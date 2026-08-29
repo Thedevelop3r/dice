@@ -1,7 +1,7 @@
 //! Chuck-a-Luck — a three-dice wagering game with a persistent bankroll.
 
 use super::Ctx;
-use crate::economy::Wallet;
+use crate::economy::{House, Wallet};
 use crate::ui::{self, dice_art, widgets};
 
 const BAILOUT: i64 = 50;
@@ -109,6 +109,7 @@ pub fn play(ctx: &mut Ctx) {
         let mult = bet.payout(&roll);
         let delta = stake * mult;
         Wallet::new(ctx.store).add_chips(delta);
+        House::record(ctx.store, "chuck", delta);
         if delta >= 0 {
             ctx.store.bump("chuck.wins", 1);
         } else {

@@ -2,7 +2,7 @@
 //! bracket of Pig matches, and play up the bracket for the prize pool.
 
 use super::{pig, Ctx, Difficulty, Player};
-use crate::economy::Wallet;
+use crate::economy::{House, Wallet};
 use crate::ui::{self, widgets};
 
 const BOT_NAMES: [&str; 7] = ["Ada", "Blitz", "Cricket", "Domino", "Echo", "Fable", "Gambit"];
@@ -91,6 +91,11 @@ pub fn play(ctx: &mut Ctx) {
                 match pig::play_match(ctx, players, cfg, false) {
                     Some(w) => w,
                     None => {
+                        // The buy-in was already spent and there's no
+                        // refund for walking away mid-bracket — the house
+                        // keeps the whole entry fee.
+                        House::record(ctx.store, "tourney", -buy_in);
+                        let _ = ctx.store.save();
                         message(ctx, &theme.dim("you walked away from the table."));
                         return;
                     }
@@ -117,20 +122,25 @@ pub fn play(ctx: &mut Ctx) {
     ctx.screen.line(&format!("  🏆 {}", theme.paint(ui::theme::YELLOW, &format!("{} takes the tournament", champion.name))));
 
     let champion_is_human = champion.ai.is_none();
-    let mut w = Wallet::new(ctx.store);
-    if champion_is_human {
+    let prize = if champion_is_human {
         let prize = pool * 70 / 100;
-        w.add_chips(prize);
+        Wallet::new(ctx.store).add_chips(prize);
         ctx.screen.line(&theme.win(&format!("you win {prize} chips!")));
         ctx.store.bump("tourney.titles", 1);
         ctx.store.record_best("tourney.best_prize", prize);
+        prize
     } else if human_out_at == Some(1) {
         let prize = pool * 30 / 100;
-        w.add_chips(prize);
+        Wallet::new(ctx.store).add_chips(prize);
         ctx.screen.line(&theme.paint(ui::theme::CYAN, &format!("runner-up — you collect {prize} chips.")));
+        prize
     } else {
         ctx.screen.line(&theme.dim("knocked out. Better draw next time."));
-    }
+        0
+    };
+    // The buy-in is already spent; the round's net for the player is
+    // whatever prize came back from it, if any.
+    House::record(ctx.store, "tourney", prize - buy_in);
     let _ = ctx.store.save();
     ctx.screen.present();
     ui::pause(ctx.screen);

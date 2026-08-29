@@ -158,3 +158,108 @@ impl<'a> Wallet<'a> {
         false
     }
 }
+
+/// The casino's own ledger — the mirror image of the player's wallet.
+/// Every wagering game settles between a player and the house: whatever
+/// chips a player's wallet gains, the house's balance loses, and vice
+/// versa, so there's nowhere else for the money to have come from or
+/// gone to. This deliberately covers only *games* (Chuck-a-Luck, Luck
+/// Bet, Roulette, Blackjack, Tournament, and Ultra Casino Dice's
+/// unclaimed pots) — not Store currency exchanges or item purchases,
+/// which move chips for a reason other than a wager's outcome.
+pub struct House;
+
+impl House {
+    /// Records one settlement: `player_delta` is how many chips the
+    /// player's wallet just changed by for this bet/hand/round (positive
+    /// on a win, negative on a loss — exactly what you'd add to a
+    /// wallet). The house's balance moves by the exact opposite amount.
+    /// `game` is the same short prefix each game already uses for its own
+    /// stats (`"roulette"`, `"blackjack"`, ...), so a running per-game
+    /// house balance shows up right alongside that game's existing
+    /// numbers on the Stats screen, under `{game}.house_pl`.
+    pub fn record(save: &mut Save, game: &str, player_delta: i64) {
+        let house_delta = -player_delta;
+        let balance = save.get_i64("house.balance", 0) + house_delta;
+        save.set_i64("house.balance", balance);
+        if house_delta > 0 {
+            save.bump("house.collected", house_delta);
+        } else if house_delta < 0 {
+            save.bump("house.paid", -house_delta);
+        }
+        save.bump(&format!("{game}.house_pl"), house_delta);
+        let _ = save.save();
+    }
+
+    /// The house's current net balance — positive means it's ahead across
+    /// every game played so far, negative means players are collectively
+    /// up on the house.
+    pub fn balance(save: &Save) -> i64 {
+        save.get_i64("house.balance", 0)
+    }
+
+    /// Lifetime totals: chips the house has collected from losing bets,
+    /// and chips it's paid out on winning ones. `collected - paid` always
+    /// equals `balance()`.
+    pub fn totals(save: &Save) -> (i64, i64) {
+        (save.get_i64("house.collected", 0), save.get_i64("house.paid", 0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_player_win_is_an_equal_house_loss() {
+        let mut save = Save::blank();
+        House::record(&mut save, "roulette", 350); // player nets +350
+        assert_eq!(House::balance(&save), -350);
+        assert_eq!(House::totals(&save), (0, 350));
+    }
+
+    #[test]
+    fn a_player_loss_is_an_equal_house_win() {
+        let mut save = Save::blank();
+        House::record(&mut save, "blackjack", -20); // player nets -20
+        assert_eq!(House::balance(&save), 20);
+        assert_eq!(House::totals(&save), (20, 0));
+    }
+
+    #[test]
+    fn balance_always_equals_collected_minus_paid() {
+        let mut save = Save::blank();
+        for delta in [-50, 120, -8, 0, 6000, -6000, 30] {
+            House::record(&mut save, "chuck", delta);
+            let (collected, paid) = House::totals(&save);
+            assert_eq!(House::balance(&save), collected - paid);
+        }
+    }
+
+    #[test]
+    fn balance_accumulates_across_settlements_and_games() {
+        let mut save = Save::blank();
+        House::record(&mut save, "chuck", 40); // house -40
+        House::record(&mut save, "roulette", -15); // house +15
+        House::record(&mut save, "chuck", -100); // house +100
+        assert_eq!(House::balance(&save), 75);
+    }
+
+    #[test]
+    fn per_game_totals_are_tracked_separately() {
+        let mut save = Save::blank();
+        House::record(&mut save, "chuck", 40);
+        House::record(&mut save, "roulette", -15);
+        House::record(&mut save, "chuck", -100);
+        assert_eq!(save.get_i64("chuck.house_pl", 0), 60); // -40 + 100
+        assert_eq!(save.get_i64("roulette.house_pl", 0), 15);
+    }
+
+    #[test]
+    fn a_zero_delta_settlement_moves_nothing() {
+        let mut save = Save::blank();
+        House::record(&mut save, "tourney", 0);
+        assert_eq!(House::balance(&save), 0);
+        assert_eq!(House::totals(&save), (0, 0));
+    }
+}

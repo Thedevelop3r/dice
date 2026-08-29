@@ -2,7 +2,7 @@
 //! on all 17s, blackjack pays 3:2, one card on a double down.
 
 use super::Ctx;
-use crate::economy::Wallet;
+use crate::economy::{House, Wallet};
 use crate::ui::{self, card_art, widgets};
 
 #[derive(Clone, Copy)]
@@ -198,6 +198,7 @@ pub fn play(ctx: &mut Ctx) {
         if delta > 0 {
             Wallet::new(ctx.store).add_chips(delta);
         }
+        House::record(ctx.store, "blackjack", delta - bet);
         if delta > bet {
             ctx.store.bump("blackjack.wins", 1);
         } else if delta == bet {

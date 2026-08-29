@@ -15,6 +15,7 @@
 //! plain-text log (`history.rs`) viewable later from the dashboard.
 
 use super::Ctx;
+use crate::economy::House;
 use crate::history;
 use crate::rng::Rng;
 use crate::ui::{self, dice_art, theme, widgets};
@@ -377,6 +378,13 @@ fn settle_round(ctx: &mut Ctx, seats: &mut [Seat], values: &[u32], round: u32) {
     }
     ctx.screen.blank();
     if winners.is_empty() {
+        // Nobody backed the winning combination this round, so the whole
+        // pot — every seat's stake, already deducted at bid time — has
+        // nowhere else to go. It's the one place Ultra Casino Dice's
+        // otherwise player-vs-player table actually pays the house.
+        if pot > 0 {
+            House::record(ctx.store, "ultra", -pot);
+        }
         ctx.screen.line(&theme.dim(&format!("  no one called it — {pot} chips lost to the house.")));
     } else {
         let label = if winners.len() == 1 {

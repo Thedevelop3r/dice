@@ -82,6 +82,7 @@ fn main() {
             MenuItem::new('s', "Store", "chips, dollars and lucky charms"),
             MenuItem::new('i', "Stats", "your history across every table"),
             MenuItem::new('h', "History", "past Ultra Casino Dice sessions"),
+            MenuItem::new('c', "Casino", "the house's own wallet — profit and loss across every table"),
             MenuItem::new('o', "Options", "name, colors, reset"),
             MenuItem::new('r', "Rules", "how each game is played"),
             MenuItem::new('q', "Quit", "cash out and leave"),
@@ -147,6 +148,7 @@ fn main() {
             Some('s') => shop::open(&mut store, &mut screen),
             Some('i') => show_stats(&mut store, &mut screen),
             Some('h') => show_history(&mut screen),
+            Some('c') => show_house(&mut store, &mut screen),
             Some('o') => settings(&mut store, &mut screen),
             Some('r') => rules(&mut screen),
             Some('q') | None => break,
@@ -313,6 +315,61 @@ fn show_history(screen: &mut Screen) {
     }
 }
 
+/// The casino's own side of the ledger — the mirror image of the
+/// player's wallet. See `economy::House` for exactly what feeds it: every
+/// wagering game, and nothing else (no Store exchanges or purchases).
+fn show_house(store: &mut Store, screen: &mut Screen) {
+    let theme = screen.theme;
+    screen.begin();
+    ui::header(screen, "THE CASINO'S BOOKS");
+    screen.blank();
+
+    let balance = economy::House::balance(store);
+    let (collected, paid) = economy::House::totals(store);
+    let balance_str = if balance >= 0 { theme.win(&format!("+{balance} chips")) } else { theme.lose(&format!("{balance} chips")) };
+    screen.line(&format!("  house balance: {balance_str}"));
+    screen.line(&theme.dim(if collected == 0 && paid == 0 {
+        "  the house hasn't settled a bet yet."
+    } else if balance >= 0 {
+        "  the house is ahead across every table."
+    } else {
+        "  players are collectively up on the house."
+    }));
+    screen.blank();
+    screen.line(&format!("  collected from losing bets   {}", theme.paint(ui::theme::GREEN, &format!("{collected} chips"))));
+    screen.line(&format!("  paid out on winning bets     {}", theme.paint(ui::theme::RED, &format!("{paid} chips"))));
+
+    let rows = [
+        ("Chuck-a-Luck", "chuck"),
+        ("Luck Bet", "luckbet"),
+        ("Roulette", "roulette"),
+        ("Blackjack", "blackjack"),
+        ("Tournament", "tourney"),
+        ("Ultra Casino Dice", "ultra"),
+    ];
+    let mut any = false;
+    screen.blank();
+    screen.line(&theme.bold("by table"));
+    for (label, key) in rows {
+        let played = store.entries().any(|(k, _)| k.starts_with(&format!("{key}.")));
+        if !played {
+            continue;
+        }
+        any = true;
+        let pl = store.get_i64(&format!("{key}.house_pl"), 0);
+        let pl_str = if pl >= 0 { theme.win(&format!("+{pl}")) } else { theme.lose(&format!("{pl}")) };
+        screen.line(&format!("   {:<18} {:>10} chips", label, pl_str));
+    }
+    if !any {
+        screen.line(&theme.dim("   no games played yet."));
+    }
+    screen.blank();
+    screen.line(&theme.dim("  covers every wagering table — Chuck-a-Luck, Luck Bet, Roulette,"));
+    screen.line(&theme.dim("  Blackjack, Tournament, and unclaimed Ultra Casino Dice pots — but"));
+    screen.line(&theme.dim("  not Store currency exchanges or item purchases."));
+    ui::pause(screen);
+}
+
 fn settings(store: &mut Store, screen: &mut Screen) {
     loop {
         let colors_on = store.get_i64("cfg.colors", 1) == 1;
@@ -379,7 +436,7 @@ fn rules(screen: &mut Screen) {
         ("BLACKJACK", "Beat the dealer's hand without going over 21. Face cards count 10, aces count 11 or 1. Dealer stands on 17. Blackjack (an ace + a ten-card on the deal) pays 3:2."),
         ("TOURNAMENT", "Pay a chip buy-in, get drawn into a single-elimination Pig bracket. Your matches are played out; the rest of the bracket is simulated. Champion takes 70% of the pool, runner-up 30%."),
         ("DICE LAB", "Roll dice notation like 4d6+2, `sim 2d6 50000` to plot the distribution, or `seed 42` for reproducible rolls."),
-        ("ULTRA CASINO DICE", "An unattended spectacle table: 12 dice, 8 computer players, 10 rounds, no input required. Each round every seat backs a letter and calls a face, the table rolls for 7 seconds, and whoever called it right splits the pot — there's no house, so losers' stakes are exactly what winners collect. Seats decide to stay or cash out between rounds; anyone who leaves is replaced by a new AI player. Press Q at any time to let the round in progress finish and return to the floor; otherwise a finished session shows its final standings and a new one starts on its own. Every round and every session is logged to the History screen."),
+        ("ULTRA CASINO DICE", "An unattended spectacle table: 12 dice, 8 computer players, 10 rounds, no input required. Each round every seat backs a letter and calls a face, the table rolls for 7 seconds, and whoever called it right splits the pot — losers' stakes are exactly what winners collect, with one exception: a round nobody calls right pays its whole pot to the house. Seats decide to stay or cash out between rounds; anyone who leaves is replaced by a new AI player. Press Q at any time to let the round in progress finish and return to the floor; otherwise a finished session shows its final standings and a new one starts on its own. Every round and every session is logged to the History screen."),
     ];
     for (title, body) in entries {
         screen.blank();

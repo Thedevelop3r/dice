@@ -7,7 +7,7 @@
 
 use super::{Ctx, Difficulty};
 use crate::dice;
-use crate::economy::{Item, Wallet};
+use crate::economy::{House, Item, Wallet};
 use crate::ui::{self, dice_art, widgets};
 
 pub const DICE: usize = 8;
@@ -420,6 +420,7 @@ fn settle(ctx: &mut Ctx, title: &str, table: &mut Table, seats: &mut [Seat], tur
         }
     }
 
+    House::record(ctx.store, "luckbet", seats[0].last_delta);
     if seats[0].last_delta > 0 {
         ctx.store.bump("luckbet.wins", 1);
         ctx.store.record_best("luckbet.best_win", seats[0].last_delta);

@@ -46,7 +46,8 @@ and your prompt looks exactly as it did before you ran it once you quit.
 | **Tournament** | Chip buy-in, single-elimination Pig bracket (4 or 8 entrants, three tiers). Your matches are played out, the rest of the bracket is simulated. Champion takes 70% of the pool, runner-up 30%. |
 | **Store** | Exchange in-game dollars for chips (10 per $1) and back (12 chips per $1), and buy reroll tokens, insurance chits, lucky charms, a VIP pass or a gold dice skin. |
 | **Dice Lab** | Roll any `NdM+K` (`3d6`, `d20`, `4d10+2`), plot a distribution with `sim 2d6 50000`, and pin the RNG with `seed 42`. The one screen that still takes typed text — there's no sensible key for an arbitrary expression. |
-| **Ultra Casino Dice** | An unattended spectacle table — 12 dice, 8 computer players, 10 rounds, zero input required. Every round each seat backs a letter and calls a face, the table spins for a full 7 seconds, and whoever called it right splits the pot; there's no house, so a miss loses exactly what a hit collects. Seats decide to stay or cash out between rounds, and anyone who leaves is replaced by a fresh AI player with a new random name and bankroll. A finished session shows its final standings, then a new one starts on its own — press `Q` to let the current round finish and return to the floor instead. Every round and every session lands in the **History** screen. |
+| **Ultra Casino Dice** | An unattended spectacle table — 12 dice, 8 computer players, 10 rounds, zero input required. Every round each seat backs a letter and calls a face, the table spins for a full 7 seconds, and whoever called it right splits the pot — losers' stakes are exactly what winners collect, with one exception: a round nobody calls right pays its whole pot to the house. Seats decide to stay or cash out between rounds, and anyone who leaves is replaced by a fresh AI player with a new random name and bankroll. A finished session shows its final standings, then a new one starts on its own — press `Q` to let the current round finish and return to the floor instead. Every round and every session lands in the **History** screen. |
+| **Casino** | Not a table — the house's own books. A running balance of the house's total profit and loss across every wagering game, with a per-table breakdown, updated live as bets settle. |
 
 ## The roll
 
@@ -63,6 +64,18 @@ Chips are the table currency, dollars are the in-game cash — **all of it
 fictional**, with no real money involved anywhere. One shared wallet spans
 every wagering game and persists between sessions. Go broke and the house
 stakes you again, so the game is never a dead end.
+
+### The house
+
+The casino keeps a wallet too. Every time a wagering game settles — Chuck-a-Luck,
+Luck Bet, Roulette, Blackjack, Tournament, and unclaimed Ultra Casino Dice pots
+— the house's balance moves by exactly the opposite of whatever the player's
+wallet just did, so the two ledgers are always mirror images of each other.
+Store currency exchanges and item purchases don't touch it: those move chips
+around, but they aren't a game's outcome. The **Casino** screen (`[C]` on the
+dashboard) shows the house's running balance, lifetime collected/paid totals,
+and a per-table breakdown; the same per-table numbers also show up as a
+`house_pl` line under each game's own section on the **Stats** screen.
 
 ## Architecture
 
@@ -84,6 +97,11 @@ next — new tables, new animations, a new color theme in `src/ui/theme.rs`.
   stepper, text input, progress bars, banners.
 - `src/games/*.rs` — pure game logic, one file per game, each drawing
   only through the `Ctx`/`Screen` it's handed.
+- `src/economy.rs` — `Wallet`, the player's chips/dollars/inventory, and
+  `House`, the casino's own mirror-image ledger, recorded explicitly at
+  each game's settlement point rather than hooked generically into
+  `Wallet` (which is also used for Store exchanges that shouldn't count
+  as house winnings).
 - `src/history.rs` — a plain-text, append-only log of Ultra Casino Dice
   sessions, kept separate from `stats::Store`'s `key=value` settings file
   since it only ever grows. Read back by the dashboard's History screen.
@@ -100,6 +118,9 @@ next — new tables, new animations, a new color theme in `src/ui/theme.rs`.
 - Reproducible sessions: `DICE_SEED=42 cargo run`
 - Persistent inventory: consumables (reroll, insurance, charm) and
   permanent upgrades (VIP payouts, gold dice)
+- A live house ledger (`Casino` screen) tracking the casino's own
+  profit and loss, mirror-image to the player's wallet, across every
+  wagering table
 - Handles EOF and Ctrl+C cleanly, so the whole app is scriptable
 
 ## Tests
@@ -110,6 +131,8 @@ cargo test
 
 Covers dice-notation parsing, roll uniformity, seeded reproducibility,
 every Yahtzee scoring category, Luck Bet hit/sweep resolution, Roulette's
-payout table, Blackjack's hand totals (soft aces, busts, the shoe), and
+payout table, Blackjack's hand totals (soft aces, busts, the shoe),
 Ultra Casino Dice's pot math (proportional splits between tied winners,
-zero-sum payouts, stake bounds).
+zero-sum payouts, stake bounds), and the house ledger's zero-sum
+invariant (its balance always equals lifetime collected minus paid,
+across settlements and games).

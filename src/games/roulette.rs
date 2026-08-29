@@ -2,7 +2,7 @@
 //! bets (red/black, odd/even, high/low, dozens) pay evens or 2:1.
 
 use super::Ctx;
-use crate::economy::Wallet;
+use crate::economy::{House, Wallet};
 use crate::ui::{self, dice_art, widgets};
 
 const RED_NUMBERS: [u32; 18] = [1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36];
@@ -137,6 +137,7 @@ pub fn play(ctx: &mut Ctx) {
         } else {
             ctx.store.bump("roulette.losses", 1);
         }
+        House::record(ctx.store, "roulette", delta);
         let _ = ctx.store.save();
 
         let theme = ctx.theme();
