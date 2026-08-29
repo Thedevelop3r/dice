@@ -174,6 +174,45 @@ mod raw {
         byte
     }
 
+    /// A single non-blocking read attempt — no spin, no wait. Used by
+    /// `poll_leave_signal` to check "is anything waiting?" once per
+    /// animation frame without slowing the animation down.
+    fn read_byte_nonblocking_once() -> Option<u8> {
+        let fd = std::io::stdin().as_raw_fd();
+        set_nonblocking(fd, true);
+        let mut buf = [0u8; 1];
+        let n = unsafe { read(fd, buf.as_mut_ptr(), 1) };
+        set_nonblocking(fd, false);
+        if n == 1 {
+            Some(buf[0])
+        } else {
+            None
+        }
+    }
+
+    /// True if Q/q or Ctrl+C was pressed since the last call. Drains and
+    /// discards *every* byte currently waiting (not just one), so holding
+    /// a key down — or a stray escape sequence — can't starve the check;
+    /// everything except Q and Ctrl+C is silently swallowed rather than
+    /// queued, since an unattended screen has nowhere to feed it later.
+    /// This is how a hands-off animation or idle loop notices a leave
+    /// request without ever blocking a frame on `read_key()`.
+    pub fn poll_leave_signal() -> bool {
+        let mut left = false;
+        loop {
+            match read_byte_nonblocking_once() {
+                Some(0x03) => {
+                    super::request_quit();
+                    left = true;
+                }
+                Some(b) if b == b'q' || b == b'Q' => left = true,
+                Some(_) => {}
+                None => break,
+            }
+        }
+        left
+    }
+
     pub fn read_key() -> super::Key {
         use super::Key;
         loop {
@@ -255,6 +294,13 @@ mod raw {
             None => Key::Enter,
         }
     }
+
+    /// No non-blocking read exists on this degraded fallback path, so an
+    /// unattended screen here simply can't be interrupted mid-animation —
+    /// acceptable on a target with no real raw-mode input anyway.
+    pub fn poll_leave_signal() -> bool {
+        false
+    }
 }
 
 pub use raw::RawGuard;
@@ -262,6 +308,14 @@ pub use raw::RawGuard;
 /// Blocks for exactly one key press.
 pub fn read_key() -> Key {
     raw::read_key()
+}
+
+/// Non-blocking: has the user asked to leave since the last call? See
+/// `raw::poll_leave_signal` for the real (Unix) implementation — this is
+/// what unattended animations and idle screens poll instead of blocking
+/// on `read_key()`.
+pub fn poll_leave_signal() -> bool {
+    raw::poll_leave_signal()
 }
 
 /// Waits for any key at all — the "press any key to continue" beat.

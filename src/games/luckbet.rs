@@ -176,7 +176,7 @@ fn draw_spin_prompt(ctx: &mut Ctx, title: &str, seats: &[Seat], table: &Table) {
     ctx.screen.blank();
     let gold = Wallet::new(ctx.store).owns(Item::GoldDice);
     let no_hits = [false; DICE];
-    for line in dice_art::table_block(&theme, &table.values, &LETTERS, &no_hits, gold) {
+    for line in dice_art::table_block(&theme, &table.values, &LETTERS, &no_hits, gold, DICE) {
         ctx.screen.line(&line);
     }
     ctx.screen.blank();
@@ -203,7 +203,7 @@ fn ask_bet(ctx: &mut Ctx, title: &str, seats: &[Seat], table: &Table, last: Opti
     table_header(ctx, title, seats, table);
     ctx.screen.blank();
     let no_hits = [false; DICE];
-    for line in dice_art::table_block(&theme, &table.values, &LETTERS, &no_hits, gold) {
+    for line in dice_art::table_block(&theme, &table.values, &LETTERS, &no_hits, gold, DICE) {
         ctx.screen.line(&line);
     }
     ctx.screen.blank();
@@ -285,7 +285,7 @@ fn spin(ctx: &mut Ctx, title: &str, seats: &[Seat], table: &mut Table, turbo: bo
     let gold = Wallet::new(ctx.store).owns(Item::GoldDice);
     let delays: &[u64] = if turbo { &dice_art::TURBO_FRAME_DELAYS } else { dice_art::standard_frames() };
     let no_hits = [false; DICE];
-    let final_values = dice_art::animate_table_roll(ctx.screen, ctx.rng, delays, |screen, frame| {
+    let final_values = dice_art::animate_table_roll(ctx.screen, ctx.rng, DICE, delays, |screen, frame| {
         let theme = screen.theme;
         screen.begin();
         ui::header(screen, title);
@@ -295,13 +295,13 @@ fn spin(ctx: &mut Ctx, title: &str, seats: &[Seat], table: &mut Table, turbo: bo
             screen.line(&theme.dim(&format!("  {} ({}) — {} chips", s.name, s.ai.unwrap().label(), s.chips)));
         }
         screen.blank();
-        for line in dice_art::table_block(&theme, frame, &LETTERS, &no_hits, gold) {
+        for line in dice_art::table_block(&theme, frame, &LETTERS, &no_hits, gold, DICE) {
             screen.line(&line);
         }
         screen.blank();
         screen.line(&theme.dim("spinning..."));
     });
-    table.values = final_values;
+    table.values = final_values.try_into().expect("animate_table_roll returns exactly DICE values");
     ctx.store.bump("luckbet.rolls", DICE as i64);
 }
 
@@ -325,7 +325,7 @@ fn offer_second_chance(ctx: &mut Ctx, title: &str, table: &mut Table, seat: &Sea
     ui::header(ctx.screen, title);
     ctx.screen.blank();
     let no_hits = [false; DICE];
-    for line in dice_art::table_block(&theme, &table.values, &LETTERS, &no_hits, gold) {
+    for line in dice_art::table_block(&theme, &table.values, &LETTERS, &no_hits, gold, DICE) {
         ctx.screen.line(&line);
     }
     ctx.screen.blank();
@@ -431,7 +431,7 @@ fn settle(ctx: &mut Ctx, title: &str, table: &mut Table, seats: &mut [Seat], tur
     ctx.screen.begin();
     ui::header(ctx.screen, title);
     ctx.screen.blank();
-    for line in dice_art::table_block(&theme, &table.values, &LETTERS, &hits, gold) {
+    for line in dice_art::table_block(&theme, &table.values, &LETTERS, &hits, gold, DICE) {
         ctx.screen.line(&line);
     }
     ctx.screen.blank();

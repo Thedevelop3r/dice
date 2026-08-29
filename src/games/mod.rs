@@ -5,6 +5,7 @@ pub mod luckbet;
 pub mod pig;
 pub mod roulette;
 pub mod tournament;
+pub mod ultra;
 pub mod yahtzee;
 
 use crate::rng::Rng;

@@ -11,7 +11,7 @@ pub mod menu;
 pub mod theme;
 pub mod widgets;
 
-pub use input::{choose_key, confirm_key, quit_requested, read_key, wait_any_key, Key};
+pub use input::{choose_key, confirm_key, poll_leave_signal, quit_requested, read_key, wait_any_key, Key};
 pub use theme::{Theme, GOLD};
 
 use std::io::Write;

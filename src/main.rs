@@ -10,12 +10,13 @@
 mod dice;
 mod economy;
 mod games;
+mod history;
 mod rng;
 mod shop;
 mod stats;
 mod ui;
 
-use games::{blackjack, chuck, lab, luckbet, pig, roulette, tournament, yahtzee, Ctx, Player};
+use games::{blackjack, chuck, lab, luckbet, pig, roulette, tournament, ultra, yahtzee, Ctx, Player};
 use rng::Rng;
 use stats::Store;
 use ui::menu::{choose_from, MenuItem};
@@ -77,8 +78,10 @@ fn main() {
             MenuItem::new('7', "Blackjack", "beat the dealer to 21"),
             MenuItem::new('8', "Tournament", "knockout bracket for a chip prize pool"),
             MenuItem::new('9', "Dice Lab", "roll any NdM+K, sample distributions"),
+            MenuItem::new('0', "Ultra Casino Dice", "idle-screen spectacle — 8 AI players, 12 dice, fully automatic"),
             MenuItem::new('s', "Store", "chips, dollars and lucky charms"),
             MenuItem::new('i', "Stats", "your history across every table"),
+            MenuItem::new('h', "History", "past Ultra Casino Dice sessions"),
             MenuItem::new('o', "Options", "name, colors, reset"),
             MenuItem::new('r', "Rules", "how each game is played"),
             MenuItem::new('q', "Quit", "cash out and leave"),
@@ -137,8 +140,13 @@ fn main() {
                 let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
                 lab::play(&mut ctx);
             }
+            Some('0') => {
+                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+                ultra::play(&mut ctx);
+            }
             Some('s') => shop::open(&mut store, &mut screen),
             Some('i') => show_stats(&mut store, &mut screen),
+            Some('h') => show_history(&mut screen),
             Some('o') => settings(&mut store, &mut screen),
             Some('r') => rules(&mut screen),
             Some('q') | None => break,
@@ -234,6 +242,7 @@ fn show_stats(store: &mut Store, screen: &mut Screen) {
         ("Blackjack", "blackjack"),
         ("Tournament", "tourney"),
         ("Dice Lab", "lab"),
+        ("Ultra Casino Dice", "ultra"),
         ("Store", "store"),
         ("Inventory", "inv"),
     ];
@@ -261,6 +270,47 @@ fn show_stats(store: &mut Store, screen: &mut Screen) {
     screen.blank();
     screen.line(&theme.dim(&format!("saved at {}", store.path_display())));
     ui::pause(screen);
+}
+
+/// A simple paginated reader for `history.rs`'s plain-text Ultra Casino
+/// Dice log — most recent entries first, `N`/`P` to page, any other key
+/// to leave.
+fn show_history(screen: &mut Screen) {
+    let theme = screen.theme;
+    let mut lines = history::read_all();
+    lines.reverse();
+    if lines.is_empty() {
+        screen.begin();
+        ui::header(screen, "HISTORY");
+        screen.blank();
+        screen.line(&theme.dim("  no sessions played yet — try Ultra Casino Dice from the floor."));
+        ui::pause(screen);
+        return;
+    }
+
+    let (_, rows) = screen.size();
+    let page_size = (rows as usize).saturating_sub(10).clamp(8, 30);
+    let total_pages = lines.len().div_ceil(page_size).max(1);
+    let mut page = 0usize;
+    loop {
+        screen.begin();
+        ui::header(screen, "HISTORY");
+        screen.blank();
+        let start = page * page_size;
+        let end = (start + page_size).min(lines.len());
+        for line in &lines[start..end] {
+            screen.line(&format!("  {}", theme.dim(line)));
+        }
+        screen.blank();
+        screen.line(&theme.dim(&format!("page {}/{total_pages} · {} lines · {}", page + 1, lines.len(), history::path_display())));
+        screen.line(&widgets::footer(&theme, &[('n', "next page"), ('p', "prev page"), ('q', "back")]));
+        screen.present();
+        match ui::choose_key(&['n', 'p', 'q'], 'q') {
+            Some('n') => page = (page + 1).min(total_pages.saturating_sub(1)),
+            Some('p') => page = page.saturating_sub(1),
+            _ => return,
+        }
+    }
 }
 
 fn settings(store: &mut Store, screen: &mut Screen) {
@@ -320,7 +370,7 @@ fn rules(screen: &mut Screen) {
     let theme = screen.theme;
     screen.begin();
     ui::header(screen, "RULES");
-    let entries: [(&str, &str); 8] = [
+    let entries: [(&str, &str); 9] = [
         ("PIG", "Roll to build a turn total, hold to bank it. Roll a 1 and the turn total is gone. In the two-dice variant a single 1 ends the turn, snake eyes wipes your whole score, and doubles pay double. First to the target score wins."),
         ("YAHTZEE", "Thirteen rounds, three rolls each: keep dice between rolls, then commit the hand to one open category. 63+ in the upper section earns a 35-point bonus; each extra Yahtzee after the first is worth 100."),
         ("CHUCK-A-LUCK", "Stake chips on a face (pays 1:1, 2:1 or 3:1 by how many of the three dice show it), on HIGH (11-17) or LOW (4-10) at even money — both lose to any triple — or on any triple at 30:1."),
@@ -329,6 +379,7 @@ fn rules(screen: &mut Screen) {
         ("BLACKJACK", "Beat the dealer's hand without going over 21. Face cards count 10, aces count 11 or 1. Dealer stands on 17. Blackjack (an ace + a ten-card on the deal) pays 3:2."),
         ("TOURNAMENT", "Pay a chip buy-in, get drawn into a single-elimination Pig bracket. Your matches are played out; the rest of the bracket is simulated. Champion takes 70% of the pool, runner-up 30%."),
         ("DICE LAB", "Roll dice notation like 4d6+2, `sim 2d6 50000` to plot the distribution, or `seed 42` for reproducible rolls."),
+        ("ULTRA CASINO DICE", "An unattended spectacle table: 12 dice, 8 computer players, 10 rounds, no input required. Each round every seat backs a letter and calls a face, the table rolls for 7 seconds, and whoever called it right splits the pot — there's no house, so losers' stakes are exactly what winners collect. Seats decide to stay or cash out between rounds; anyone who leaves is replaced by a new AI player. Press Q at any time to let the round in progress finish and return to the floor; otherwise a finished session shows its final standings and a new one starts on its own. Every round and every session is logged to the History screen."),
     ];
     for (title, body) in entries {
         screen.blank();

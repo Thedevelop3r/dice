@@ -87,10 +87,18 @@ impl Store {
     }
 }
 
-fn data_path() -> PathBuf {
+/// The app's save directory — `$XDG_DATA_HOME/dice_arena` (falling back to
+/// `~/.local/share/dice_arena`, then the current directory). Shared with
+/// `history.rs`, which keeps its own plain-text log alongside `save.conf`
+/// rather than folding a growing log into this file's `key=value` format.
+pub fn data_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(|_| PathBuf::from("."));
-    base.join("dice_arena").join("save.conf")
+    base.join("dice_arena")
+}
+
+fn data_path() -> PathBuf {
+    data_dir().join("save.conf")
 }

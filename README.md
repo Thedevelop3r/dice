@@ -24,6 +24,9 @@ no-echo mode on launch, so the instant you press a key it acts:
   press `Enter` to confirm.
 - `Ctrl+C` leaves the table/menu you're in immediately and cleanly closes
   the app, saving as it goes.
+- Ultra Casino Dice is the one exception: it's a hands-off spectacle table
+  that runs itself. The only key that does anything is `Q`, which lets the
+  round in progress finish and then returns you to the floor.
 
 The whole app runs in the terminal's alternate screen buffer, so nothing
 scrolls into your shell's history — every screen is a hard clear-and-redraw,
@@ -43,13 +46,16 @@ and your prompt looks exactly as it did before you ran it once you quit.
 | **Tournament** | Chip buy-in, single-elimination Pig bracket (4 or 8 entrants, three tiers). Your matches are played out, the rest of the bracket is simulated. Champion takes 70% of the pool, runner-up 30%. |
 | **Store** | Exchange in-game dollars for chips (10 per $1) and back (12 chips per $1), and buy reroll tokens, insurance chits, lucky charms, a VIP pass or a gold dice skin. |
 | **Dice Lab** | Roll any `NdM+K` (`3d6`, `d20`, `4d10+2`), plot a distribution with `sim 2d6 50000`, and pin the RNG with `seed 42`. The one screen that still takes typed text — there's no sensible key for an arbitrary expression. |
+| **Ultra Casino Dice** | An unattended spectacle table — 12 dice, 8 computer players, 10 rounds, zero input required. Every round each seat backs a letter and calls a face, the table spins for a full 7 seconds, and whoever called it right splits the pot; there's no house, so a miss loses exactly what a hit collects. Seats decide to stay or cash out between rounds, and anyone who leaves is replaced by a fresh AI player with a new random name and bankroll. A finished session shows its final standings, then a new one starts on its own — press `Q` to let the current round finish and return to the floor instead. Every round and every session lands in the **History** screen. |
 
 ## The roll
 
 Every dice reveal in the app — Pig, Yahtzee, Chuck-a-Luck, Luck Bet, the
 Dice Lab, Roulette's wheel — plays the same house animation: ten frames
 of tumbling values over roughly a second, easing from a quick flicker to
-a settle, before landing on the real, already-determined result.
+a settle, before landing on the real, already-determined result. Ultra
+Casino Dice's table spins to its own, longer rhythm — 20 frames a second
+for a full 7 seconds — matching the scale of a 12-die, 8-player table.
 
 ## Economy
 
@@ -78,6 +84,9 @@ next — new tables, new animations, a new color theme in `src/ui/theme.rs`.
   stepper, text input, progress bars, banners.
 - `src/games/*.rs` — pure game logic, one file per game, each drawing
   only through the `Ctx`/`Screen` it's handed.
+- `src/history.rs` — a plain-text, append-only log of Ultra Casino Dice
+  sessions, kept separate from `stats::Store`'s `key=value` settings file
+  since it only ever grows. Read back by the dashboard's History screen.
 
 ## Features
 
@@ -86,7 +95,8 @@ next — new tables, new animations, a new color theme in `src/ui/theme.rs`.
 - Three AI difficulties — Easy is erratic, Normal holds at 20, Hard uses
   the near-optimal "hold at 25 minus banked" rule and pushes when behind
 - Persistent stats, high scores and settings in
-  `$XDG_DATA_HOME/dice_arena/save.conf`
+  `$XDG_DATA_HOME/dice_arena/save.conf`, plus a plain-text Ultra Casino
+  Dice history log at `$XDG_DATA_HOME/dice_arena/ultra_history.log`
 - Reproducible sessions: `DICE_SEED=42 cargo run`
 - Persistent inventory: consumables (reroll, insurance, charm) and
   permanent upgrades (VIP payouts, gold dice)
@@ -100,4 +110,6 @@ cargo test
 
 Covers dice-notation parsing, roll uniformity, seeded reproducibility,
 every Yahtzee scoring category, Luck Bet hit/sweep resolution, Roulette's
-payout table, and Blackjack's hand totals (soft aces, busts, the shoe).
+payout table, Blackjack's hand totals (soft aces, busts, the shoe), and
+Ultra Casino Dice's pot math (proportional splits between tied winners,
+zero-sum payouts, stake bounds).
