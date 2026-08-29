@@ -1,4 +1,11 @@
-//! dice_arena — a console dice suite: Pig, Yahtzee, Chuck-a-Luck and a dice lab.
+//! dice_arena — a casino console: Pig, Yahtzee, Chuck-a-Luck, Luck Bet,
+//! Roulette, Blackjack, a knockout Tournament and a free-rolling Dice Lab.
+//!
+//! Everything on screen is driven by single keypresses — no typing a
+//! letter and hitting Enter — and every screen is a hard clear-and-redraw,
+//! so the terminal never fills up with scrollback. See `src/ui/` for the
+//! whole presentation layer; game logic below never touches the terminal
+//! directly.
 
 mod dice;
 mod economy;
@@ -8,10 +15,12 @@ mod shop;
 mod stats;
 mod ui;
 
-use games::{chuck, lab, luckbet, pig, tournament, yahtzee, Ctx, Difficulty, Player};
+use games::{blackjack, chuck, lab, luckbet, pig, roulette, tournament, yahtzee, Ctx, Player};
 use rng::Rng;
 use stats::Store;
-use ui::*;
+use ui::menu::{choose_from, MenuItem};
+use ui::widgets;
+use ui::{Screen, Theme};
 
 fn main() {
     let mut store = Store::load();
@@ -19,124 +28,218 @@ fn main() {
         Some(seed) => Rng::from_seed(seed),
         None => Rng::new(),
     };
+    let colors = store.get_i64("cfg.colors", 1) == 1;
+    let mut screen = Screen::open(colors);
 
     if store.get_str("player.name", "").is_empty() {
-        let name = ui::prompt("  what should we call you? ");
-        store.set_str("player.name", if name.is_empty() || name == "q" { "Player" } else { &name });
+        screen.begin();
+        ui::header(&mut screen, "WELCOME TO THE ARENA");
+        screen.blank();
+        screen.line("  what should we call you?");
+        let name = widgets::text_input(&mut screen, "Player", 18, |s, buf| {
+            s.begin();
+            ui::header(s, "WELCOME TO THE ARENA");
+            s.blank();
+            s.line("  what should we call you?");
+            s.blank();
+            s.line(&format!("  > {buf}█"));
+            s.blank();
+            s.line(&s.theme.dim("type a name, then press Enter"));
+        });
+        store.set_str("player.name", &name);
         let _ = store.save();
     }
 
-    loop {
-        let colors = store.get_i64("cfg.colors", 1) == 1;
-        ui::clear();
-        ui::banner(colors);
+    'app: loop {
+        if ui::quit_requested() {
+            break;
+        }
         let name = store.get_str("player.name", "Player");
-        println!("  welcome back, {}\n", color(colors, BOLD, &name));
-        println!("   1. {}  {}", color(colors, CYAN, "Pig"), color(colors, DIM, "press your luck to the target score"));
-        println!("   2. {}  {}", color(colors, CYAN, "Yahtzee"), color(colors, DIM, "13-category scorecard classic"));
-        println!("   3. {}  {}", color(colors, CYAN, "Luck Bet"), color(colors, DIM, "8 dice A-H, back a letter and a face"));
-        println!("   4. {}  {}", color(colors, CYAN, "Luck Bet: Turbo"), color(colors, DIM, "hands-free — Enter spins the table"));
-        println!("   5. {}  {}", color(colors, CYAN, "Tournament"), color(colors, DIM, "knockout bracket for a chip prize pool"));
-        println!("   6. {}  {}", color(colors, CYAN, "Chuck-a-Luck"), color(colors, DIM, "three-dice wagering"));
-        println!("   7. {}  {}", color(colors, CYAN, "Dice Lab"), color(colors, DIM, "roll any NdM+K, sample distributions"));
-        println!("   8. {}  {}", color(colors, BLUE, "Store"), color(colors, DIM, "chips, dollars and lucky charms"));
-        println!("   9. {}", color(colors, BLUE, "Statistics"));
-        println!("   s. {}", color(colors, BLUE, "Settings"));
-        println!("   r. {}", color(colors, BLUE, "Rules"));
-        println!("   q. quit");
-
         let (chips, dollars) = {
             let w = economy::Wallet::new(&mut store);
             (w.chips(), w.dollars())
         };
-        println!("\n  wallet: {}", ui::money(colors, chips, dollars));
+        screen.set_colors(store.get_i64("cfg.colors", 1) == 1);
+        let theme = screen.theme;
 
-        let choice = ui::prompt("\n  choose: ");
-        if choice.eq_ignore_ascii_case("8") {
-            shop::open(&mut store, colors);
-            continue;
-        }
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, colors };
-        match choice.to_lowercase().as_str() {
-            "1" => {
-                let players = setup_players(&mut ctx, &name, 2, 6);
-                if players.len() < 2 {
-                    continue;
-                }
-                let target = ui::prompt_usize("  target score", 20, 1000, 100) as i64;
-                let two_dice = ui::confirm("  two-dice variant?");
+        screen.begin();
+        draw_banner(&mut screen, &theme);
+        screen.line(&format!("  welcome back, {}", theme.bold(&name)));
+        screen.line(&format!("  {}", ui::money(&theme, chips, dollars)));
+
+        let items = vec![
+            MenuItem::new('1', "Pig", "press-your-luck race to a target score"),
+            MenuItem::new('2', "Yahtzee", "13-category scorecard classic"),
+            MenuItem::new('3', "Luck Bet", "8 dice A-H, back a letter and a face"),
+            MenuItem::new('4', "Luck Bet: Turbo", "hands-free — press to spin the table"),
+            MenuItem::new('5', "Chuck-a-Luck", "three-dice wagering"),
+            MenuItem::new('6', "Roulette", "single-zero wheel, chips on the felt"),
+            MenuItem::new('7', "Blackjack", "beat the dealer to 21"),
+            MenuItem::new('8', "Tournament", "knockout bracket for a chip prize pool"),
+            MenuItem::new('9', "Dice Lab", "roll any NdM+K, sample distributions"),
+            MenuItem::new('s', "Store", "chips, dollars and lucky charms"),
+            MenuItem::new('i', "Stats", "your history across every table"),
+            MenuItem::new('o', "Options", "name, colors, reset"),
+            MenuItem::new('r', "Rules", "how each game is played"),
+            MenuItem::new('q', "Quit", "cash out and leave"),
+        ];
+        let choice = choose_from(&mut screen, "THE FLOOR", &items);
+
+        match choice {
+            Some('1') => {
+                let Some(players) = setup_players(&mut screen, &mut store, &mut rng, &name, 2, 6) else { continue 'app };
+                let Some(target) = pick_amount(&mut screen, "target score", 20, 500, 100, 10, &[]) else { continue 'app };
+                screen.begin();
+                ui::header(&mut screen, "PIG");
+                screen.line("  two-dice variant? a single 1 ends your turn, snake eyes wipes your");
+                screen.line("  score, doubles pay double.");
+                screen.line(&widgets::footer(&screen.theme, &[('y', "two-dice"), ('n', "classic")]));
+                screen.present();
+                let two_dice = ui::confirm_key(false);
+                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
                 pig::play(&mut ctx, players, pig::Config { target, two_dice });
             }
-            "2" => {
-                let players = setup_players(&mut ctx, &name, 1, 4);
-                if players.is_empty() {
-                    continue;
-                }
+            Some('2') => {
+                let Some(players) = setup_players(&mut screen, &mut store, &mut rng, &name, 1, 4) else { continue 'app };
+                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
                 yahtzee::play(&mut ctx, players);
             }
-            "3" | "4" => {
-                let turbo = choice == "4";
+            Some('3') | Some('4') => {
+                let turbo = choice == Some('4');
                 let opponents = if turbo {
                     2
                 } else {
-                    ui::prompt_usize("  how many CPU opponents (0-2)", 0, 2, 2)
+                    match pick_amount(&mut screen, "CPU opponents", 0, 2, 2, 1, &[]) {
+                        Some(v) => v as usize,
+                        None => continue 'app,
+                    }
                 };
+                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
                 luckbet::play(&mut ctx, opponents, turbo);
             }
-            "5" => tournament::play(&mut ctx),
-            "6" => chuck::play(&mut ctx),
-            "7" => lab::play(&mut ctx),
-            "9" => show_stats(&mut ctx),
-            "s" | "settings" => settings(&mut ctx),
-            "r" | "rules" => rules(colors),
-            "q" | "quit" | "exit" => {
-                let _ = store.save();
-                println!("\n  {}\n", color(colors, DIM, "thanks for playing."));
-                return;
+            Some('5') => {
+                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+                chuck::play(&mut ctx);
             }
+            Some('6') => {
+                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+                roulette::play(&mut ctx);
+            }
+            Some('7') => {
+                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+                blackjack::play(&mut ctx);
+            }
+            Some('8') => {
+                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+                tournament::play(&mut ctx);
+            }
+            Some('9') => {
+                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+                lab::play(&mut ctx);
+            }
+            Some('s') => shop::open(&mut store, &mut screen),
+            Some('i') => show_stats(&mut store, &mut screen),
+            Some('o') => settings(&mut store, &mut screen),
+            Some('r') => rules(&mut screen),
+            Some('q') | None => break,
             _ => {}
         }
     }
+
+    let _ = store.save();
+    drop(screen);
+    println!("\n  thanks for playing — the house always keeps the lights on.\n");
+}
+
+fn draw_banner(screen: &mut Screen, theme: &Theme) {
+    let art = [
+        " ██████╗ ██╗ ██████╗███████╗     █████╗ ██████╗ ███████╗███╗   ██╗ █████╗ ",
+        " ██╔══██╗██║██╔════╝██╔════╝    ██╔══██╗██╔══██╗██╔════╝████╗  ██║██╔══██╗",
+        " ██║  ██║██║██║     █████╗      ███████║██████╔╝█████╗  ██╔██╗ ██║███████║",
+        " ██║  ██║██║██║     ██╔══╝      ██╔══██║██╔══██╗██╔══╝  ██║╚██╗██║██╔══██║",
+        " ██████╔╝██║╚██████╗███████╗    ██║  ██║██║  ██║███████╗██║ ╚████║██║  ██║",
+        " ╚═════╝ ╚═╝ ╚═════╝╚══════╝    ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝",
+    ];
+    for line in art {
+        screen.line(&theme.paint(ui::theme::GOLD, line));
+    }
+    screen.line(&theme.dim("            ♠ ♥ ♦ ♣   every table live, every roll animated   ♣ ♦ ♥ ♠"));
+    screen.blank();
+}
+
+/// A key-driven numeric picker with a consistent header/footer, for the
+/// handful of places a bounded quantity is genuinely needed (target
+/// score, player counts, bracket picks feed through their own screens).
+pub fn pick_amount(screen: &mut Screen, label: &str, min: i64, max: i64, default: i64, step: i64, presets: &[(char, i64, &str)]) -> Option<i64> {
+    let preset_keys: Vec<(char, i64)> = presets.iter().map(|(k, v, _)| (*k, *v)).collect();
+    widgets::number_picker(screen, min, max, default, step, &preset_keys, |s, value| {
+        let theme = s.theme;
+        s.begin();
+        ui::header(s, &label.to_uppercase());
+        s.blank();
+        s.line(&format!("   {}", theme.paint(ui::theme::GOLD, &format!("{value}"))));
+        s.blank();
+        s.line(&format!("  {}  {}", theme.paint(ui::theme::GOLD, "[↑/→]"), theme.dim("increase")));
+        s.line(&format!("  {}  {}", theme.paint(ui::theme::GOLD, "[↓/←]"), theme.dim("decrease")));
+        s.line(&format!("  {}  {}", theme.paint(ui::theme::GOLD, "[0-9]"), theme.dim("type a value")));
+        for (k, _, l) in presets {
+            s.line(&format!("  {}  {}", theme.paint(ui::theme::GOLD, &format!("[{}]", k.to_ascii_uppercase())), theme.dim(l)));
+        }
+        s.blank();
+        s.line(&widgets::footer(&theme, &[('\u{23ce}', "confirm"), ('\u{238b}', "cancel")]));
+    })
 }
 
 /// Builds the roster: the human player plus any humans/bots they add.
-fn setup_players(ctx: &mut Ctx, name: &str, min: usize, max: usize) -> Vec<Player> {
-    ui::header(ctx.colors, "PLAYERS");
-    let total = ui::prompt_usize("  how many players", min, max, min.max(2));
+fn setup_players(screen: &mut Screen, store: &mut Store, rng: &mut Rng, name: &str, min: usize, max: usize) -> Option<Vec<Player>> {
+    let total = pick_amount(screen, "how many players", min as i64, max as i64, min.max(2) as i64, 1, &[])? as usize;
     let mut players = vec![Player::human(name)];
     for i in 2..=total {
-        let is_bot = ui::confirm(&format!("  is player {i} a computer?"));
+        screen.begin();
+        ui::header(screen, &format!("PLAYER {i}"));
+        screen.blank();
+        screen.line(&widgets::footer(&screen.theme, &[('h', "human"), ('c', "computer")]));
+        screen.present();
+        let is_bot = ui::choose_key(&['h', 'c'], 'h') == Some('c');
         if is_bot {
-            println!("   1. Easy   2. Normal   3. Hard");
-            let d = Difficulty::from_index(ui::prompt_usize("  difficulty", 1, 3, 2));
+            let mut ctx = Ctx { rng, store, screen };
+            let d = games::pick_difficulty(&mut ctx, &format!("PLAYER {i} DIFFICULTY"));
             players.push(Player::bot(&format!("CPU-{}", i - 1), d));
         } else {
-            let n = ui::prompt(&format!("  name for player {i}: "));
-            let n = if n.is_empty() { format!("Player {i}") } else { n };
+            screen.begin();
+            ui::header(screen, &format!("PLAYER {i}"));
+            let n = widgets::text_input(screen, &format!("Player {i}"), 16, |s, buf| {
+                s.begin();
+                ui::header(s, &format!("PLAYER {i}"));
+                s.blank();
+                s.line(&format!("  name: {buf}█"));
+            });
             players.push(Player::human(&n));
         }
     }
-    players
+    Some(players)
 }
 
-fn show_stats(ctx: &mut Ctx) {
-    ui::clear();
-    ui::header(ctx.colors, "STATISTICS");
+fn show_stats(store: &mut Store, screen: &mut Screen) {
+    let theme = screen.theme;
+    screen.begin();
+    ui::header(screen, "STATISTICS");
     let rows = [
         ("Wallet", "econ"),
         ("Pig", "pig"),
         ("Yahtzee", "yahtzee"),
         ("Luck Bet", "luckbet"),
-        ("Tournament", "tourney"),
         ("Chuck-a-Luck", "chuck"),
+        ("Roulette", "roulette"),
+        ("Blackjack", "blackjack"),
+        ("Tournament", "tourney"),
         ("Dice Lab", "lab"),
         ("Store", "store"),
         ("Inventory", "inv"),
     ];
     let mut any = false;
     for (label, key) in rows {
-        let entries: Vec<(String, String)> = ctx
-            .store
+        let entries: Vec<(String, String)> = store
             .entries()
             .filter(|(k, _)| k.starts_with(&format!("{key}.")) && *k != "econ.init")
             .map(|(k, v)| (k.split_once('.').unwrap().1.to_string(), v.clone()))
@@ -145,82 +248,115 @@ fn show_stats(ctx: &mut Ctx) {
             continue;
         }
         any = true;
-        println!("\n  {}", color(ctx.colors, BOLD, label));
+        screen.blank();
+        screen.line(&theme.bold(label));
         for (k, v) in entries {
-            println!("   {:<14} {}", k, color(ctx.colors, CYAN, &v));
+            screen.line(&format!("   {:<16} {}", k, theme.paint(ui::theme::CYAN, &v)));
         }
     }
     if !any {
-        println!("\n  {}", color(ctx.colors, DIM, "no games played yet."));
+        screen.blank();
+        screen.line(&theme.dim("no games played yet."));
     }
-    println!("\n  {}", color(ctx.colors, DIM, &format!("saved at {}", ctx.store.path_display())));
-    ui::pause();
+    screen.blank();
+    screen.line(&theme.dim(&format!("saved at {}", store.path_display())));
+    ui::pause(screen);
 }
 
-fn settings(ctx: &mut Ctx) {
+fn settings(store: &mut Store, screen: &mut Screen) {
     loop {
-        ui::clear();
-        ui::header(ctx.colors, "SETTINGS");
-        let colors_on = ctx.store.get_i64("cfg.colors", 1) == 1;
-        println!("   1. name    : {}", ctx.store.get_str("player.name", "Player"));
-        println!("   2. colors  : {}", if colors_on { "on" } else { "off" });
-        println!("   3. reset statistics");
-        println!("   b. back");
-        match ui::prompt("\n  choose: ").to_lowercase().as_str() {
-            "1" => {
-                let n = ui::prompt("  new name: ");
-                if !n.is_empty() {
-                    ctx.store.set_str("player.name", &n);
-                }
+        let colors_on = store.get_i64("cfg.colors", 1) == 1;
+        screen.set_colors(colors_on);
+        screen.begin();
+        ui::header(screen, "OPTIONS");
+        screen.blank();
+        screen.line(&format!("  name    : {}", store.get_str("player.name", "Player")));
+        screen.line(&format!("  colors  : {}", if colors_on { "on" } else { "off" }));
+        screen.blank();
+        let items = vec![
+            MenuItem::new('n', "change name", ""),
+            MenuItem::new('c', "toggle colors", ""),
+            MenuItem::new('x', "reset statistics", "wipes stats and bankroll"),
+            MenuItem::new('b', "back", ""),
+        ];
+        match choose_from(screen, "SETTINGS", &items) {
+            Some('n') => {
+                screen.begin();
+                ui::header(screen, "OPTIONS");
+                let n = widgets::text_input(screen, &store.get_str("player.name", "Player"), 18, |s, buf| {
+                    s.begin();
+                    ui::header(s, "OPTIONS");
+                    s.blank();
+                    s.line(&format!("  new name: {buf}█"));
+                });
+                store.set_str("player.name", &n);
             }
-            "2" => ctx.store.set_i64("cfg.colors", if colors_on { 0 } else { 1 }),
-            "3" => {
-                if ui::confirm("  wipe all stats and bankrolls?") {
-                    ctx.store.reset();
-                    println!("  {}", color(ctx.colors, GREEN, "stats cleared."));
-                    ui::pause();
+            Some('c') => store.set_i64("cfg.colors", if colors_on { 0 } else { 1 }),
+            Some('x') => {
+                screen.begin();
+                ui::header(screen, "OPTIONS");
+                screen.blank();
+                screen.line("  wipe all stats and bankroll?");
+                screen.line(&widgets::footer(&screen.theme, &[('y', "wipe it"), ('n', "cancel")]));
+                screen.present();
+                if ui::confirm_key(false) {
+                    store.reset();
+                    screen.blank();
+                    screen.line(&screen.theme.win("stats cleared."));
+                    screen.present();
+                    ui::sleep_ms(500);
                 }
             }
             _ => {
-                let _ = ctx.store.save();
+                let _ = store.save();
                 return;
             }
         }
-        let _ = ctx.store.save();
+        let _ = store.save();
     }
 }
 
-fn rules(colors: bool) {
-    ui::clear();
-    ui::header(colors, "RULES");
-    println!(
-        "\n  {}\n   Roll to build a turn total, hold to bank it. Roll a 1 and the turn\n   total is gone. In the two-dice variant a single 1 ends the turn, snake\n   eyes wipes your whole score, and doubles pay double. First to the\n   target score wins.\n",
-        color(colors, BOLD, "PIG")
-    );
-    println!(
-        "  {}\n   Thirteen rounds, three rolls each: keep dice between rolls, then\n   commit the hand to one open category. 63+ in the upper section earns\n   a 35-point bonus; each extra Yahtzee after the first is worth 100.\n",
-        color(colors, BOLD, "YAHTZEE")
-    );
-    println!(
-        "  {}\n   Stake chips on a face (pays 1:1, 2:1 or 3:1 by how many of the three\n   dice show it), on HIGH (11-17) or LOW (4-10) at even money — both lose\n   to any triple — or on any triple at 30:1.\n",
-        color(colors, BOLD, "CHUCK-A-LUCK")
-    );
-    println!(
-        "  {}\n   Eight dice sit on the table, named A to H. Each player backs one\n   letter and the face they think it will show (6 by default), then the\n   table is rolled. A hit pays 5:1 from the house (6:1 with a VIP pass);\n   a miss loses the stake and rakes a fifth of it into the jackpot. Hit\n   your number while three or more dice show it and you sweep the\n   jackpot too. Up to three players — the other two can be CPUs.\n   TURBO plays the identical game hands-free: press Enter and the table\n   spins at 20 frames a second for three seconds before it settles.\n",
-        color(colors, BOLD, "LUCK BET")
-    );
-    println!(
-        "  {}\n   Pay a chip buy-in, get drawn into a single-elimination Pig bracket.\n   Your matches are played out; the rest of the bracket is simulated.\n   The champion takes 70% of the pool and the runner-up 30%.\n",
-        color(colors, BOLD, "TOURNAMENT")
-    );
-    println!(
-        "  {}\n   Chips are the table currency and dollars are the in-game cash — all\n   of it fictional. Buy chips at 10 per $1, cash out at 12 chips per $1,\n   and spend dollars on charms, insurance, reroll tokens, a VIP pass\n   (6:1 Luck Bet payouts) or gold dice.\n",
-        color(colors, BOLD, "THE STORE")
-    );
-    println!(
-        "  {}\n   Type dice notation like 4d6+2 to roll, `sim 2d6 50000` to plot the\n   distribution, or `seed 42` for reproducible rolls.\n",
-        color(colors, BOLD, "DICE LAB")
-    );
-    println!("  {}", color(colors, DIM, "tip: set DICE_SEED=<n> in the environment to seed the whole session."));
-    ui::pause();
+fn rules(screen: &mut Screen) {
+    let theme = screen.theme;
+    screen.begin();
+    ui::header(screen, "RULES");
+    let entries: [(&str, &str); 8] = [
+        ("PIG", "Roll to build a turn total, hold to bank it. Roll a 1 and the turn total is gone. In the two-dice variant a single 1 ends the turn, snake eyes wipes your whole score, and doubles pay double. First to the target score wins."),
+        ("YAHTZEE", "Thirteen rounds, three rolls each: keep dice between rolls, then commit the hand to one open category. 63+ in the upper section earns a 35-point bonus; each extra Yahtzee after the first is worth 100."),
+        ("CHUCK-A-LUCK", "Stake chips on a face (pays 1:1, 2:1 or 3:1 by how many of the three dice show it), on HIGH (11-17) or LOW (4-10) at even money — both lose to any triple — or on any triple at 30:1."),
+        ("LUCK BET", "Eight dice sit on the table, named A to H. Each player backs one letter and the face they think it will show, then the table is rolled. A hit pays 5:1 (6:1 with a VIP pass); a miss rakes a fifth of the stake into the jackpot. Land 3+ copies of your number and sweep the jackpot too. TURBO plays hands-free."),
+        ("ROULETTE", "Single-zero wheel. Straight-up numbers pay 35:1, split/street/corner bets pay accordingly, and the outside bets (red/black, odd/even, high/low, dozens, columns) pay even money or 2:1."),
+        ("BLACKJACK", "Beat the dealer's hand without going over 21. Face cards count 10, aces count 11 or 1. Dealer stands on 17. Blackjack (an ace + a ten-card on the deal) pays 3:2."),
+        ("TOURNAMENT", "Pay a chip buy-in, get drawn into a single-elimination Pig bracket. Your matches are played out; the rest of the bracket is simulated. Champion takes 70% of the pool, runner-up 30%."),
+        ("DICE LAB", "Roll dice notation like 4d6+2, `sim 2d6 50000` to plot the distribution, or `seed 42` for reproducible rolls."),
+    ];
+    for (title, body) in entries {
+        screen.blank();
+        screen.line(&theme.bold(title));
+        for line in wrap(body, 74) {
+            screen.line(&format!("   {line}"));
+        }
+    }
+    screen.blank();
+    screen.line(&theme.dim("tip: set DICE_SEED=<n> in the environment to seed the whole session."));
+    ui::pause(screen);
+}
+
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if cur.chars().count() + word.chars().count() + 1 > width {
+            lines.push(cur.clone());
+            cur.clear();
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
 }

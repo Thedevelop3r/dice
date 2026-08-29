@@ -2,7 +2,7 @@
 
 use super::{Ctx, Difficulty, Player};
 use crate::dice;
-use crate::ui::{self, *};
+use crate::ui::{self, dice_art, widgets, Screen};
 
 pub const CATEGORIES: [&str; 13] = [
     "Ones", "Twos", "Threes", "Fours", "Fives", "Sixes",
@@ -46,17 +46,17 @@ pub fn score_for(cat: usize, d: &[u32]) -> u32 {
             let face = cat as u32 + 1;
             t[face as usize] * face
         }
-        6 => if t.iter().any(|c| *c >= 3) { sum } else { 0 },
-        7 => if t.iter().any(|c| *c >= 4) { sum } else { 0 },
+        6 if t.iter().any(|c| *c >= 3) => sum,
+        7 if t.iter().any(|c| *c >= 4) => sum,
         8 => {
-            let has3 = t.iter().any(|c| *c == 3);
-            let has2 = t.iter().any(|c| *c == 2);
-            let has5 = t.iter().any(|c| *c == 5);
+            let has3 = t.contains(&3);
+            let has2 = t.contains(&2);
+            let has5 = t.contains(&5);
             if (has3 && has2) || has5 { 25 } else { 0 }
         }
-        9 => if longest_run(&t) >= 4 { 30 } else { 0 },
-        10 => if longest_run(&t) >= 5 { 40 } else { 0 },
-        11 => if t.iter().any(|c| *c == 5) { 50 } else { 0 },
+        9 if longest_run(&t) >= 4 => 30,
+        10 if longest_run(&t) >= 5 => 40,
+        11 if t.contains(&5) => 50,
         12 => sum,
         _ => 0,
     }
@@ -65,8 +65,8 @@ pub fn score_for(cat: usize, d: &[u32]) -> u32 {
 fn longest_run(tally: &[u32]) -> u32 {
     let mut best = 0;
     let mut run = 0;
-    for face in 1..=6usize {
-        if tally[face] > 0 {
+    for &count in &tally[1..=6] {
+        if count > 0 {
             run += 1;
             best = best.max(run);
         } else {
@@ -77,107 +77,134 @@ fn longest_run(tally: &[u32]) -> u32 {
 }
 
 pub fn play(ctx: &mut Ctx, players: Vec<Player>) {
-    ui::header(ctx.colors, "YAHTZEE");
-    println!("  13 rounds. Three rolls a turn — keep the dice you like, reroll the rest.");
-
     let mut cards: Vec<Card> = players.iter().map(|_| Card::new()).collect();
 
     for round in 1..=13u32 {
         for (i, p) in players.iter().enumerate() {
-            ui::header(ctx.colors, &format!("Round {round}/13 — {}", p.name));
-            let d = roll_phase(ctx, p, &cards[i]);
+            let d = roll_phase(ctx, &players, p, round, &cards[i]);
             let Some(d) = d else { return };
             let cat = choose_category(ctx, p, &cards[i], &d);
             let Some(cat) = cat else { return };
 
             // Joker/bonus rule: an extra Yahtzee after a scored 50 is worth 100 more.
-            if score_for(11, &d) == 50 && cards[i].slots[11] == Some(50) {
+            let bonus = score_for(11, &d) == 50 && cards[i].slots[11] == Some(50);
+            if bonus {
                 cards[i].bonus_yahtzees += 1;
-                println!("  {}", color(ctx.colors, GREEN, "BONUS YAHTZEE! +100"));
             }
             let pts = score_for(cat, &d);
             cards[i].slots[cat] = Some(pts);
-            println!(
-                "  {} → {} in {}",
-                color(ctx.colors, BOLD, &format!("{pts} pts")),
-                CATEGORIES[cat],
-                color(ctx.colors, DIM, "scorecard")
-            );
-            print_card(ctx.colors, &p.name, &cards[i]);
+            show_scored(ctx, p, &cards[i], cat, pts, bonus);
         }
     }
 
-    println!();
-    ui::header(ctx.colors, "FINAL SCORES");
-    let mut ranked: Vec<(usize, u32)> = cards.iter().enumerate().map(|(i, c)| (i, c.total())).collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
-    for (place, (i, total)) in ranked.iter().enumerate() {
-        let medal = ["🥇", "🥈", "🥉"].get(place).copied().unwrap_or("  ");
-        println!("  {medal} {:<14} {}", players[*i].name, color(ctx.colors, BOLD, &total.to_string()));
-    }
-    let (best_i, best) = ranked[0];
-    println!();
-    println!("  {}", color(ctx.colors, GREEN, &format!("★ {} wins with {} ★", players[best_i].name, best)));
-
-    ctx.store.bump("yahtzee.games", 1);
-    if !players[best_i].is_ai() {
-        ctx.store.bump("yahtzee.wins", 1);
-    }
-    for (i, c) in cards.iter().enumerate() {
-        if !players[i].is_ai() {
-            ctx.store.record_best("yahtzee.best", c.total() as i64);
-        }
-    }
-    let _ = ctx.store.save();
-    ui::pause();
+    final_scores(ctx, &players, &cards);
 }
 
-/// Rolls up to three times, letting the player (or AI) hold dice. `None` = quit.
-fn roll_phase(ctx: &mut Ctx, p: &Player, card: &Card) -> Option<Vec<u32>> {
-    let mut d = dice::roll_n(ctx.rng, 5, 6);
+fn hud(screen: &mut Screen, _players: &[Player], round: u32, p: &Player) {
+    ui::header(screen, &format!("YAHTZEE — round {round}/13 — {}'s turn", p.name));
+}
+
+/// Rolls up to three times, letting the player (or AI) hold dice between
+/// rolls. Held dice sit still through the animation; the rest tumble.
+/// `None` = quit.
+fn roll_phase(ctx: &mut Ctx, players: &[Player], p: &Player, round: u32, card: &Card) -> Option<Vec<u32>> {
+    let theme = ctx.theme();
+    let seed = vec![1u32; 5];
+    let all_open = [false; 5];
+    let mut d = dice_art::animate_roll(ctx.screen, ctx.rng, 6, &seed, &all_open, |screen, values| {
+        screen.begin();
+        hud(screen, players, round, p);
+        screen.blank();
+        for line in dice_art::dice_block(&theme, values, Some(&[false; 5][..])) {
+            screen.line(&line);
+        }
+        screen.blank();
+        screen.line(&theme.dim("rolling..."));
+    });
     let mut held = [false; 5];
+    ctx.store.bump("yahtzee.rolls", 1);
 
     for roll_no in 1..=2 {
-        ui::draw_dice(&d, Some(&held), ctx.colors);
         if let Some(diff) = p.ai {
+            ui::sleep_ms(500);
             held = ai_hold(diff, &d, card, ctx);
-            let kept: Vec<String> = d.iter().zip(held.iter()).filter(|(_, h)| **h).map(|(v, _)| v.to_string()).collect();
-            println!(
-                "  {} keeps [{}]",
-                color(ctx.colors, MAGENTA, "AI"),
-                kept.join(" ")
-            );
+            draw_hold_screen(ctx, players, &HoldView { round, player: p, dice: &d, held: &held, roll_no, ai_turn: true });
+            ctx.screen.present();
+            ui::sleep_ms(600);
         } else {
-            let ans = ui::prompt(&format!(
-                "  roll {roll_no}/3 — dice to keep (e.g. 135), (s)tand, (q)uit: "
-            ));
-            let low = ans.to_lowercase();
-            if low.starts_with('q') {
-                return None;
-            }
-            if low.starts_with('s') {
-                return Some(d);
-            }
-            held = [false; 5];
-            for ch in low.chars().filter(|c| c.is_ascii_digit()) {
-                let i = ch.to_digit(10).unwrap() as usize;
-                if (1..=5).contains(&i) {
-                    held[i - 1] = true;
+            loop {
+                draw_hold_screen(ctx, players, &HoldView { round, player: p, dice: &d, held: &held, roll_no, ai_turn: false });
+                ctx.screen.present();
+                match ui::read_key() {
+                    ui::Key::Char(c) if ('1'..='5').contains(&c) => {
+                        let i = c.to_digit(10).unwrap() as usize - 1;
+                        held[i] = !held[i];
+                    }
+                    ui::Key::Char('r') => break,
+                    ui::Key::Char('s') | ui::Key::Enter => return Some(d),
+                    ui::Key::Quit | ui::Key::Char('q') => return None,
+                    _ => {}
                 }
             }
-            if held.iter().all(|h| *h) {
-                return Some(d);
-            }
         }
-        for i in 0..5 {
-            if !held[i] {
-                d[i] = ctx.rng.roll(6);
+
+        let theme = ctx.theme();
+        let held_snapshot = held;
+        d = dice_art::animate_roll(ctx.screen, ctx.rng, 6, &d, &held_snapshot, |screen, values| {
+            screen.begin();
+            hud(screen, players, round, p);
+            screen.blank();
+            for line in dice_art::dice_block(&theme, values, Some(&held_snapshot[..])) {
+                screen.line(&line);
             }
-        }
+            screen.blank();
+            screen.line(&theme.dim("rolling..."));
+        });
         ctx.store.bump("yahtzee.rolls", 1);
     }
-    ui::draw_dice(&d, None, ctx.colors);
+
+    ctx.screen.begin();
+    hud(ctx.screen, players, round, p);
+    ctx.screen.blank();
+    for line in dice_art::dice_block(&ctx.theme(), &d, None) {
+        ctx.screen.line(&line);
+    }
+    ctx.screen.blank();
+    ctx.screen.line(&ctx.theme().dim("final roll — choose a category"));
+    ctx.screen.present();
+    ui::sleep_ms(if p.is_ai() { 500 } else { 0 });
     Some(d)
+}
+
+/// Everything `draw_hold_screen` needs beyond `ctx`/`players`, bundled so
+/// the function doesn't carry an unwieldy argument list.
+struct HoldView<'a> {
+    round: u32,
+    player: &'a Player,
+    dice: &'a [u32],
+    held: &'a [bool; 5],
+    roll_no: u32,
+    ai_turn: bool,
+}
+
+fn draw_hold_screen(ctx: &mut Ctx, players: &[Player], v: &HoldView) {
+    let theme = ctx.theme();
+    ctx.screen.begin();
+    hud(ctx.screen, players, v.round, v.player);
+    ctx.screen.blank();
+    for line in dice_art::dice_block(&theme, v.dice, Some(&v.held[..])) {
+        ctx.screen.line(&line);
+    }
+    ctx.screen.blank();
+    ctx.screen.line(&theme.dim(&format!("roll {}/3 · {} rerolls left", v.roll_no, 3 - v.roll_no)));
+    if v.ai_turn {
+        ctx.screen.line(&theme.dim("the house AI is deciding..."));
+    } else {
+        ctx.screen.line(&widgets::footer(
+            &theme,
+            &[('1', "toggle die 1"), ('…', ""), ('5', "toggle die 5"), ('r', "reroll"), ('s', "stand"), ('q', "quit")],
+        ));
+    }
 }
 
 /// Greedy keep policy: chase the face that already appears most, but keep a
@@ -185,7 +212,7 @@ fn roll_phase(ctx: &mut Ctx, p: &Player, card: &Card) -> Option<Vec<u32>> {
 fn ai_hold(diff: Difficulty, d: &[u32], card: &Card, ctx: &mut Ctx) -> [bool; 5] {
     let mut held = [false; 5];
     if diff == Difficulty::Easy && ctx.rng.below(3) == 0 {
-        return held; // sometimes rerolls everything
+        return held;
     }
     let t = dice::tally(d, 6);
     let straight_open = card.slots[9].is_none() || card.slots[10].is_none();
@@ -205,7 +232,8 @@ fn ai_hold(diff: Difficulty, d: &[u32], card: &Card, ctx: &mut Ctx) -> [bool; 5]
     held
 }
 
-/// Picks where to score. `None` = quit.
+/// Picks where to score. `None` = quit. Open categories are offered on
+/// letter keys a..m so the pick lands the instant it's pressed.
 fn choose_category(ctx: &mut Ctx, p: &Player, card: &Card, d: &[u32]) -> Option<usize> {
     let open: Vec<usize> = (0..13).filter(|i| card.slots[*i].is_none()).collect();
     if p.is_ai() {
@@ -215,57 +243,120 @@ fn choose_category(ctx: &mut Ctx, p: &Player, card: &Card, d: &[u32]) -> Option<
             .copied()
             .max_by_key(|c| {
                 let s = score_for(*c, d) as i64;
-                // Value upper-section progress toward the 63-point bonus.
                 let bonus_pull = if *c < 6 && diff == Difficulty::Hard { s - (*c as i64 + 1) * 3 } else { 0 };
                 let dump_penalty = if s == 0 { -(*c as i64) } else { 0 };
                 s * 10 + bonus_pull + dump_penalty
             })
             .unwrap_or(open[0]);
-        println!("  {} scores in {}", color(ctx.colors, MAGENTA, "AI"), CATEGORIES[pick]);
+        ui::sleep_ms(400);
         return Some(pick);
     }
 
-    println!();
-    println!("  {}", color(ctx.colors, BOLD, "open categories:"));
-    for c in &open {
-        println!(
-            "   {:>2}. {:<17} {}",
-            c + 1,
-            CATEGORIES[*c],
-            color(ctx.colors, if score_for(*c, d) > 0 { GREEN } else { DIM }, &format!("{} pts", score_for(*c, d)))
-        );
-    }
+    let theme = ctx.theme();
     loop {
-        let ans = ui::prompt("  score in # (or q to quit): ");
-        if ans.to_lowercase().starts_with('q') {
-            return None;
+        ctx.screen.begin();
+        ui::header(ctx.screen, "SCORE WHERE?");
+        ctx.screen.blank();
+        for line in dice_art::dice_block(&theme, d, None) {
+            ctx.screen.line(&line);
         }
-        match ans.parse::<usize>() {
-            Ok(n) if n >= 1 && n <= 13 && open.contains(&(n - 1)) => return Some(n - 1),
-            _ => println!("  ! pick an open category number"),
+        ctx.screen.blank();
+        let mut valid = Vec::new();
+        for (i, cat) in open.iter().enumerate() {
+            let key = (b'a' + i as u8) as char;
+            valid.push(key);
+            let pts = score_for(*cat, d);
+            ctx.screen.line(&format!(
+                "  {} {:<17} {}",
+                theme.paint(ui::theme::GOLD, &format!("[{}]", key.to_ascii_uppercase())),
+                CATEGORIES[*cat],
+                theme.paint(if pts > 0 { ui::theme::GREEN } else { ui::theme::DIM }, &format!("{pts} pts"))
+            ));
+        }
+        ctx.screen.blank();
+        ctx.screen.line(&theme.dim("press a letter to score there · q to quit"));
+        ctx.screen.present();
+        valid.push('q');
+        match ui::choose_key(&valid, 'q') {
+            Some('q') | None => return None,
+            Some(c) => {
+                let idx = (c as u8 - b'a') as usize;
+                if let Some(cat) = open.get(idx) {
+                    return Some(*cat);
+                }
+            }
         }
     }
 }
 
-pub fn print_card(colors: bool, name: &str, card: &Card) {
-    println!();
-    println!("  {}", color(colors, BOLD, &format!("── {name}'s card ──")));
-    for i in 0..13 {
+fn show_scored(ctx: &mut Ctx, p: &Player, card: &Card, cat: usize, pts: u32, bonus: bool) {
+    let theme = ctx.theme();
+    ctx.screen.begin();
+    ui::header(ctx.screen, &format!("{}'s card", p.name));
+    ctx.screen.blank();
+    if bonus {
+        ctx.screen.line(&theme.win("BONUS YAHTZEE! +100"));
+        ctx.screen.blank();
+    }
+    ctx.screen.line(&format!("  {} → {}", theme.bold(&format!("{pts} pts")), CATEGORIES[cat]));
+    ctx.screen.blank();
+    print_card(ctx.screen, card);
+    ctx.screen.present();
+    if p.is_ai() {
+        ui::sleep_ms(700);
+    } else {
+        ui::pause(ctx.screen);
+    }
+}
+
+fn print_card(screen: &mut Screen, card: &Card) {
+    let theme = screen.theme;
+    for (i, &name) in CATEGORIES.iter().enumerate() {
         let val = card.slots[i].map(|v| v.to_string()).unwrap_or_else(|| "-".into());
         if i == 6 {
-            println!(
+            screen.line(&format!(
                 "   {:<18} {:>4}   {}",
                 "Upper subtotal",
                 card.upper_subtotal(),
-                color(colors, DIM, &format!("bonus {}", card.upper_bonus()))
-            );
+                theme.dim(&format!("bonus {}", card.upper_bonus()))
+            ));
         }
-        println!("   {:<18} {:>4}", CATEGORIES[i], val);
+        screen.line(&format!("   {:<18} {:>4}", name, val));
     }
     if card.bonus_yahtzees > 0 {
-        println!("   {:<18} {:>4}", "Yahtzee bonus", card.bonus_yahtzees * 100);
+        screen.line(&format!("   {:<18} {:>4}", "Yahtzee bonus", card.bonus_yahtzees * 100));
     }
-    println!("   {}{:<18} {:>4}{}", if colors { BOLD } else { "" }, "TOTAL", card.total(), if colors { RESET } else { "" });
+    screen.line(&format!("   {}{:<18} {:>4}{}", if theme.colors { ui::theme::BOLD } else { "" }, "TOTAL", card.total(), if theme.colors { ui::theme::RESET } else { "" }));
+}
+
+fn final_scores(ctx: &mut Ctx, players: &[Player], cards: &[Card]) {
+    let theme = ctx.theme();
+    ctx.screen.begin();
+    ui::header(ctx.screen, "FINAL SCORES");
+    let mut ranked: Vec<(usize, u32)> = cards.iter().enumerate().map(|(i, c)| (i, c.total())).collect();
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.1));
+    ctx.screen.blank();
+    for (place, (i, total)) in ranked.iter().enumerate() {
+        let medal = ["🥇", "🥈", "🥉"].get(place).copied().unwrap_or("  ");
+        ctx.screen.line(&format!("  {medal} {:<16} {}", players[*i].name, theme.bold(&total.to_string())));
+    }
+    let (best_i, best) = ranked[0];
+    ctx.screen.blank();
+    for line in widgets::banner(&theme, &format!("{} WINS WITH {}", players[best_i].name, best), true) {
+        ctx.screen.line(&format!("  {line}"));
+    }
+
+    ctx.store.bump("yahtzee.games", 1);
+    if !players[best_i].is_ai() {
+        ctx.store.bump("yahtzee.wins", 1);
+    }
+    for (i, c) in cards.iter().enumerate() {
+        if !players[i].is_ai() {
+            ctx.store.record_best("yahtzee.best", c.total() as i64);
+        }
+    }
+    let _ = ctx.store.save();
+    ui::pause(ctx.screen);
 }
 
 #[cfg(test)]

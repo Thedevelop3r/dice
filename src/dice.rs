@@ -36,7 +36,7 @@ impl Notation {
         if count == 0 || count > 100 {
             return Err("dice count must be 1..=100".into());
         }
-        if sides < 2 || sides > 1000 {
+        if !(2..=1000).contains(&sides) {
             return Err("die must have 2..=1000 sides".into());
         }
         Ok(Notation { count, sides, modifier })

@@ -1,9 +1,8 @@
 //! Chuck-a-Luck — a three-dice wagering game with a persistent bankroll.
 
 use super::Ctx;
-use crate::dice;
 use crate::economy::Wallet;
-use crate::ui::{self, *};
+use crate::ui::{self, dice_art, widgets};
 
 const BAILOUT: i64 = 50;
 
@@ -46,63 +45,121 @@ impl Bet {
 }
 
 pub fn play(ctx: &mut Ctx) {
-    ui::header(ctx.colors, "CHUCK-A-LUCK");
-    println!("  Three dice. Back a number, the high/low halves, or any triple.");
-
     loop {
-        let bank = {
+        let bailed = {
             let mut w = Wallet::new(ctx.store);
-            if w.chips() <= 0 && w.ensure_solvent(BAILOUT) {
-                println!("  {}", color(ctx.colors, DIM, &format!("broke — the house stakes you {BAILOUT} chips.")));
-            }
-            w.chips()
+            w.chips() <= 0 && w.ensure_solvent(BAILOUT)
         };
-        println!();
-        println!("  bank: {}", color(ctx.colors, GREEN, &format!("{bank} chips")));
-        let choice = ui::prompt("  bet on (1-6 = number, h = high, l = low, t = triple, q = quit): ");
-        let low = choice.to_lowercase();
-        let bet = match low.chars().next() {
-            Some('q') | None => break,
+        if bailed {
+            message(ctx, &format!("broke — the house stakes you {BAILOUT} chips."));
+        }
+        let bank = Wallet::new(ctx.store).chips();
+
+        let theme = ctx.theme();
+        ctx.screen.begin();
+        ui::header(ctx.screen, "CHUCK-A-LUCK");
+        ctx.screen.blank();
+        ctx.screen.line(&format!("  bank: {}", theme.win(&format!("{bank} chips"))));
+        ctx.screen.blank();
+        ctx.screen.line("  three dice — back a number, high/low, or any triple.");
+        ctx.screen.blank();
+        ctx.screen.line(&widgets::footer(
+            &theme,
+            &[('1', "…"), ('6', "number"), ('h', "high"), ('l', "low"), ('t', "triple"), ('q', "leave")],
+        ));
+        ctx.screen.present();
+
+        let choice = ui::choose_key(&['1', '2', '3', '4', '5', '6', 'h', 'l', 't', 'q'], 'q');
+        let bet = match choice {
             Some('h') => Bet::High,
             Some('l') => Bet::Low,
             Some('t') => Bet::Triple,
-            Some(c) if c.is_ascii_digit() && ('1'..='6').contains(&c) => {
-                Bet::Number(c.to_digit(10).unwrap())
-            }
-            _ => {
-                println!("  ! 1-6, h, l, t or q");
-                continue;
-            }
+            Some(c) if c.is_ascii_digit() => Bet::Number(c.to_digit(10).unwrap()),
+            _ => break,
         };
 
-        let stake = ui::prompt_usize("  stake", 1, bank.max(1) as usize, 10.min(bank.max(1) as usize)) as i64;
-        println!("  {} on {}", color(ctx.colors, BOLD, &format!("{stake} chips")), bet.label());
+        let Some(stake) = widgets::number_picker(ctx.screen, 1, bank.max(1), 10.min(bank.max(1)), 5, &[('m', bank.max(1))], |s, v| {
+            let theme = s.theme;
+            s.begin();
+            ui::header(s, "CHUCK-A-LUCK");
+            s.blank();
+            s.line(&format!("  bet on {}", bet.label()));
+            s.blank();
+            s.line(&format!("  stake: {}", theme.paint(ui::theme::GOLD, &format!("{v} chips"))));
+            s.blank();
+            s.line(&widgets::footer(&theme, &[('↑', "+5"), ('↓', "-5"), ('m', "max"), ('\u{23ce}', "roll")]));
+        }) else {
+            continue;
+        };
 
-        let roll = dice::roll_n(ctx.rng, 3, 6);
-        ui::draw_dice(&roll, None, ctx.colors);
+        let seed = vec![1u32; 3];
+        let roll = dice_art::animate_roll(ctx.screen, ctx.rng, 6, &seed, &[false, false, false], |screen, values| {
+            let theme = screen.theme;
+            screen.begin();
+            ui::header(screen, "CHUCK-A-LUCK");
+            screen.blank();
+            screen.line(&format!("  {stake} chips on {}", bet.label()));
+            screen.blank();
+            for line in dice_art::dice_block(&theme, values, None) {
+                screen.line(&line);
+            }
+        });
         ctx.store.bump("chuck.rolls", 3);
 
         let mult = bet.payout(&roll);
         let delta = stake * mult;
         Wallet::new(ctx.store).add_chips(delta);
         if delta >= 0 {
-            println!("  {}", color(ctx.colors, GREEN, &format!("win +{delta} chips")));
             ctx.store.bump("chuck.wins", 1);
         } else {
-            println!("  {}", color(ctx.colors, RED, &format!("lose {delta} chips")));
             ctx.store.bump("chuck.losses", 1);
         }
-
         let _ = ctx.store.save();
 
+        let theme = ctx.theme();
+        ctx.screen.begin();
+        ui::header(ctx.screen, "CHUCK-A-LUCK");
+        ctx.screen.blank();
+        for line in dice_art::dice_block(&theme, &roll, None) {
+            ctx.screen.line(&line);
+        }
+        ctx.screen.blank();
+        if delta >= 0 {
+            ctx.screen.line(&theme.win(&format!("win +{delta} chips")));
+        } else {
+            ctx.screen.line(&theme.lose(&format!("lose {delta} chips")));
+        }
+        ctx.screen.present();
+        ui::pause(ctx.screen);
+
         if Wallet::new(ctx.store).chips() <= 0 {
-            println!("  {}", color(ctx.colors, RED, "you're cleaned out."));
-            if !ui::confirm("  keep playing?") {
+            ctx.screen.begin();
+            ui::header(ctx.screen, "CHUCK-A-LUCK");
+            ctx.screen.blank();
+            ctx.screen.line(&theme.lose("you're cleaned out."));
+            ctx.screen.line(&widgets::footer(&theme, &[('y', "keep playing"), ('n', "cash out")]));
+            ctx.screen.present();
+            if !ui::confirm_key(true) {
                 break;
             }
         }
     }
     let final_chips = Wallet::new(ctx.store).chips();
-    println!("  cashing out with {final_chips} chips.");
-    ui::pause();
+    let theme = ctx.theme();
+    ctx.screen.begin();
+    ui::header(ctx.screen, "CHUCK-A-LUCK");
+    ctx.screen.blank();
+    ctx.screen.line(&format!("  cashing out with {}", theme.win(&format!("{final_chips} chips"))));
+    ctx.screen.present();
+    ui::pause(ctx.screen);
+}
+
+fn message(ctx: &mut Ctx, text: &str) {
+    let theme = ctx.theme();
+    ctx.screen.begin();
+    ui::header(ctx.screen, "CHUCK-A-LUCK");
+    ctx.screen.blank();
+    ctx.screen.line(&format!("  {}", theme.dim(text)));
+    ctx.screen.present();
+    ui::sleep_ms(600);
 }
