@@ -7,8 +7,8 @@ use crate::stats::Store as Save;
 pub const CHIPS_PER_DOLLAR: i64 = 10;
 /// Chips -> dollars when cashing out (the spread is the house edge).
 pub const CHIPS_PER_DOLLAR_SELL: i64 = 12;
-pub const START_CHIPS: i64 = 100;
-pub const START_DOLLARS: i64 = 50;
+pub const START_CHIPS: i64 = 10000;
+pub const START_DOLLARS: i64 = 9000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Item {
