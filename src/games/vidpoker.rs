@@ -10,6 +10,7 @@
 use super::cards::{self, Card, HandRank, Shoe};
 use super::{table, Ctx};
 use crate::economy::Wallet;
+use crate::rng::Rng;
 use crate::ui::{self, card_art, widgets};
 
 const KEY: &str = "vidpoker";
@@ -238,6 +239,33 @@ pub fn idle(ctx: &mut Ctx) {
             return;
         }
     }
+}
+
+/// One hand held the way the demo machine holds: keep a paying hand, and
+/// otherwise keep the high cards. This is well short of optimal play, so
+/// the return it produces is a floor rather than the machine's headline
+/// figure — the band in `games::audit` says so.
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    let mut shoe = Shoe::new(rng, 1);
+    let mut hand: Vec<Card> = shoe.deal(rng, HAND);
+    let mut held = [false; HAND];
+    let score = cards::evaluate5(&hand);
+    if payout_mult(&hand).0 > 0 {
+        let keep: Vec<u8> = score.kickers.iter().take(2).copied().collect();
+        for (i, c) in hand.iter().enumerate() {
+            held[i] = keep.contains(&c.poker_rank()) || score.rank >= HandRank::Straight;
+        }
+    } else {
+        for (i, c) in hand.iter().enumerate() {
+            held[i] = c.poker_rank() >= 11;
+        }
+    }
+    for i in 0..HAND {
+        if !held[i] {
+            hand[i] = shoe.draw(rng);
+        }
+    }
+    (100, 100 * payout_mult(&hand).0)
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@
 
 use super::{table, Ctx};
 use crate::economy::Wallet;
+use crate::rng::Rng;
 use crate::ui::{self, widgets};
 
 const KEY: &str = "plinko";
@@ -63,8 +64,8 @@ fn payout(risk: Risk, slot: usize, stake: i64) -> i64 {
 
 /// Drops the ball, returning the number of rightward bounces — which is
 /// the slot it lands in.
-fn drop_path(ctx: &mut Ctx) -> Vec<bool> {
-    (0..ROWS).map(|_| ctx.rng.below(2) == 1).collect()
+fn drop_path(rng: &mut Rng) -> Vec<bool> {
+    (0..ROWS).map(|_| rng.below(2) == 1).collect()
 }
 
 fn draw_field(ctx: &mut Ctx, risk: Risk, depth: usize, right_so_far: usize, headline: &str, landed: Option<usize>, note: &str) {
@@ -116,7 +117,7 @@ fn draw_field(ctx: &mut Ctx, risk: Risk, depth: usize, right_so_far: usize, head
 
 /// Animates one drop and reports the slot.
 fn drop_ball(ctx: &mut Ctx, risk: Risk, headline: &str) -> usize {
-    let path = drop_path(ctx);
+    let path = drop_path(ctx.rng);
     let mut right = 0usize;
     for (d, went_right) in path.iter().enumerate() {
         draw_field(ctx, risk, d, right, headline, None, "");
@@ -234,6 +235,29 @@ pub fn idle(ctx: &mut Ctx) {
     }
 }
 
+/// One drop at a given risk, no rendering: chips staked, chips returned.
+pub fn simulate_at(rng: &mut Rng, which: usize) -> (i64, i64) {
+    let slot = drop_path(rng).iter().filter(|r| **r).count();
+    (100, payout(profile(which), slot, 100))
+}
+
+#[cfg(test)]
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    simulate_at(rng, 1)
+}
+
+/// The risk profiles, addressed by index so the audit harness never has
+/// to name this module's private types.
+pub const PROFILES: usize = 3;
+
+fn profile(i: usize) -> Risk {
+    [Risk::Low, Risk::Medium, Risk::High][i % PROFILES]
+}
+
+pub fn profile_name(i: usize) -> &'static str {
+    profile(i).label()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,12 +322,9 @@ mod tests {
 
     #[test]
     fn a_drop_always_lands_on_the_board() {
-        let mut store = crate::stats::Store::blank();
         let mut rng = crate::rng::Rng::from_seed(5);
-        let mut screen = crate::ui::Screen::headless();
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
         for _ in 0..500 {
-            let path = drop_path(&mut ctx);
+            let path = drop_path(&mut rng);
             assert_eq!(path.len(), ROWS);
             let slot = path.iter().filter(|r| **r).count();
             assert!(slot < SLOTS);

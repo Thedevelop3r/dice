@@ -8,6 +8,7 @@
 
 use super::{table, Ctx};
 use crate::economy::Wallet;
+use crate::rng::Rng;
 use crate::ui::{self, widgets};
 
 const KEY: &str = "slots";
@@ -117,10 +118,16 @@ fn draw_machine(ctx: &mut Ctx, strip: &[usize], pos: [usize; 3], stake: i64, not
     }
 }
 
+/// Where the three reels stop. Shared with the audit harness so the
+/// simulated odds are the machine's own odds, not a second opinion.
+fn draw_stops(rng: &mut Rng, n: usize) -> [usize; 3] {
+    [rng.below(n), rng.below(n), rng.below(n)]
+}
+
 /// Spins the reels, stopping them left to right, and reports the payline.
 fn spin(ctx: &mut Ctx, strip: &[usize], stake: i64, credits: Option<i64>) -> [usize; 3] {
     let n = strip.len();
-    let stops: [usize; 3] = [ctx.rng.below(n), ctx.rng.below(n), ctx.rng.below(n)];
+    let stops = draw_stops(ctx.rng, n);
     // Each reel runs a little longer than the one to its left; the frame
     // delay grows throughout so the whole machine eases to a stop.
     let halt = [16usize, 24, 33];
@@ -262,6 +269,15 @@ pub fn idle(ctx: &mut Ctx) {
     }
 }
 
+/// One spin at the machine's own odds, no rendering: chips staked, chips
+/// returned. Used by the audit harness in `games::audit`.
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    let strip = strip();
+    let stops = draw_stops(rng, strip.len());
+    let line = [strip[stops[0]], strip[stops[1]], strip[stops[2]]];
+    (100, 100 * payout_mult(line))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +337,24 @@ mod tests {
             assert!(pair[0].weight < pair[1].weight, "weights must ascend");
             assert!(pair[0].three > pair[1].three, "payouts must descend as weight rises");
         }
+    }
+
+    #[test]
+    fn the_machine_returns_what_it_should() {
+        // Twenty-one stops on three reels is 9,261 outcomes — few enough to
+        // add up exactly, so this is the machine's true return rather than
+        // an estimate of it.
+        let s = strip();
+        let n = s.len();
+        let mut paid = 0i64;
+        for a in 0..n {
+            for b in 0..n {
+                for c in 0..n {
+                    paid += payout_mult([s[a], s[b], s[c]]);
+                }
+            }
+        }
+        let rtp = paid as f64 / (n * n * n) as f64;
+        assert!(rtp > 0.90 && rtp < 0.96, "the machine returns {rtp:.4}");
     }
 }

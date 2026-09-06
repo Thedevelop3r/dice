@@ -10,6 +10,7 @@
 use super::cards::{self, Card, Shoe};
 use super::{table, Ctx};
 use crate::economy::Wallet;
+use crate::rng::Rng;
 use crate::ui::{self, card_art, widgets};
 
 const KEY: &str = "baccarat";
@@ -120,42 +121,67 @@ fn draw_table(ctx: &mut Ctx, player: &[Card], banker: &[Card], headline: &str, n
     }
 }
 
-/// Deals the hand out card by card so the count builds in front of you.
-fn deal_hand(ctx: &mut Ctx, shoe: &mut Shoe, headline: &str) -> (Vec<Card>, Vec<Card>) {
+/// Plays the hand out under the fixed rules — no rendering, no decisions.
+/// Deciding the whole hand first and replaying it is the same discipline
+/// the wheel and the race use, and it is what lets the audit harness run
+/// the real rules rather than a second copy of them.
+fn resolve(shoe: &mut Shoe, rng: &mut Rng) -> (Vec<Card>, Vec<Card>) {
     let mut player: Vec<Card> = Vec::with_capacity(3);
     let mut banker: Vec<Card> = Vec::with_capacity(3);
     for i in 0..4 {
-        let c = shoe.draw(ctx.rng);
+        let c = shoe.draw(rng);
         if i % 2 == 0 {
             player.push(c);
         } else {
             banker.push(c);
         }
-        draw_table(ctx, &player, &banker, headline, "dealing...");
+    }
+    if natural(&player) || natural(&banker) {
+        return (player, banker);
+    }
+    let mut player_third = None;
+    if total(&player) <= 5 {
+        let c = shoe.draw(rng);
+        player.push(c);
+        player_third = Some(pip(c));
+    }
+    if banker_draws(total(&banker), player_third) {
+        banker.push(shoe.draw(rng));
+    }
+    (player, banker)
+}
+
+/// Replays a resolved hand card by card so the count builds in front of you.
+fn deal_hand(ctx: &mut Ctx, shoe: &mut Shoe, headline: &str) -> (Vec<Card>, Vec<Card>) {
+    let (player, banker) = resolve(shoe, ctx.rng);
+
+    // The opening four, alternating, then whatever the rules drew after.
+    for i in 0..4 {
+        let p = &player[..(i / 2 + i % 2).min(player.len())];
+        let b = &banker[..(i / 2).min(banker.len())];
+        draw_table(ctx, p, b, headline, "dealing...");
         ctx.screen.present();
         ui::sleep_ms(420);
     }
-
-    if natural(&player) || natural(&banker) {
+    let opening = (&player[..2], &banker[..2]);
+    if player.len() == 2 && banker.len() == 2 {
         let theme = ctx.theme();
-        let note = theme.accent("a natural — the hand stands");
-        draw_table(ctx, &player, &banker, headline, &note);
+        let note = if natural(&player) || natural(&banker) {
+            theme.accent("a natural — the hand stands")
+        } else {
+            theme.dim("both stand")
+        };
+        draw_table(ctx, opening.0, opening.1, headline, &note);
         ctx.screen.present();
         ui::sleep_ms(900);
         return (player, banker);
     }
-
-    let mut player_third = None;
-    if total(&player) <= 5 {
-        let c = shoe.draw(ctx.rng);
-        player.push(c);
-        player_third = Some(pip(c));
-        draw_table(ctx, &player, &banker, headline, "player draws...");
+    if player.len() > 2 {
+        draw_table(ctx, &player, &banker[..2], headline, "player draws...");
         ctx.screen.present();
         ui::sleep_ms(700);
     }
-    if banker_draws(total(&banker), player_third) {
-        banker.push(shoe.draw(ctx.rng));
+    if banker.len() > 2 {
         draw_table(ctx, &player, &banker, headline, "banker draws...");
         ctx.screen.present();
         ui::sleep_ms(700);
@@ -256,6 +282,30 @@ pub fn idle(ctx: &mut Ctx) {
             return;
         }
     }
+}
+
+/// One hand backing `bet`, no rendering: chips staked, chips returned.
+pub fn simulate_at(rng: &mut Rng, which: usize) -> (i64, i64) {
+    let bet = bet(which);
+    let mut shoe = Shoe::new(rng, 6);
+    let (player, banker) = resolve(&mut shoe, rng);
+    (100, payout(bet, total(&player), total(&banker), 100))
+}
+
+#[cfg(test)]
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    simulate_at(rng, 1)
+}
+
+/// The three bets, by index — `Bet` stays private to this module.
+pub const BETS: usize = 3;
+
+fn bet(i: usize) -> Bet {
+    [Bet::Player, Bet::Banker, Bet::Tie][i % BETS]
+}
+
+pub fn bet_name(i: usize) -> &'static str {
+    bet(i).name()
 }
 
 #[cfg(test)]

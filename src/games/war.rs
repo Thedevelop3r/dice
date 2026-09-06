@@ -8,6 +8,7 @@
 use super::cards::{self, Card, Shoe};
 use super::{table, Ctx};
 use crate::economy::Wallet;
+use crate::rng::Rng;
 use crate::ui::{self, card_art, widgets};
 
 const KEY: &str = "war";
@@ -240,6 +241,30 @@ pub fn idle(ctx: &mut Ctx) {
             return;
         }
     }
+}
+
+/// One hand, always going to war on a tie — the more interesting of the
+/// two choices, and the one the table is really priced around.
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    let mut shoe = Shoe::new(rng, 6);
+    let ante = 100;
+    let mine = shoe.draw(rng);
+    let theirs = shoe.draw(rng);
+    let out = match mine.poker_rank().cmp(&theirs.poker_rank()) {
+        std::cmp::Ordering::Greater => Outcome::Straight,
+        std::cmp::Ordering::Less => Outcome::Lost,
+        std::cmp::Ordering::Equal => {
+            for _ in 0..BURN {
+                shoe.draw(rng);
+            }
+            match shoe.draw(rng).poker_rank().cmp(&shoe.draw(rng).poker_rank()) {
+                std::cmp::Ordering::Greater => Outcome::WarWon,
+                std::cmp::Ordering::Less => Outcome::WarLost,
+                std::cmp::Ordering::Equal => Outcome::WarTied,
+            }
+        }
+    };
+    (out.total_staked(ante), out.payout(ante))
 }
 
 #[cfg(test)]

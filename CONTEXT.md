@@ -32,12 +32,14 @@ The two constraints that define the whole codebase:
 
 | | |
 |---|---|
-| Source | 11,748 lines across 41 files |
-| Tests | 167, all passing |
+| Source | 14,528 lines across 48 files |
+| Tests | 217, all passing |
+| Starting balances | 10,000 chips / $9,000 — the user's own tuning in `economy.rs` |
 | Clippy | clean, zero warnings |
 | Dependencies | none |
 | Tables | 24 (8 dice, 6 card, 2 wheel, 8 arcade) |
 | Idle screens | 17 tables + a floor-wide cycler |
+| Background casino | a real simulation thread; 51 tables at 0.2% CPU |
 
 ---
 
@@ -54,7 +56,7 @@ point of every wagering game. Added the `[C] Casino` screen. Deliberately
 excluded Store exchanges and item purchases, since those aren't a game's
 outcome.
 
-**Session 4 (this one) — the big expansion.** Five threads:
+**Session 4 — the big expansion.** Five threads:
 
 - **Optimised the render path.** Added `Theme::paint_into` so animation
   inner loops don't allocate a `String` per painted segment; removed the
@@ -75,6 +77,62 @@ outcome.
 
 Also restructured the dashboard into rooms — 24 tables did not fit on one
 readable menu — and paginated the Rules screen for the same reason.
+
+**Session 5 — the house auditor.** Built `games/audit.rs`, the harness that
+plays every table headlessly and holds its realised return to a declared
+band. Getting there meant giving each table a `simulate(rng) -> (staked,
+returned)` entry point that runs through the *real* settlement code, which
+in turn meant two worthwhile refactors: every draw function that only ever
+needed the RNG now takes `&mut Rng` rather than a whole `Ctx` (and the tests
+that used to fake a `Ctx` got simpler), and Baccarat now resolves its hand
+first and replays it — the same outcome-first discipline the wheel and the
+race already used. Blackjack's settlement came out of `play` into
+`settle_hand` for the same reason.
+
+The harness paid for itself immediately: **Keno was badly mispriced.** Its
+return ran from 75% on a one-spot board down to **39.8% on a ten-spot** —
+against 93–99% everywhere else in the building, which quietly made the big
+boards a trap. Retuned against the exact hypergeometric odds, in hundredths
+so a one-spot board can be priced honestly at all, every board now returns
+90–93%. The exact check lives in `keno.rs` and cannot drift.
+
+**Session 6 (most recent) — the living casino.** `[A] Start Casino` on the
+dashboard opens a floor that runs itself on a **real OS thread**, entirely
+independently of whatever screen is showing. This is the first genuinely
+concurrent thing in the codebase.
+
+The five pieces map onto the brief one-for-one, and the separation is the
+point rather than an accident:
+
+- `casino/bank.rs` — the economy manager. Money and chips are genuinely
+  separate: chips move bet by bet at the tables, money moves only at the
+  cage. Because the cage sells chips at 10/$1 and buys them back at 12/$1
+  (the Store's own long-standing spread), the house takes a cut on every
+  visit before a single bet is struck — which is why the two numbers move
+  independently and why watching them is interesting.
+- `casino/patron.rs` — simulated players. Four traits (nerve, appetite,
+  discipline, read), each the average of two rolls so the extremes are rare.
+  **No trait bends an outcome.** Appetite changes *which real bet* a patron
+  takes off the table's ladder, nerve changes the stake, discipline decides
+  when they walk. `luck` is measured after the fact, never rolled — letting a
+  patron be born lucky would quietly undo `games::audit`.
+- `casino/instance.rs` — one table: seats, round clock, bounded history.
+  Rounds resolve through each game's own `simulate` entry point, so a
+  background table *is* the real game with the animation taken away.
+- `casino/manager.rs` — the simulation thread. Owns every instance, advances
+  the ones whose round is due, hands out read-only snapshots.
+- `casino/ui.rs` — screens that draw snapshots and nothing else.
+
+The badge in the top-right is a lock-free `ui::Badge` the simulation thread
+writes once per tick, and `Screen::present` stamps into row 1 with an
+absolute cursor move. That is why it stays current on *every* screen —
+including deep inside a hand of blackjack the user is playing themselves —
+without a single other screen knowing it exists.
+
+Verified live: watching Slots #1 it ran 3→14; hopping to Slots #2 found it
+already at round 16 having run unwatched; hopping back found #1 at 17, still
+holding its patrons and history. Fifty-one tables run at 0.2% CPU and 3.5 MB
+across two threads.
 
 ### The fourteen new tables
 
@@ -116,6 +174,13 @@ src/
     card_art.rs    281  cards at three sizes, block-art suits
     menu.rs         80  the boxed keyed menu
     widgets.rs     143  number_picker, text_input, footer, banner, bar
+  casino/                  ← the background simulation (session 6)
+    mod.rs          27  what the five pieces are and why they are separate
+    bank.rs        205  the economy manager: money, chips, the cage spread
+    patron.rs      313  simulated players and the traits that drive them
+    instance.rs    499  one running table + the Kind → real-game mapping
+    manager.rs     475  the simulation thread, snapshots, start/stop/pause
+    ui.rs          413  opening screen, floor overview, live table view
   games/
     mod.rs         109  Ctx, Difficulty, Player, pick_difficulty
     cards.rs       443  shared deck/shoe/hand rankings  ← every card table
@@ -217,11 +282,58 @@ Then register the idle function in `floor::ATTRACT` and it joins the cycler.
 - **Two screens now paginate** (History, Rules). Anything else that grows
   past a screen needs the same treatment.
 
+### The casino simulation
+
+- **The UI is a viewer, never a driver.** Nothing under `casino/ui.rs` may
+  advance a simulation, and nothing above `manager.rs` may hold game state.
+  Break this and "the table kept running while I was away" stops being true.
+- **The lock is never held across a draw or a keypress** — only for a tick or
+  a snapshot copy. The UI cannot stall the floor and the floor cannot stall
+  the UI.
+- **Tables are paced by the clock, not by tick count** (`Instance::next_at`),
+  so pace survives a slow or busy machine. A paused table has its `next_at`
+  pushed forward each tick so resuming it does not fire a burst of rounds.
+- **Total chips are conserved.** Buy-in, settlement and cash-out are all
+  transfers, so the tray plus every stack in the room is a constant — pinned
+  by `chips_are_only_ever_moved_never_created`. If that ever fails, the
+  casino is printing money.
+- **Patron traits must never touch an outcome.** They pick bets and sizes;
+  the table's audited maths does the rest.
+- **`simulate` is now shipped, not test-only.** The casino drives real games
+  through it. The plain `simulate` on tables the casino reaches via
+  `simulate_at` (baccarat, bigsix, chuck, horses, keno, plinko, roulette) is
+  still `#[cfg(test)]` — only the audit uses those.
+- **Padding coloured text needs `ui::pad_end` / `ui::pad_start`.**
+  `format!("{:<9}")` counts escape bytes as characters and shears columns —
+  the same bug the `10` card had.
+
 ---
+
+## Delivering changes
+
+The cloud workspace this is developed in is a *mirror*, not the repo. Two
+rules, both learned the hard way:
+
+1. **A change that spans modules must ship every file it touched.** The
+   session-6 casino failed to build on the real machine because the
+   `casino/` files shipped but the seventeen game files whose `#[cfg(test)]`
+   gates had been lifted did not. A green build in the mirror proves
+   nothing about the repo unless the same set of files is in both.
+2. **Diff against the real repo before shipping, not after.** Stage the
+   files with `device_stage_files` and `cmp` them. That is also how the
+   user's own edit to `economy.rs` was caught before it got overwritten —
+   they had raised the starting balances (`START_CHIPS` 10000,
+   `START_DOLLARS` 9000) and a blind commit would have reverted it.
+
+A from-scratch build in a pristine copy (`cp -r src Cargo.toml` somewhere
+new, then `cargo build --release`) is the check that actually matches what
+`cargo install` does on the user's machine.
 
 ## Verifying changes
 
-`cargo test` covers the maths. It cannot cover the thing this app mostly
+`cargo test` covers the maths, and `cargo test --release audit --
+--nocapture` prints the whole book of returns — the fastest way to see that
+a paytable edit did what you meant. It cannot cover the thing this app mostly
 is — what appears on screen. For that, drive a real pty with tmux:
 
 ```bash
@@ -292,9 +404,13 @@ Notes that will save time:
    pegs is correct; only the spacing reads badly.
 3. **The save file has no version field.** Any future change to the key
    layout will silently misread old saves.
-4. **RTP claims are point estimates in tests.** Correct, but a change to a
-   paytable could drift the real return without failing anything if the
-   test's tolerance is loose.
+4. **Big Six returns 75–89%**, well below the 93–99% the rest of the floor
+   pays. That is authentic — a real money wheel is the meanest thing on any
+   casino floor — but it is inconsistent with this building. Worth deciding
+   deliberately rather than leaving as an accident.
+5. **Video poker and blackjack are audited under sub-optimal play** (demo
+   holds, and hit-below-17 with no doubling). Their bands are floors, not
+   the tables' headline returns. Real basic strategy would raise both.
 
 ---
 
@@ -302,18 +418,13 @@ Notes that will save time:
 
 Roughly in the order I would take them.
 
-### 1. A headless RTP harness (highest value)
+### 1. Persist the running floor
 
-This app is now fourteen paytables deep, and its central promise is that
-every one of them is honestly priced. Right now each table proves that its
-own way, in its own test. A single harness — run N rounds of every table
-against a seeded RNG with no rendering, report the realised return — would
-turn that into one table of numbers you can eye in a second, and catch a
-paytable edit that quietly moves a game to 1.4× return.
-
-It needs each game's settlement maths callable without its UI. Most are
-already pure functions (`payout_mult`, `payout`, `multiplier`); the work is
-a common trait or a small registry over them.
+The casino's *balances* survive a restart (`casino.money` / `casino.chips`
+in the save file) but its *tables* do not — reopening starts a fresh floor.
+Serialising the instance roster would make the casino genuinely persistent
+between sessions, which is the one part of the brief's "living environment"
+that is currently only true within a run.
 
 ### 2. Close the four idle gaps
 
@@ -322,19 +433,31 @@ match, so a bot-vs-bot display loop is mostly rendering. Yahtzee needs an
 AI that fills a scorecard, which is more interesting work. The Dice Lab
 could idle by cycling distribution plots, which would actually look good.
 
-### 3. Save-file versioning
+### 3. Decide what Big Six should pay
+
+The auditor makes it plain that Big Six is the outlier on the floor at
+75–89%. Authentic, but out of keeping. Either soften the paytable to sit
+with everything else, or leave it and say so on the table's own screen so a
+player is choosing it knowingly rather than being caught out.
+
+Pig and Tournament are cheap — `pig::simulate` already runs a headless
+match, so a bot-vs-bot display loop is mostly rendering. Yahtzee needs an
+AI that fills a scorecard, which is more interesting work. The Dice Lab
+could idle by cycling distribution plots, which would actually look good.
+
+### 4. Save-file versioning
 
 Add `save.version` now, while the layout is fresh, plus a migration hook.
 Cheap today, and the alternative is silently corrupting people's stats the
 first time a key gets renamed.
 
-### 4. Split `main.rs`
+### 5. Split `main.rs`
 
 609 lines, and the four room menus are the bulk of it. They belong in
 something like `ui/dashboard.rs`, leaving `main.rs` as wiring. Worth doing
 before a fifth room appears.
 
-### 5. Product depth, if you want the game to grow rather than the codebase
+### 6. Product depth, if you want the game to grow rather than the codebase
 
 - **A progressive jackpot** shared across the arcade tables, fed by a rake,
   paid on a rare trigger. Luck Bet already has a per-table version of this,
@@ -347,7 +470,7 @@ before a fifth room appears.
   one theme; a colour-blind-safe palette would be a genuine accessibility
   win, not just a cosmetic one.
 
-### 6. Smaller polish
+### 7. Smaller polish
 
 - Widen Plinko's slot cells (gap 2).
 - Make the floor cycler's 24-second slot configurable in Options.

@@ -13,6 +13,7 @@
 
 use super::{table, Ctx};
 use crate::economy::Wallet;
+use crate::rng::Rng;
 use crate::ui::{self, widgets};
 
 const KEY: &str = "horses";
@@ -47,10 +48,10 @@ fn weights() -> [i64; RUNNERS] {
 }
 
 /// Draws the winner from the book's own weights.
-fn draw_winner(ctx: &mut Ctx) -> usize {
+fn draw_winner(rng: &mut Rng) -> usize {
     let w = weights();
     let total: i64 = w.iter().sum();
-    let mut roll = ctx.rng.below(total as usize) as i64;
+    let mut roll = rng.below(total as usize) as i64;
     for (i, weight) in w.iter().enumerate() {
         roll -= weight;
         if roll < 0 {
@@ -194,7 +195,7 @@ pub fn play(ctx: &mut Ctx) {
             continue;
         }
 
-        let winner = draw_winner(ctx);
+        let winner = draw_winner(ctx.rng);
         run_race(ctx, winner, Some(backed), stake, false);
 
         ctx.store.bump("horses.races", 1);
@@ -223,7 +224,7 @@ pub fn idle(ctx: &mut Ctx) {
         let punter = table::BOT_NAMES[ctx.rng.below(table::BOT_NAMES.len())];
         let backed = ctx.rng.below(RUNNERS);
         let stake = 10 + 5 * ctx.rng.below(5) as i64;
-        let winner = draw_winner(ctx);
+        let winner = draw_winner(ctx.rng);
 
         let theme = ctx.theme();
         let note = theme.dim(&format!("{punter} is on {} at {}:1", CARD[backed].0, CARD[backed].1));
@@ -256,6 +257,18 @@ pub fn idle(ctx: &mut Ctx) {
         }
     }
 }
+
+/// One race with a ticket on `backed`, no rendering.
+pub fn simulate_at(rng: &mut Rng, backed: usize) -> (i64, i64) {
+    (100, payout(backed, draw_winner(rng), 100))
+}
+
+#[cfg(test)]
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    simulate_at(rng, 0)
+}
+
+pub const FIELD: usize = RUNNERS;
 
 #[cfg(test)]
 mod tests {
@@ -305,14 +318,11 @@ mod tests {
 
     #[test]
     fn winners_come_out_in_roughly_their_advertised_share() {
-        let mut store = crate::stats::Store::blank();
         let mut rng = crate::rng::Rng::from_seed(17);
-        let mut screen = crate::ui::Screen::headless();
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
         let n = 120_000;
         let mut wins = [0i64; RUNNERS];
         for _ in 0..n {
-            wins[draw_winner(&mut ctx)] += 1;
+            wins[draw_winner(&mut rng)] += 1;
         }
         let w = weights();
         let total: i64 = w.iter().sum();
@@ -325,13 +335,10 @@ mod tests {
 
     #[test]
     fn the_whole_field_is_drawable() {
-        let mut store = crate::stats::Store::blank();
         let mut rng = crate::rng::Rng::from_seed(23);
-        let mut screen = crate::ui::Screen::headless();
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
         let mut seen = [false; RUNNERS];
         for _ in 0..5_000 {
-            seen[draw_winner(&mut ctx)] = true;
+            seen[draw_winner(&mut rng)] = true;
         }
         assert!(seen.iter().all(|s| *s), "some runner can never win: {seen:?}");
     }

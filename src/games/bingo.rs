@@ -10,6 +10,7 @@
 
 use super::{table, Ctx};
 use crate::economy::Wallet;
+use crate::rng::Rng;
 use crate::ui::{self, widgets};
 
 const KEY: &str = "bingo";
@@ -52,13 +53,13 @@ struct Card {
 }
 
 impl Card {
-    fn new(ctx: &mut Ctx) -> Card {
+    fn new(rng: &mut Rng) -> Card {
         let mut cells = [[0u32; SIDE]; SIDE];
         for (c, col) in cells.iter_mut().enumerate() {
             let lo = (c * PER_COLUMN + 1) as u32;
             let mut pool: Vec<u32> = (lo..lo + PER_COLUMN as u32).collect();
             for i in (1..pool.len()).rev() {
-                let j = ctx.rng.below(i + 1);
+                let j = rng.below(i + 1);
                 pool.swap(i, j);
             }
             let mut chosen: Vec<u32> = pool.into_iter().take(SIDE).collect();
@@ -110,10 +111,10 @@ fn payout_mult(first_line: Option<usize>) -> i64 {
 }
 
 /// The caller's list: every ball, shuffled, capped at the limit.
-fn call_sheet(ctx: &mut Ctx) -> Vec<u32> {
+fn call_sheet(rng: &mut Rng) -> Vec<u32> {
     let mut pool: Vec<u32> = (1..=BALLS as u32).collect();
     for i in (1..pool.len()).rev() {
-        let j = ctx.rng.below(i + 1);
+        let j = rng.below(i + 1);
         pool.swap(i, j);
     }
     pool.truncate(LIMIT);
@@ -210,8 +211,8 @@ pub fn play(ctx: &mut Ctx) {
             continue;
         }
 
-        let mut card = Card::new(ctx);
-        let sheet = call_sheet(ctx);
+        let mut card = Card::new(ctx.rng);
+        let sheet = call_sheet(ctx.rng);
         let mut called: Vec<u32> = Vec::with_capacity(LIMIT);
         let mut first_line: Option<usize> = None;
 
@@ -274,8 +275,8 @@ pub fn play(ctx: &mut Ctx) {
 pub fn idle(ctx: &mut Ctx) {
     let lines = lines();
     loop {
-        let mut cards: Vec<(usize, Card)> = (0..3).map(|_| (ctx.rng.below(table::BOT_NAMES.len()), Card::new(ctx))).collect();
-        let sheet = call_sheet(ctx);
+        let mut cards: Vec<(usize, Card)> = (0..3).map(|_| (ctx.rng.below(table::BOT_NAMES.len()), Card::new(ctx.rng))).collect();
+        let sheet = call_sheet(ctx.rng);
         let mut called: Vec<u32> = Vec::with_capacity(LIMIT);
         let mut winner: Option<(usize, usize)> = None;
 
@@ -331,20 +332,35 @@ pub fn idle(ctx: &mut Ctx) {
     }
 }
 
+/// One card against one call sheet, no rendering: chips staked, chips
+/// returned.
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    let lines = lines();
+    let mut card = Card::new(rng);
+    let mut first = None;
+    for (i, ball) in call_sheet(rng).iter().enumerate() {
+        card.mark(*ball);
+        if card.completed_lines(&lines) > 0 {
+            first = Some(i + 1);
+            break;
+        }
+    }
+    (100, 100 * payout_mult(first))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn probe() -> (crate::rng::Rng, crate::stats::Store, crate::ui::Screen) {
-        (crate::rng::Rng::from_seed(41), crate::stats::Store::blank(), crate::ui::Screen::headless())
+    fn probe() -> Rng {
+        Rng::from_seed(41)
     }
 
     #[test]
     fn a_card_draws_each_column_from_its_own_range() {
-        let (mut rng, mut store, mut screen) = probe();
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+        let mut rng = probe();
         for _ in 0..300 {
-            let card = Card::new(&mut ctx);
+            let card = Card::new(&mut rng);
             for c in 0..SIDE {
                 let lo = (c * PER_COLUMN + 1) as u32;
                 let hi = lo + PER_COLUMN as u32 - 1;
@@ -360,9 +376,8 @@ mod tests {
 
     #[test]
     fn the_centre_square_starts_marked_and_stays_that_way() {
-        let (mut rng, mut store, mut screen) = probe();
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
-        let mut card = Card::new(&mut ctx);
+        let mut rng = probe();
+        let mut card = Card::new(&mut rng);
         assert!(card.marked[SIDE / 2][SIDE / 2]);
         // Calling the number printed under the free square changes nothing.
         let under = card.cells[SIDE / 2][SIDE / 2];
@@ -379,8 +394,7 @@ mod tests {
 
     #[test]
     fn rows_columns_and_both_diagonals_all_count() {
-        let (mut rng, mut store, mut screen) = probe();
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+        let mut rng = probe();
         let l = lines();
         for target in [
             (0..SIDE).map(|c| (c, 2)).collect::<Vec<_>>(),
@@ -388,7 +402,7 @@ mod tests {
             (0..SIDE).map(|i| (i, i)).collect::<Vec<_>>(),
             (0..SIDE).map(|i| (i, SIDE - 1 - i)).collect::<Vec<_>>(),
         ] {
-            let mut card = Card::new(&mut ctx);
+            let mut card = Card::new(&mut rng);
             assert_eq!(card.completed_lines(&l), 0);
             for (c, r) in &target {
                 card.marked[*c][*r] = true;
@@ -399,10 +413,9 @@ mod tests {
 
     #[test]
     fn the_gap_counts_down_as_a_line_fills() {
-        let (mut rng, mut store, mut screen) = probe();
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+        let mut rng = probe();
         let l = lines();
-        let mut card = Card::new(&mut ctx);
+        let mut card = Card::new(&mut rng);
         // The middle row already has the free square, so it needs four.
         assert_eq!(card.closest_gap(&l), 4);
         card.marked[0][2] = true;
@@ -426,15 +439,14 @@ mod tests {
         // Deal a few thousand real cards against real call sheets and add
         // up what the table would have paid. This is the number the bands
         // were chosen for, so a change to either must move it back.
-        let (mut rng, mut store, mut screen) = probe();
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+        let mut rng = probe();
         let l = lines();
         let rounds = 4_000;
         let mut paid = 0i64;
         for _ in 0..rounds {
-            let mut card = Card::new(&mut ctx);
+            let mut card = Card::new(&mut rng);
             let mut first = None;
-            for (i, ball) in call_sheet(&mut ctx).iter().enumerate() {
+            for (i, ball) in call_sheet(&mut rng).iter().enumerate() {
                 card.mark(*ball);
                 if card.completed_lines(&l) > 0 {
                     first = Some(i + 1);
@@ -449,10 +461,9 @@ mod tests {
 
     #[test]
     fn a_call_sheet_never_repeats_a_ball() {
-        let (mut rng, mut store, mut screen) = probe();
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+        let mut rng = probe();
         for _ in 0..200 {
-            let sheet = call_sheet(&mut ctx);
+            let sheet = call_sheet(&mut rng);
             assert_eq!(sheet.len(), LIMIT);
             let mut seen = std::collections::HashSet::new();
             assert!(sheet.iter().all(|b| seen.insert(*b)), "a ball was called twice");

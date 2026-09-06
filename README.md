@@ -1,27 +1,14 @@
-# Dice Arena  -  Built with Claude AI
+# Dice Arena
 
 A casino console in Rust — **zero external crates**, including its own PRNG
 and its own raw-terminal input (direct `termios(3)` FFI, no `crossterm`).
-Twenty-four tables across four rooms, every one of them animated, and every
-one of them able to run itself with nobody watching.
+Twenty-four tables across four rooms, every one of them animated, every one
+able to run itself with nobody watching — and a whole casino that keeps
+running on its own thread while you play something else.
 
-*Install Deps*
-```
-cargo install --path .
-
-```
-*Build project*
-```
-cargo build --release
-
-```
-*Run Binary build*
 ```
 cargo run --release
-
 ```
-
-![Home Screen](screenshots/home.png)
 
 ## Controls
 
@@ -93,7 +80,7 @@ All six deal from one shared deck, shoe and set of hand rankings
 | | |
 |---|---|
 | **Slots** | Three weighted reels stopping left to right on one payline. The reels are real strips — each symbol appears as many times as its weight — so the odds are visible in the code rather than hidden in a constant. Three of a kind pays 8x to 120x; loose sevens pay on their own. |
-| **Keno** | Cover 1–10 spots on an eighty-number board; twenty balls come out one at a time. Cover one and a single hit pays 3x; cover ten and you need five before anything pays — but all ten pays 10,000x. |
+| **Keno** | Cover 1–10 spots on an eighty-number board; twenty balls come out one at a time. Cover one and a single hit pays 3.7x; cover ten and you need five before anything pays — but all ten pays 250,000x. Every board size returns the same 90–93%, checked against the exact hypergeometric odds. |
 | **Bingo** | A 75-ball card with a free centre. Forty balls are called and the payout is on *how fast* your first line lands: 30x by ball 15, down to your stake back by ball 40. Flat-rate bingo would hand the building over — a line inside forty balls turns up nearly half the time. |
 | **Plinko** | Drop a ball through twelve rows of pegs into thirteen slots. Low, medium and high risk change how sharply the prizes climb toward the edges — up to 220x — but all three return the same share of your stake. |
 | **Mines** | Choose how many mines hide under twenty-five tiles, then turn them over one at a time. Each safe tile raises the multiplier by the true odds of having got that far. Cash out whenever; find a mine and the round is gone. |
@@ -118,7 +105,7 @@ money wheel decelerates into its pointer, a plinko ball accelerates as it
 falls, keno balls speed up as the board fills, and a crash curve tightens
 exactly as the decision gets harder.
 
-Nothing is deco:rative. Where an outcome is drawn before the animation runs —
+Nothing is decorative. Where an outcome is drawn before the animation runs —
 the wheel's segment, the race winner — the animation is worked backwards
 from that result so what you watch is what you get.
 
@@ -131,6 +118,36 @@ the renderers measure the window and take the biggest that fits, so
 Chuck-a-Luck's three dice fill the screen while Ultra Casino Dice's twelve
 fall back gracefully on the very same terminal. A big card fills its face
 with its suit drawn as block art.
+
+## The casino
+
+`[A] Start Casino` opens a floor that runs itself. Tables deal, patrons buy
+in and cash out, and the books move — on a real background thread, entirely
+independently of whatever screen you happen to be looking at.
+
+- **Pick a floor** — a quiet night, a busy floor, one of everything, or all
+  fifty-one tables at once. Open more at any time.
+- **The overview** lists every running table with its seats, round, status,
+  take and last result. Move with `J`/`K`, watch one with `W`, pause with
+  `P`, close with `X`, change speed with `S`.
+- **Watching a table** shows who is sitting there, what each of them just
+  bet, their stack, and how they have run. `N`/`P` step to the next table —
+  the ones you leave keep playing.
+- **The money and chips in the top-right** are the casino's own, live. They
+  stay on screen everywhere in the app, including in the middle of a hand
+  you are playing yourself.
+
+Patrons are not random noise with names on. Four traits — nerve, appetite,
+discipline and read — decide how much they stake, how far up a table's bet
+ladder they reach, and when they walk away. What no trait does is bend an
+outcome: every background round is settled by the same audited maths as the
+table you would play by hand. A patron's `luck` is therefore *measured*
+rather than rolled.
+
+Money and chips are separate quantities. Chips move bet by bet at the
+tables; money moves only at the cage, where the house sells chips at 10 to
+the dollar and buys them back at 12 — so it takes a cut on every visit
+before anyone places a bet.
 
 ## Idle screens
 
@@ -189,6 +206,10 @@ that touch nothing in the games that came before them.
   uses to time-slice tables that don't know they're being cycled.
 - `src/games/floor.rs` — which tables exist, and the screensaver that walks
   them.
+- `src/casino/` — the background simulation: `bank.rs` (the one set of
+  books), `patron.rs` (simulated players), `instance.rs` (one running
+  table), `manager.rs` (the simulation thread), `ui.rs` (screens that draw
+  snapshots and never run anything).
 - `src/economy.rs` — `Wallet` (the player's chips, dollars and inventory)
   and `House`, the casino's mirror-image ledger, recorded explicitly at each
   game's settlement point rather than hooked generically into `Wallet`
@@ -220,22 +241,39 @@ that touch nothing in the games that came before them.
 cargo test
 ```
 
-167 tests, covering dice-notation parsing, roll uniformity, seeded
+217 tests, covering dice-notation parsing, roll uniformity, seeded
 reproducibility, every Yahtzee scoring category, Luck Bet hit/sweep
 resolution, Roulette's payout table, Blackjack's hand totals, Ultra Casino
 Dice's pot math, the house ledger's zero-sum invariant, and the render
 geometry (every face and card is a perfect rectangle at every size, and the
 big ones really are 3× the small ones).
 
-Every new table's payout maths is pinned down against the odds it claims,
-not just against itself:
+### The house auditor
 
-- **Plinko** — all three risk profiles return 95–100% of stake, weighted by
-  the real binomial odds of each slot.
-- **Scratch Cards** — the print run adds up to exactly 98% return.
-- **Horse Racing** — every runner on the card returns the same share.
-- **Big Six** — every segment pays strictly less than its true odds.
-- **Crash** — the survival curve matches `0.99 / x` at two sample points.
-- **Hi-Lo** — every call is priced below fair odds, and mirrored calls match.
-- **Mines** — the price never exceeds the fair reciprocal of the odds.
-- **Bingo** — the speed paytable is checked against thousands of real cards.
+Every table's payout maths is pinned against the odds it claims, not just
+against itself. `src/games/audit.rs` plays every table hundreds of thousands
+of times with no rendering, through the same settlement code the table uses,
+and holds each to a declared band:
+
+```
+cargo test --release audit -- --nocapture
+```
+
+The rule about what belongs there is **simulate only what cannot be
+computed**. A table with a small outcome space or a closed-form
+distribution is priced exactly in its own file, which is strictly better:
+
+- **Slots** — all 9,261 lines added up exactly.
+- **Chuck-a-Luck** — all 216 rolls, every bet on the board.
+- **Roulette** — all 37 pockets; every bet must carry the identical 36/37.
+- **Big Six** — all 54 segments.
+- **Keno** — the exact hypergeometric odds for every board size.
+- **Plinko** — the real binomial odds of each slot.
+- **Scratch Cards** — the print run, which sums to exactly 98%.
+- **Horse Racing** — every runner returns the same share, by construction.
+
+The rest — blackjack, baccarat, war, three card poker, hi-lo, video poker,
+bingo, mines, crash — genuinely need playing out, and that is what the
+harness does. Where a return depends on how the table is played, the
+strategy is fixed in the harness and named alongside the band, because a
+return with no strategy attached means nothing.

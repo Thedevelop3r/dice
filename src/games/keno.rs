@@ -10,6 +10,7 @@
 
 use super::{table, Ctx};
 use crate::economy::Wallet;
+use crate::rng::Rng;
 use crate::ui::{self, widgets};
 
 const KEY: &str = "keno";
@@ -19,53 +20,72 @@ const BOARD: usize = 80;
 const BALLS: usize = 20;
 const MAX_SPOTS: usize = 10;
 
-/// Gross multiplier on the stake for `hits` out of `picks` spots.
-/// Anything not listed pays nothing.
+/// Gross multiplier on the stake for `hits` out of `picks` spots, in
+/// hundredths — `370` pays 3.7x. Hundredths rather than whole numbers
+/// because a one-spot board cannot be priced honestly otherwise: it hits
+/// exactly one time in four, so every integer multiplier is either a
+/// break-even 4x or a miserly 3x.
+///
+/// Every board size returns between 90% and 93%, checked exactly against
+/// the hypergeometric odds in `every_board_size_is_priced_the_same_way`.
+/// That evenness is the point — the original table ran from 75% on one
+/// spot down to 40% on ten, which quietly made the big boards a trap.
 fn payout_mult(picks: usize, hits: usize) -> i64 {
     match (picks, hits) {
-        (1, 1) => 3,
-        (2, 2) => 12,
-        (3, 2) => 1,
-        (3, 3) => 42,
-        (4, 2) => 1,
-        (4, 3) => 4,
-        (4, 4) => 100,
-        (5, 3) => 2,
-        (5, 4) => 12,
-        (5, 5) => 800,
-        (6, 3) => 1,
-        (6, 4) => 4,
-        (6, 5) => 70,
-        (6, 6) => 1_600,
-        (7, 4) => 2,
-        (7, 5) => 20,
-        (7, 6) => 100,
-        (7, 7) => 7_000,
-        (8, 5) => 10,
-        (8, 6) => 50,
-        (8, 7) => 1_000,
-        (8, 8) => 10_000,
-        (9, 5) => 5,
-        (9, 6) => 20,
-        (9, 7) => 100,
-        (9, 8) => 4_000,
-        (9, 9) => 10_000,
-        (10, 5) => 2,
-        (10, 6) => 10,
-        (10, 7) => 50,
-        (10, 8) => 500,
-        (10, 9) => 5_000,
-        (10, 10) => 10_000,
+        (1, 1) => 370,
+        (2, 2) => 1_500,
+        (3, 2) => 250,
+        (3, 3) => 4_200,
+        (4, 2) => 120,
+        (4, 3) => 700,
+        (4, 4) => 12_000,
+        (5, 3) => 350,
+        (5, 4) => 2_500,
+        (5, 5) => 50_000,
+        (6, 3) => 200,
+        (6, 4) => 1_000,
+        (6, 5) => 7_000,
+        (6, 6) => 130_000,
+        (7, 4) => 550,
+        (7, 5) => 3_200,
+        (7, 6) => 28_000,
+        (7, 7) => 600_000,
+        (8, 5) => 1_600,
+        (8, 6) => 11_000,
+        (8, 7) => 125_000,
+        (8, 8) => 3_800_000,
+        (9, 5) => 850,
+        (9, 6) => 4_500,
+        (9, 7) => 34_000,
+        (9, 8) => 340_000,
+        (9, 9) => 10_000_000,
+        (10, 5) => 500,
+        (10, 6) => 2_250,
+        (10, 7) => 12_500,
+        (10, 8) => 90_000,
+        (10, 9) => 900_000,
+        (10, 10) => 25_000_000,
         _ => 0,
+    }
+}
+
+/// `3.7x`, `120x`, `2.5x` — how a multiplier in hundredths reads.
+fn fmt_mult(hundredths: i64) -> String {
+    if hundredths % 100 == 0 {
+        format!("{}x", hundredths / 100)
+    } else if hundredths % 10 == 0 {
+        format!("{}.{}x", hundredths / 100, (hundredths % 100) / 10)
+    } else {
+        format!("{}.{:02}x", hundredths / 100, hundredths % 100)
     }
 }
 
 /// `count` distinct numbers from 1..=80, sorted so the board reads
 /// naturally.
-fn pick_spots(ctx: &mut Ctx, count: usize) -> Vec<usize> {
+fn pick_spots(rng: &mut Rng, count: usize) -> Vec<usize> {
     let mut pool: Vec<usize> = (1..=BOARD).collect();
     for i in (1..pool.len()).rev() {
-        let j = ctx.rng.below(i + 1);
+        let j = rng.below(i + 1);
         pool.swap(i, j);
     }
     let mut spots: Vec<usize> = pool.into_iter().take(count).collect();
@@ -109,13 +129,19 @@ fn draw_board(ctx: &mut Ctx, spots: &[usize], drawn: &[usize], headline: &str, n
 }
 
 /// Draws the twenty balls one at a time, lighting the board as they land.
-fn draw_balls(ctx: &mut Ctx, spots: &[usize], headline: &str) -> Vec<usize> {
+/// The twenty balls for one game. Shared with the audit harness so the
+/// simulated draw is the caller's own draw.
+fn draw_sheet(rng: &mut Rng) -> Vec<usize> {
     let mut pool: Vec<usize> = (1..=BOARD).collect();
     for i in (1..pool.len()).rev() {
-        let j = ctx.rng.below(i + 1);
+        let j = rng.below(i + 1);
         pool.swap(i, j);
     }
-    let balls: Vec<usize> = pool.into_iter().take(BALLS).collect();
+    pool.into_iter().take(BALLS).collect()
+}
+
+fn draw_balls(ctx: &mut Ctx, spots: &[usize], headline: &str) -> Vec<usize> {
+    let balls = draw_sheet(ctx.rng);
     let mut out: Vec<usize> = Vec::with_capacity(BALLS);
     for (i, b) in balls.iter().enumerate() {
         out.push(*b);
@@ -158,7 +184,7 @@ pub fn play(ctx: &mut Ctx) {
             for hits in 0..=(v as usize) {
                 let m = payout_mult(v as usize, hits);
                 if m > 0 {
-                    wins.push(format!("{hits} hits {m}x"));
+                    wins.push(format!("{hits} hits {}", fmt_mult(m)));
                 }
             }
             s.line(&theme.dim(&format!("  pays: {}", wins.join(" · "))));
@@ -171,7 +197,7 @@ pub fn play(ctx: &mut Ctx) {
 
         // Quick-pick, with a re-pick loop before anything is staked.
         let spots = loop {
-            let spots = pick_spots(ctx, picks);
+            let spots = pick_spots(ctx.rng, picks);
             let theme = ctx.theme();
             let headline = format!("  {}", theme.dim("your board"));
             draw_board(ctx, &spots, &[], &headline, "");
@@ -202,11 +228,11 @@ pub fn play(ctx: &mut Ctx) {
         let mult = payout_mult(spots.len(), hits);
         ctx.store.bump("keno.games", 1);
         ctx.store.bump("keno.hits", hits as i64);
-        let delta = table::settle(ctx, KEY, stake, stake * mult);
+        let delta = table::settle(ctx, KEY, stake, stake * mult / 100);
 
         let theme = ctx.theme();
         let note = if mult > 0 {
-            theme.win(&format!("{hits} of {} — pays {mult}x", spots.len()))
+            theme.win(&format!("{hits} of {} — pays {}", spots.len(), fmt_mult(mult)))
         } else {
             theme.lose(&format!("{hits} of {} — nothing this time", spots.len()))
         };
@@ -223,7 +249,7 @@ pub fn play(ctx: &mut Ctx) {
 pub fn idle(ctx: &mut Ctx) {
     loop {
         let picks = 4 + ctx.rng.below(5);
-        let spots = pick_spots(ctx, picks);
+        let spots = pick_spots(ctx.rng, picks);
         let theme = ctx.theme();
         let punter = table::BOT_NAMES[ctx.rng.below(table::BOT_NAMES.len())];
         let headline = format!("  {} is covering {} spots", theme.accent(punter), theme.paint(ui::theme::GOLD, &picks.to_string()));
@@ -233,7 +259,7 @@ pub fn idle(ctx: &mut Ctx) {
         let mult = payout_mult(picks, hits);
         let theme = ctx.theme();
         let note = if mult > 0 {
-            theme.win(&format!("{hits} of {picks} — the board pays {mult}x"))
+            theme.win(&format!("{hits} of {picks} — the board pays {}", fmt_mult(mult)))
         } else {
             theme.dim(&format!("{hits} of {picks} — no good"))
         };
@@ -246,18 +272,30 @@ pub fn idle(ctx: &mut Ctx) {
     }
 }
 
+/// One game covering `picks` spots, no rendering: chips staked, chips
+/// returned. Keno's return depends heavily on how many spots are covered,
+/// so the harness runs several.
+pub fn simulate_at(rng: &mut Rng, picks: usize) -> (i64, i64) {
+    let spots = pick_spots(rng, picks);
+    let drawn = draw_sheet(rng);
+    let hits = spots.iter().filter(|s| drawn.contains(s)).count();
+    (100, 100 * payout_mult(picks, hits) / 100)
+}
+
+#[cfg(test)]
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    simulate_at(rng, 5)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn a_quick_pick_covers_distinct_numbers_on_the_board() {
-        let mut store = crate::stats::Store::blank();
         let mut rng = crate::rng::Rng::from_seed(7);
-        let mut screen = crate::ui::Screen::headless();
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
         for count in 1..=MAX_SPOTS {
-            let spots = pick_spots(&mut ctx, count);
+            let spots = pick_spots(&mut rng, count);
             assert_eq!(spots.len(), count);
             assert!(spots.iter().all(|n| (1..=BOARD).contains(n)), "off the board: {spots:?}");
             let mut sorted = spots.clone();
@@ -267,12 +305,51 @@ mod tests {
         }
     }
 
+    /// C(n, k) as an f64 — big enough for C(80, 20) without overflowing.
+    fn choose(n: u64, k: u64) -> f64 {
+        if k > n {
+            return 0.0;
+        }
+        let mut c = 1.0f64;
+        for i in 0..k {
+            c = c * (n - i) as f64 / (i + 1) as f64;
+        }
+        c
+    }
+
+    /// The exact chance of `hits` of `picks` when twenty of eighty come out.
+    fn odds(picks: u64, hits: u64) -> f64 {
+        choose(picks, hits) * choose(80 - picks, 20 - hits) / choose(80, 20)
+    }
+
+    #[test]
+    fn every_board_size_is_priced_the_same_way() {
+        // Not a simulation — the real hypergeometric odds, so this is the
+        // return to the last decimal rather than an estimate. The evenness
+        // across board sizes is the property worth protecting: it is what
+        // stops the big boards from quietly becoming a trap.
+        for picks in 1..=MAX_SPOTS as u64 {
+            let rtp: f64 = (0..=picks).map(|h| odds(picks, h) * payout_mult(picks as usize, h as usize) as f64 / 100.0).sum();
+            assert!(rtp > 0.90 && rtp < 0.94, "covering {picks} spots returns {rtp:.4}");
+        }
+    }
+
+    #[test]
+    fn no_board_size_is_a_worse_deal_than_another() {
+        let rtps: Vec<f64> = (1..=MAX_SPOTS as u64)
+            .map(|p| (0..=p).map(|h| odds(p, h) * payout_mult(p as usize, h as usize) as f64 / 100.0).sum())
+            .collect();
+        let lo = rtps.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = rtps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(hi - lo < 0.04, "board sizes range from {lo:.4} to {hi:.4} — too far apart to be fair");
+    }
+
     #[test]
     fn covering_every_spot_pays_the_top_prize() {
-        assert_eq!(payout_mult(1, 1), 3);
-        assert_eq!(payout_mult(5, 5), 800);
-        assert_eq!(payout_mult(8, 8), 10_000);
-        assert_eq!(payout_mult(10, 10), 10_000);
+        assert_eq!(payout_mult(1, 1), 370);
+        assert_eq!(payout_mult(5, 5), 50_000);
+        assert_eq!(payout_mult(8, 8), 3_800_000);
+        assert_eq!(payout_mult(10, 10), 25_000_000);
     }
 
     #[test]
@@ -313,16 +390,13 @@ mod tests {
 
     #[test]
     fn the_draw_produces_twenty_distinct_balls() {
-        let mut store = crate::stats::Store::blank();
         let mut rng = crate::rng::Rng::from_seed(3);
-        let mut screen = crate::ui::Screen::headless();
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
         // Reuse the same shuffle the caller uses, without the animation.
-        let spots = pick_spots(&mut ctx, 4);
+        let spots = pick_spots(&mut rng, 4);
         assert_eq!(spots.len(), 4);
         let mut pool: Vec<usize> = (1..=BOARD).collect();
         for i in (1..pool.len()).rev() {
-            let j = ctx.rng.below(i + 1);
+            let j = rng.below(i + 1);
             pool.swap(i, j);
         }
         let balls: Vec<usize> = pool.into_iter().take(BALLS).collect();
