@@ -1,4 +1,4 @@
-# Dice Arena
+# Dice Arena  -  Built with Claude AI
 
 A casino console in Rust — **zero external crates**, including its own PRNG
 and its own raw-terminal input (direct `termios(3)` FFI, no `crossterm`).
@@ -7,7 +7,10 @@ one of them able to run itself with nobody watching.
 
 ```
 cargo run --release
+
 ```
+
+![Home Screen](screenshots/home.png)
 
 ## Controls
 
@@ -104,7 +107,7 @@ money wheel decelerates into its pointer, a plinko ball accelerates as it
 falls, keno balls speed up as the board fills, and a crash curve tightens
 exactly as the decision gets harder.
 
-Nothing is decorative. Where an outcome is drawn before the animation runs —
+Nothing is deco:rative. Where an outcome is drawn before the animation runs —
 the wheel's segment, the race winner — the animation is worked backwards
 from that result so what you watch is what you get.
 
