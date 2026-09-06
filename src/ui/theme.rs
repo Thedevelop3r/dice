@@ -61,6 +61,21 @@ impl Theme {
         }
     }
 
+    /// `paint` straight into an existing buffer. The renderers that run
+    /// inside an animation loop — dice faces, card hands, spinning reels —
+    /// redraw dozens of painted segments twenty times a second, so this
+    /// exists to keep that path from allocating a `String` per segment
+    /// per frame.
+    pub fn paint_into(&self, out: &mut String, code: &str, text: &str) {
+        if self.colors {
+            out.push_str(code);
+            out.push_str(text);
+            out.push_str(RESET);
+        } else {
+            out.push_str(text);
+        }
+    }
+
     pub fn gold(&self, text: &str) -> String {
         self.paint(GOLD, text)
     }

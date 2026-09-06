@@ -16,7 +16,10 @@ mod shop;
 mod stats;
 mod ui;
 
-use games::{blackjack, chuck, lab, luckbet, pig, roulette, tournament, ultra, yahtzee, Ctx, Player};
+use games::{
+    baccarat, bigsix, bingo, blackjack, chuck, crash, floor, hilo, horses, keno, lab, luckbet, mines, pig, plinko, roulette, scratch, slots, threecard,
+    tournament, ultra, vidpoker, war, yahtzee, Ctx, Player,
+};
 use rng::Rng;
 use stats::Store;
 use ui::menu::{choose_from, MenuItem};
@@ -68,17 +71,15 @@ fn main() {
         screen.line(&format!("  welcome back, {}", theme.bold(&name)));
         screen.line(&format!("  {}", ui::money(&theme, chips, dollars)));
 
+        // Two dozen tables will not fit on one readable screen, so the
+        // floor is grouped the way a real one is and each room keeps its
+        // own menu.
         let items = vec![
-            MenuItem::new('1', "Pig", "press-your-luck race to a target score"),
-            MenuItem::new('2', "Yahtzee", "13-category scorecard classic"),
-            MenuItem::new('3', "Luck Bet", "8 dice A-H, back a letter and a face"),
-            MenuItem::new('4', "Luck Bet: Turbo", "hands-free — press to spin the table"),
-            MenuItem::new('5', "Chuck-a-Luck", "three-dice wagering"),
-            MenuItem::new('6', "Roulette", "single-zero wheel, chips on the felt"),
-            MenuItem::new('7', "Blackjack", "beat the dealer to 21"),
-            MenuItem::new('8', "Tournament", "knockout bracket for a chip prize pool"),
-            MenuItem::new('9', "Dice Lab", "roll any NdM+K, sample distributions"),
-            MenuItem::new('0', "Ultra Casino Dice", "idle-screen spectacle — 8 AI players, 12 dice, fully automatic"),
+            MenuItem::new('1', "Dice Tables", "Pig, Yahtzee, Luck Bet, Chuck-a-Luck, the Tournament, the Lab"),
+            MenuItem::new('2', "Card Tables", "Blackjack, Baccarat, Video Poker, Three Card, War, Hi-Lo"),
+            MenuItem::new('3', "The Wheels", "Roulette and the Big Six money wheel"),
+            MenuItem::new('4', "The Arcade", "slots, keno, bingo, plinko, mines, crash, scratch cards, the races"),
+            MenuItem::new('5', "Idle Screens", "every table running itself — or the whole floor in turn"),
             MenuItem::new('s', "Store", "chips, dollars and lucky charms"),
             MenuItem::new('i', "Stats", "your history across every table"),
             MenuItem::new('h', "History", "past Ultra Casino Dice sessions"),
@@ -87,71 +88,20 @@ fn main() {
             MenuItem::new('r', "Rules", "how each game is played"),
             MenuItem::new('q', "Quit", "cash out and leave"),
         ];
-        let choice = choose_from(&mut screen, "THE FLOOR", &items);
 
-        match choice {
-            Some('1') => {
-                let Some(players) = setup_players(&mut screen, &mut store, &mut rng, &name, 2, 6) else { continue 'app };
-                let Some(target) = pick_amount(&mut screen, "target score", 20, 500, 100, 10, &[]) else { continue 'app };
-                screen.begin();
-                ui::header(&mut screen, "PIG");
-                screen.line("  two-dice variant? a single 1 ends your turn, snake eyes wipes your");
-                screen.line("  score, doubles pay double.");
-                screen.line(&widgets::footer(&screen.theme, &[('y', "two-dice"), ('n', "classic")]));
-                screen.present();
-                let two_dice = ui::confirm_key(false);
-                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
-                pig::play(&mut ctx, players, pig::Config { target, two_dice });
-            }
-            Some('2') => {
-                let Some(players) = setup_players(&mut screen, &mut store, &mut rng, &name, 1, 4) else { continue 'app };
-                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
-                yahtzee::play(&mut ctx, players);
-            }
-            Some('3') | Some('4') => {
-                let turbo = choice == Some('4');
-                let opponents = if turbo {
-                    2
-                } else {
-                    match pick_amount(&mut screen, "CPU opponents", 0, 2, 2, 1, &[]) {
-                        Some(v) => v as usize,
-                        None => continue 'app,
-                    }
-                };
-                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
-                luckbet::play(&mut ctx, opponents, turbo);
-            }
-            Some('5') => {
-                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
-                chuck::play(&mut ctx);
-            }
-            Some('6') => {
-                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
-                roulette::play(&mut ctx);
-            }
-            Some('7') => {
-                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
-                blackjack::play(&mut ctx);
-            }
-            Some('8') => {
-                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
-                tournament::play(&mut ctx);
-            }
-            Some('9') => {
-                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
-                lab::play(&mut ctx);
-            }
-            Some('0') => {
-                let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
-                ultra::play(&mut ctx);
-            }
+        match choose_from(&mut screen, "THE FLOOR", &items) {
+            Some('1') => dice_room(&mut store, &mut rng, &mut screen, &name),
+            Some('2') => card_room(&mut store, &mut rng, &mut screen),
+            Some('3') => wheel_room(&mut store, &mut rng, &mut screen),
+            Some('4') => arcade_room(&mut store, &mut rng, &mut screen),
+            Some('5') => idle_room(&mut store, &mut rng, &mut screen),
             Some('s') => shop::open(&mut store, &mut screen),
             Some('i') => show_stats(&mut store, &mut screen),
             Some('h') => show_history(&mut screen),
             Some('c') => show_house(&mut store, &mut screen),
             Some('o') => settings(&mut store, &mut screen),
             Some('r') => rules(&mut screen),
-            Some('q') | None => break,
+            Some('q') | None => break 'app,
             _ => {}
         }
     }
@@ -159,6 +109,196 @@ fn main() {
     let _ = store.save();
     drop(screen);
     println!("\n  thanks for playing — the house always keeps the lights on.\n");
+}
+
+/// Every table's stats prefix and the name it goes by, in floor order.
+/// The Stats screen and the Casino books both read this list, so a new
+/// table appears on both of them or on neither.
+const TABLES: [(&str, &str); 23] = [
+    ("Pig", "pig"),
+    ("Yahtzee", "yahtzee"),
+    ("Luck Bet", "luckbet"),
+    ("Chuck-a-Luck", "chuck"),
+    ("Tournament", "tourney"),
+    ("Dice Lab", "lab"),
+    ("Ultra Casino Dice", "ultra"),
+    ("Blackjack", "blackjack"),
+    ("Baccarat", "baccarat"),
+    ("Video Poker", "vidpoker"),
+    ("Three Card Poker", "threecard"),
+    ("Casino War", "war"),
+    ("Hi-Lo", "hilo"),
+    ("Roulette", "roulette"),
+    ("Big Six", "bigsix"),
+    ("Slots", "slots"),
+    ("Keno", "keno"),
+    ("Bingo", "bingo"),
+    ("Plinko", "plinko"),
+    ("Mines", "mines"),
+    ("Crash", "crash"),
+    ("Scratch Cards", "scratch"),
+    ("Horse Racing", "horses"),
+];
+
+/// The dice room: everything that settles on a pip face.
+fn dice_room(store: &mut Store, rng: &mut Rng, screen: &mut Screen, name: &str) {
+    loop {
+        let items = vec![
+            MenuItem::new('1', "Pig", "press-your-luck race to a target score"),
+            MenuItem::new('2', "Yahtzee", "13-category scorecard classic"),
+            MenuItem::new('3', "Luck Bet", "8 dice A-H, back a letter and a face"),
+            MenuItem::new('4', "Luck Bet: Turbo", "hands-free — press to spin the table"),
+            MenuItem::new('5', "Chuck-a-Luck", "three-dice wagering"),
+            MenuItem::new('6', "Tournament", "knockout bracket for a chip prize pool"),
+            MenuItem::new('7', "Dice Lab", "roll any NdM+K, sample distributions"),
+            MenuItem::new('8', "Ultra Casino Dice", "the spectacle table — 8 AI players, 12 dice, fully automatic"),
+            MenuItem::new('b', "back", "return to the floor"),
+        ];
+        match choose_from(screen, "DICE TABLES", &items) {
+            Some('1') => {
+                let Some(players) = setup_players(screen, store, rng, name, 2, 6) else { continue };
+                let Some(target) = pick_amount(screen, "target score", 20, 500, 100, 10, &[]) else { continue };
+                screen.begin();
+                ui::header(screen, "PIG");
+                screen.line("  two-dice variant? a single 1 ends your turn, snake eyes wipes your");
+                screen.line("  score, doubles pay double.");
+                screen.line(&widgets::footer(&screen.theme, &[('y', "two-dice"), ('n', "classic")]));
+                screen.present();
+                let two_dice = ui::confirm_key(false);
+                let mut ctx = Ctx { rng, store, screen };
+                pig::play(&mut ctx, players, pig::Config { target, two_dice });
+            }
+            Some('2') => {
+                let Some(players) = setup_players(screen, store, rng, name, 1, 4) else { continue };
+                let mut ctx = Ctx { rng, store, screen };
+                yahtzee::play(&mut ctx, players);
+            }
+            Some(c @ ('3' | '4')) => {
+                let turbo = c == '4';
+                let opponents = if turbo {
+                    2
+                } else {
+                    match pick_amount(screen, "CPU opponents", 0, 2, 2, 1, &[]) {
+                        Some(v) => v as usize,
+                        None => continue,
+                    }
+                };
+                let mut ctx = Ctx { rng, store, screen };
+                luckbet::play(&mut ctx, opponents, turbo);
+            }
+            Some('5') => chuck::play(&mut Ctx { rng, store, screen }),
+            Some('6') => tournament::play(&mut Ctx { rng, store, screen }),
+            Some('7') => lab::play(&mut Ctx { rng, store, screen }),
+            Some('8') => ultra::play(&mut Ctx { rng, store, screen }),
+            _ => return,
+        }
+    }
+}
+
+/// The card room. Every table here deals from `games::cards`.
+fn card_room(store: &mut Store, rng: &mut Rng, screen: &mut Screen) {
+    loop {
+        let items = vec![
+            MenuItem::new('1', "Blackjack", "beat the dealer to 21"),
+            MenuItem::new('2', "Baccarat", "back the player, the banker or the tie"),
+            MenuItem::new('3', "Video Poker", "jacks or better, one draw"),
+            MenuItem::new('4', "Three Card Poker", "ante up against a dealer who needs queen high"),
+            MenuItem::new('5', "Casino War", "high card wins — a tie means war"),
+            MenuItem::new('6', "Hi-Lo", "call the next card, press your run or take the money"),
+            MenuItem::new('b', "back", "return to the floor"),
+        ];
+        match choose_from(screen, "CARD TABLES", &items) {
+            Some('1') => blackjack::play(&mut Ctx { rng, store, screen }),
+            Some('2') => baccarat::play(&mut Ctx { rng, store, screen }),
+            Some('3') => vidpoker::play(&mut Ctx { rng, store, screen }),
+            Some('4') => threecard::play(&mut Ctx { rng, store, screen }),
+            Some('5') => war::play(&mut Ctx { rng, store, screen }),
+            Some('6') => hilo::play(&mut Ctx { rng, store, screen }),
+            _ => return,
+        }
+    }
+}
+
+/// The two tables that settle on a spinning board.
+fn wheel_room(store: &mut Store, rng: &mut Rng, screen: &mut Screen) {
+    loop {
+        let items = vec![
+            MenuItem::new('1', "Roulette", "single-zero wheel, chips on the felt"),
+            MenuItem::new('2', "Big Six", "the money wheel — 54 segments past a pointer"),
+            MenuItem::new('b', "back", "return to the floor"),
+        ];
+        match choose_from(screen, "THE WHEELS", &items) {
+            Some('1') => roulette::play(&mut Ctx { rng, store, screen }),
+            Some('2') => bigsix::play(&mut Ctx { rng, store, screen }),
+            _ => return,
+        }
+    }
+}
+
+/// Everything that is neither dice nor cards.
+fn arcade_room(store: &mut Store, rng: &mut Rng, screen: &mut Screen) {
+    loop {
+        let items = vec![
+            MenuItem::new('1', "Slots", "three weighted reels, stopping left to right"),
+            MenuItem::new('2', "Keno", "cover up to ten spots, twenty balls come out"),
+            MenuItem::new('3', "Bingo", "a 75-ball card — the faster your line, the more it pays"),
+            MenuItem::new('4', "Plinko", "drop a ball through twelve rows of pegs"),
+            MenuItem::new('5', "Mines", "turn over tiles and get out before you find one"),
+            MenuItem::new('6', "Crash", "cash out before the multiplier goes"),
+            MenuItem::new('7', "Scratch Cards", "nine panels, three of a kind pays"),
+            MenuItem::new('8', "Horse Racing", "six runners at fixed odds"),
+            MenuItem::new('b', "back", "return to the floor"),
+        ];
+        match choose_from(screen, "THE ARCADE", &items) {
+            Some('1') => slots::play(&mut Ctx { rng, store, screen }),
+            Some('2') => keno::play(&mut Ctx { rng, store, screen }),
+            Some('3') => bingo::play(&mut Ctx { rng, store, screen }),
+            Some('4') => plinko::play(&mut Ctx { rng, store, screen }),
+            Some('5') => mines::play(&mut Ctx { rng, store, screen }),
+            Some('6') => crash::play(&mut Ctx { rng, store, screen }),
+            Some('7') => scratch::play(&mut Ctx { rng, store, screen }),
+            Some('8') => horses::play(&mut Ctx { rng, store, screen }),
+            _ => return,
+        }
+    }
+}
+
+/// The idle screens: any single table left running itself, or the whole
+/// floor cycled in turn. Nothing in here touches the wallet or the house
+/// ledger — every chip on screen is fictional twice over.
+fn idle_room(store: &mut Store, rng: &mut Rng, screen: &mut Screen) {
+    // Tables get 1-9 then a-h; the cycler and Ultra sit outside that range
+    // so they can never collide with a table key.
+    let key_for = |i: usize| -> char {
+        if i < 9 {
+            char::from_digit(i as u32 + 1, 10).unwrap()
+        } else {
+            (b'a' + (i - 9) as u8) as char
+        }
+    };
+    loop {
+        let mut items = vec![
+            MenuItem::new('0', "The whole floor", "every table in turn, a slot each — the full screensaver"),
+            MenuItem::new('u', "Ultra Casino Dice", "the original spectacle table — 8 AI players, 12 dice"),
+        ];
+        for (i, t) in floor::ATTRACT.iter().enumerate() {
+            items.push(MenuItem::new(key_for(i), t.label, "watch this table run itself"));
+        }
+        items.push(MenuItem::new('z', "back", "return to the floor"));
+
+        match choose_from(screen, "IDLE SCREENS", &items) {
+            Some('0') => {
+                games::table::idle_budget(None);
+                floor::cycle(&mut Ctx { rng, store, screen });
+            }
+            Some('u') => ultra::play(&mut Ctx { rng, store, screen }),
+            Some(c) => {
+                let Some(i) = (0..floor::ATTRACT.len()).find(|i| key_for(*i) == c) else { return };
+                floor::attract_one(&mut Ctx { rng, store, screen }, i);
+            }
+            None => return,
+        }
+    }
 }
 
 fn draw_banner(screen: &mut Screen, theme: &Theme) {
@@ -234,20 +374,10 @@ fn show_stats(store: &mut Store, screen: &mut Screen) {
     let theme = screen.theme;
     screen.begin();
     ui::header(screen, "STATISTICS");
-    let rows = [
-        ("Wallet", "econ"),
-        ("Pig", "pig"),
-        ("Yahtzee", "yahtzee"),
-        ("Luck Bet", "luckbet"),
-        ("Chuck-a-Luck", "chuck"),
-        ("Roulette", "roulette"),
-        ("Blackjack", "blackjack"),
-        ("Tournament", "tourney"),
-        ("Dice Lab", "lab"),
-        ("Ultra Casino Dice", "ultra"),
-        ("Store", "store"),
-        ("Inventory", "inv"),
-    ];
+    let mut rows: Vec<(&str, &str)> = vec![("Wallet", "econ")];
+    rows.extend_from_slice(&TABLES);
+    rows.push(("Store", "store"));
+    rows.push(("Inventory", "inv"));
     let mut any = false;
     for (label, key) in rows {
         let entries: Vec<(String, String)> = store
@@ -339,24 +469,19 @@ fn show_house(store: &mut Store, screen: &mut Screen) {
     screen.line(&format!("  collected from losing bets   {}", theme.paint(ui::theme::GREEN, &format!("{collected} chips"))));
     screen.line(&format!("  paid out on winning bets     {}", theme.paint(ui::theme::RED, &format!("{paid} chips"))));
 
-    let rows = [
-        ("Chuck-a-Luck", "chuck"),
-        ("Luck Bet", "luckbet"),
-        ("Roulette", "roulette"),
-        ("Blackjack", "blackjack"),
-        ("Tournament", "tourney"),
-        ("Ultra Casino Dice", "ultra"),
-    ];
     let mut any = false;
     screen.blank();
     screen.line(&theme.bold("by table"));
-    for (label, key) in rows {
-        let played = store.entries().any(|(k, _)| k.starts_with(&format!("{key}.")));
-        if !played {
+    for (label, key) in TABLES {
+        // Only the tables that actually settle wagers book to the ledger,
+        // so the presence of a `house_pl` key is what puts a row here —
+        // Pig and the Dice Lab keep stats but never take a bet.
+        let pl_key = format!("{key}.house_pl");
+        if !store.entries().any(|(k, _)| *k == pl_key) {
             continue;
         }
         any = true;
-        let pl = store.get_i64(&format!("{key}.house_pl"), 0);
+        let pl = store.get_i64(&pl_key, 0);
         let pl_str = if pl >= 0 { theme.win(&format!("+{pl}")) } else { theme.lose(&format!("{pl}")) };
         screen.line(&format!("   {:<18} {:>10} chips", label, pl_str));
     }
@@ -364,9 +489,9 @@ fn show_house(store: &mut Store, screen: &mut Screen) {
         screen.line(&theme.dim("   no games played yet."));
     }
     screen.blank();
-    screen.line(&theme.dim("  covers every wagering table — Chuck-a-Luck, Luck Bet, Roulette,"));
-    screen.line(&theme.dim("  Blackjack, Tournament, and unclaimed Ultra Casino Dice pots — but"));
-    screen.line(&theme.dim("  not Store currency exchanges or item purchases."));
+    screen.line(&theme.dim("  covers every wagering table in the building, plus unclaimed Ultra"));
+    screen.line(&theme.dim("  Casino Dice pots — but not Store currency exchanges, item purchases,"));
+    screen.line(&theme.dim("  or anything an idle screen does on its own."));
     ui::pause(screen);
 }
 
@@ -427,16 +552,30 @@ fn rules(screen: &mut Screen) {
     let theme = screen.theme;
     screen.begin();
     ui::header(screen, "RULES");
-    let entries: [(&str, &str); 9] = [
+    let entries: [(&str, &str); 23] = [
         ("PIG", "Roll to build a turn total, hold to bank it. Roll a 1 and the turn total is gone. In the two-dice variant a single 1 ends the turn, snake eyes wipes your whole score, and doubles pay double. First to the target score wins."),
         ("YAHTZEE", "Thirteen rounds, three rolls each: keep dice between rolls, then commit the hand to one open category. 63+ in the upper section earns a 35-point bonus; each extra Yahtzee after the first is worth 100."),
         ("CHUCK-A-LUCK", "Stake chips on a face (pays 1:1, 2:1 or 3:1 by how many of the three dice show it), on HIGH (11-17) or LOW (4-10) at even money — both lose to any triple — or on any triple at 30:1."),
         ("LUCK BET", "Eight dice sit on the table, named A to H. Each player backs one letter and the face they think it will show, then the table is rolled. A hit pays 5:1 (6:1 with a VIP pass); a miss rakes a fifth of the stake into the jackpot. Land 3+ copies of your number and sweep the jackpot too. TURBO plays hands-free."),
-        ("ROULETTE", "Single-zero wheel. Straight-up numbers pay 35:1, split/street/corner bets pay accordingly, and the outside bets (red/black, odd/even, high/low, dozens, columns) pay even money or 2:1."),
-        ("BLACKJACK", "Beat the dealer's hand without going over 21. Face cards count 10, aces count 11 or 1. Dealer stands on 17. Blackjack (an ace + a ten-card on the deal) pays 3:2."),
         ("TOURNAMENT", "Pay a chip buy-in, get drawn into a single-elimination Pig bracket. Your matches are played out; the rest of the bracket is simulated. Champion takes 70% of the pool, runner-up 30%."),
         ("DICE LAB", "Roll dice notation like 4d6+2, `sim 2d6 50000` to plot the distribution, or `seed 42` for reproducible rolls."),
-        ("ULTRA CASINO DICE", "An unattended spectacle table: 12 dice, 8 computer players, 10 rounds, no input required. Each round every seat backs a letter and calls a face, the table rolls for 7 seconds, and whoever called it right splits the pot — losers' stakes are exactly what winners collect, with one exception: a round nobody calls right pays its whole pot to the house. Seats decide to stay or cash out between rounds; anyone who leaves is replaced by a new AI player. Press Q at any time to let the round in progress finish and return to the floor; otherwise a finished session shows its final standings and a new one starts on its own. Every round and every session is logged to the History screen."),
+        ("ULTRA CASINO DICE", "An unattended spectacle table: 12 dice, 8 computer players, 10 rounds, no input required. Each round every seat backs a letter and calls a face, the table rolls for 7 seconds, and whoever called it right splits the pot — losers' stakes are exactly what winners collect, with one exception: a round nobody calls right pays its whole pot to the house. Press Q to let the round in progress finish. Every round and every session is logged to the History screen."),
+        ("BLACKJACK", "Beat the dealer's hand without going over 21. Face cards count 10, aces count 11 or 1. Dealer stands on 17. Blackjack (an ace + a ten-card on the deal) pays 3:2."),
+        ("BACCARAT", "Back the player, the banker or the tie, then watch a hand nobody makes a decision in — the third-card rules are fixed. Cards count their pips, tens and courts count nothing, and only the last digit of a total matters. Player and banker pay 1:1, the banker less a 5% commission; the tie pays 8:1 and pushes the other two."),
+        ("VIDEO POKER", "Jacks or better. Five cards, hold any of them, draw once. A pair only pays from jacks up; from there it climbs through two pair, trips, straight, flush, full house, quads and the straight flush to a royal at 800:1."),
+        ("THREE CARD POKER", "Ante, look at three cards, then fold or match your ante to play on. The dealer needs queen high or better to play at all — if they cannot, your ante pays and the play bet comes back. Beat a qualified dealer and both bets pay even money. A straight, trips or straight flush also pays an ante bonus whether you win or lose."),
+        ("CASINO WAR", "High card wins, aces high, even money. On a tie you can surrender for half your ante, or go to war: match the ante, burn three cards and deal again. Win the war and the raise pays even money while the ante pushes; tie again and the raise pays 2:1."),
+        ("HI-LO", "A card is turned over; call whether the next one is higher or lower. Every correct call multiplies your stake by the true odds of that call less a small margin, so calling higher on a two is nearly free and calling higher on a king pays richly. Cash out whenever you like — one wrong call takes the lot, and a tie counts as wrong."),
+        ("ROULETTE", "Single-zero wheel. Straight-up numbers pay 35:1, and the outside bets (red/black, odd/even, high/low, dozens) pay even money or 2:1."),
+        ("BIG SIX", "The money wheel: 54 segments running past a pointer. Back the 1 (24 segments, 1:1), the 2 (15, 2:1), the 5 (7, 5:1), the 10 (4, 10:1), the 20 (2, 20:1), or either of the two single segments — the joker and the house star — at 40:1."),
+        ("SLOTS", "Three weighted reels stopping left to right on one payline. Three of a kind pays by symbol, from 8x for three BARs up to 120x for three sevens. Two sevens anywhere pay 5x and a single seven pays 2x, so a broken line can still come home."),
+        ("KENO", "Cover between one and ten spots on an eighty-number board, then twenty balls are drawn. What you are paid depends on both how many you covered and how many came out: cover one and a single hit pays 3x, cover ten and you need five before anything pays at all — but all ten pays 10,000x."),
+        ("BINGO", "A 75-ball card with a free centre square. Forty balls are called and the payout is on how quickly your first line lands: by ball 15 it pays 30x, by 20 it pays 10x, by 25 4x, by 30 2x, and by 40 just your stake back. No line in forty balls and the card is dead."),
+        ("PLINKO", "Drop a ball through twelve rows of pegs into one of thirteen slots. Low, medium and high risk change how sharply the prizes climb toward the edges — up to 220x on the high board — but all three return the same share of your stake over time."),
+        ("MINES", "Choose how many mines hide under twenty-five tiles, then turn them over one at a time. Every safe tile raises your multiplier by the true odds of having got that far. Cash out whenever you like; turn over a mine and the round is gone."),
+        ("CRASH", "A multiplier climbs away from 1.00x and stops dead at a point drawn before the round starts. Press C to take the money before it does. The chance of surviving to any multiplier is 0.99 divided by it, so 2x comes home just under half the time."),
+        ("SCRATCH CARDS", "Buy a card and scratch nine panels. Three matching symbols pays that symbol's prize, from 1x up to 1,000x for three stars. The prize is decided when the card is printed, which is why the panels always tell the truth about what it is worth."),
+        ("HORSE RACING", "Six runners at fixed odds from 2:1 to 20:1. Back one and watch the race. The odds come first and each runner's chance is derived from them, so every horse on the card returns the same share of your stake over time."),
     ];
     for (title, body) in entries {
         screen.blank();

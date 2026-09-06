@@ -1,11 +1,28 @@
+pub mod baccarat;
+pub mod bigsix;
+pub mod bingo;
 pub mod blackjack;
+pub mod cards;
 pub mod chuck;
+pub mod crash;
+pub mod floor;
+pub mod hilo;
+pub mod horses;
+pub mod keno;
 pub mod lab;
 pub mod luckbet;
+pub mod mines;
 pub mod pig;
+pub mod plinko;
 pub mod roulette;
+pub mod scratch;
+pub mod slots;
+pub mod table;
+pub mod threecard;
 pub mod tournament;
 pub mod ultra;
+pub mod vidpoker;
+pub mod war;
 pub mod yahtzee;
 
 use crate::rng::Rng;

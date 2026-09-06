@@ -1,6 +1,6 @@
 //! Chuck-a-Luck — a three-dice wagering game with a persistent bankroll.
 
-use super::Ctx;
+use super::{table, Ctx};
 use crate::economy::{House, Wallet};
 use crate::ui::{self, dice_art, widgets};
 
@@ -163,4 +163,56 @@ fn message(ctx: &mut Ctx, text: &str) {
     ctx.screen.line(&format!("  {}", theme.dim(text)));
     ctx.screen.present();
     ui::sleep_ms(600);
+}
+
+/// The table rolling on its own, with a fictional punter working the
+/// board. Nothing here touches the player's wallet or the house ledger —
+/// it is a spectacle, not a wager.
+pub fn idle(ctx: &mut Ctx) {
+    let board = [Bet::High, Bet::Low, Bet::Triple, Bet::Number(2), Bet::Number(4), Bet::Number(6)];
+    loop {
+        let punter = table::BOT_NAMES[ctx.rng.below(table::BOT_NAMES.len())];
+        let bet = board[ctx.rng.below(board.len())];
+        let stake = 10 + 5 * ctx.rng.below(5) as i64;
+        let theme = ctx.theme();
+        let headline = format!("  {} backs {} for {stake}", theme.accent(punter), theme.paint(ui::theme::GOLD, &bet.label()));
+
+        let seed = vec![1u32; 3];
+        let roll = dice_art::animate_roll(ctx.screen, ctx.rng, 6, &seed, &[false, false, false], |screen, values| {
+            let theme = screen.theme;
+            screen.begin();
+            ui::header(screen, "CHUCK-A-LUCK");
+            screen.blank();
+            screen.line(&headline);
+            screen.blank();
+            for line in dice_art::dice_block(&theme, values, None) {
+                screen.line(&line);
+            }
+        });
+
+        let won = stake * bet.payout(&roll);
+        let theme = ctx.theme();
+        ctx.screen.begin();
+        ui::header(ctx.screen, "CHUCK-A-LUCK");
+        ctx.screen.blank();
+        ctx.screen.line(&headline);
+        ctx.screen.blank();
+        for line in dice_art::dice_block(&theme, &roll, None) {
+            ctx.screen.line(&line);
+        }
+        ctx.screen.blank();
+        ctx.screen.line(&format!(
+            "  {}",
+            if won >= 0 {
+                theme.win(&format!("{punter} collects {won}"))
+            } else {
+                theme.lose(&format!("{punter} is down {}", -won))
+            }
+        ));
+        table::idle_footer(ctx, "the table rolls itself — no stake of yours is on the board");
+        ctx.screen.present();
+        if table::idle_hold(2_200) {
+            return;
+        }
+    }
 }

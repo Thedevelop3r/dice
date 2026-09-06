@@ -213,6 +213,34 @@ mod raw {
         left
     }
 
+    /// Like `poll_leave_signal`, but also reports one of `watch` being
+    /// pressed. Live-action tables — anything where the player must act
+    /// *during* an animation rather than between them — need this: they
+    /// cannot block a frame on `read_key()` and cannot afford to throw the
+    /// keypress away either. A leave request always wins over a watched
+    /// key, so Q gets you out of a round mid-flight.
+    pub fn poll_action(watch: &[char]) -> super::Poll {
+        use super::Poll;
+        let mut found = Poll::Nothing;
+        loop {
+            match read_byte_nonblocking_once() {
+                Some(0x03) => {
+                    super::request_quit();
+                    found = Poll::Leave;
+                }
+                Some(b) if b == b'q' || b == b'Q' => found = Poll::Leave,
+                Some(b) => {
+                    let c = (b as char).to_ascii_lowercase();
+                    if found == Poll::Nothing && watch.iter().any(|w| w.eq_ignore_ascii_case(&c)) {
+                        found = Poll::Pressed(c);
+                    }
+                }
+                None => break,
+            }
+        }
+        found
+    }
+
     pub fn read_key() -> super::Key {
         use super::Key;
         loop {
@@ -301,6 +329,23 @@ mod raw {
     pub fn poll_leave_signal() -> bool {
         false
     }
+
+    /// Same story as `poll_leave_signal` on this path: with no
+    /// non-blocking read there is nothing to report.
+    pub fn poll_action(_watch: &[char]) -> super::Poll {
+        super::Poll::Nothing
+    }
+}
+
+/// What a non-blocking poll found waiting on the input stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Poll {
+    /// Nothing was pressed since the last check.
+    Nothing,
+    /// The player asked to leave (Q or Ctrl+C).
+    Leave,
+    /// One of the keys the caller said it was watching for.
+    Pressed(char),
 }
 
 pub use raw::RawGuard;
@@ -316,6 +361,13 @@ pub fn read_key() -> Key {
 /// on `read_key()`.
 pub fn poll_leave_signal() -> bool {
     raw::poll_leave_signal()
+}
+
+/// Non-blocking: did the player press one of `watch`, or ask to leave,
+/// since the last call? Used by the live-action tables, where the whole
+/// game is acting before the animation finishes.
+pub fn poll_action(watch: &[char]) -> Poll {
+    raw::poll_action(watch)
 }
 
 /// Waits for any key at all — the "press any key to continue" beat.

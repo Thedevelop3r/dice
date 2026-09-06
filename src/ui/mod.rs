@@ -11,8 +11,72 @@ pub mod menu;
 pub mod theme;
 pub mod widgets;
 
-pub use input::{choose_key, confirm_key, poll_leave_signal, quit_requested, read_key, wait_any_key, Key};
+pub use input::{choose_key, confirm_key, poll_action, poll_leave_signal, quit_requested, read_key, wait_any_key, Key, Poll};
 pub use theme::{Theme, GOLD};
+
+/// How big a die or card is drawn. `Big` is exactly three times `Small`
+/// on both axes — 27x15 against 9x5 for a die, 21x15 against 7x5 for a
+/// card — with `Mid` the step between. Nothing in a game picks a size
+/// directly: the renderers measure the terminal and take the largest
+/// that fits, so a three-die table renders huge while a twelve-die one
+/// degrades gracefully on the very same screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scale {
+    Small,
+    Mid,
+    Big,
+}
+
+impl Scale {
+    /// Biggest first — the order `fit_scale` walks.
+    pub const ALL: [Scale; 3] = [Scale::Big, Scale::Mid, Scale::Small];
+
+    pub const fn height(self) -> usize {
+        match self {
+            Scale::Small => 5,
+            Scale::Mid => 10,
+            Scale::Big => 15,
+        }
+    }
+
+    pub const fn die_width(self) -> usize {
+        match self {
+            Scale::Small => 9,
+            Scale::Mid => 18,
+            Scale::Big => 27,
+        }
+    }
+
+    pub const fn card_width(self) -> usize {
+        match self {
+            Scale::Small => 7,
+            Scale::Mid => 14,
+            Scale::Big => 21,
+        }
+    }
+}
+
+/// The biggest scale at which `per_row` items across and `rows` rows of
+/// them still fit the live terminal, once `reserved` rows are set aside
+/// for the header, HUD and footer drawn around them. `width_of` picks
+/// the per-item width for the thing being laid out (a die or a card).
+/// Always yields at least `Small`, which is what the app drew before
+/// sizing existed, so there is no window too small to play in.
+pub fn fit_scale(per_row: usize, rows: usize, reserved: usize, width_of: impl Fn(Scale) -> usize) -> Scale {
+    let (cols, term_rows) = term_size();
+    let avail_w = cols as usize;
+    let avail_h = (term_rows as usize).saturating_sub(reserved);
+    let per_row = per_row.max(1);
+    let rows = rows.max(1);
+    for s in Scale::ALL {
+        // +1 on each axis for the gap that separates an item from its
+        // neighbour and from whatever is drawn beneath it.
+        if per_row * (width_of(s) + 1) <= avail_w && rows * (s.height() + 1) <= avail_h {
+            return s;
+        }
+    }
+    Scale::Small
+}
 
 use std::io::Write;
 use std::time::Duration;
@@ -32,6 +96,15 @@ impl Screen {
         print!("\x1b[?1049h\x1b[?25l"); // alternate screen + hide cursor
         let _ = out.flush();
         Screen { theme: Theme::new(colors), _raw: input::RawGuard::enable(), buf: String::new() }
+    }
+
+    /// A `Screen` that has claimed no terminal at all — no alternate
+    /// buffer, no raw mode, nothing written on drop. Unit tests that need
+    /// a whole `Ctx` to exercise settlement maths build one of these so
+    /// they never touch the real stdout the test harness is capturing.
+    #[cfg(test)]
+    pub fn headless() -> Screen {
+        Screen { theme: Theme::new(false), _raw: None, buf: String::new() }
     }
 
     pub fn colors(&self) -> bool {

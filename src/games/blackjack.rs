@@ -1,71 +1,17 @@
 //! Blackjack — heads-up against the house. Standard rules: dealer stands
 //! on all 17s, blackjack pays 3:2, one card on a double down.
+//!
+//! The deck, the shoe and the hand rankings all live in `games::cards`,
+//! shared with every other card table on the floor.
 
-use super::Ctx;
+use super::cards::{self, Card, Shoe};
+use super::{table, Ctx};
 use crate::economy::{House, Wallet};
 use crate::ui::{self, card_art, widgets};
 
-#[derive(Clone, Copy)]
-struct Card {
-    rank: u8, // 1..=13, 1 = Ace, 11/12/13 = J/Q/K
-    suit: u8, // 0=♠ 1=♥ 2=♦ 3=♣
-}
-
-impl Card {
-    fn label(&self) -> String {
-        let r = match self.rank {
-            1 => "A".to_string(),
-            11 => "J".to_string(),
-            12 => "Q".to_string(),
-            13 => "K".to_string(),
-            n => n.to_string(),
-        };
-        let s = match self.suit {
-            0 => "♠",
-            1 => "♥",
-            2 => "♦",
-            _ => "♣",
-        };
-        format!("{r}{s}")
-    }
-
-    fn is_red(&self) -> bool {
-        matches!(self.suit, 1 | 2)
-    }
-
-    fn value(&self) -> u32 {
-        match self.rank {
-            1 => 11,
-            n if n >= 10 => 10,
-            n => n as u32,
-        }
-    }
-}
-
-fn new_shoe(rng: &mut crate::rng::Rng) -> Vec<Card> {
-    let mut deck = Vec::with_capacity(52);
-    for suit in 0..4u8 {
-        for rank in 1..=13u8 {
-            deck.push(Card { rank, suit });
-        }
-    }
-    for i in (1..deck.len()).rev() {
-        let j = rng.below(i + 1);
-        deck.swap(i, j);
-    }
-    deck
-}
-
-fn draw(shoe: &mut Vec<Card>, rng: &mut crate::rng::Rng) -> Card {
-    if shoe.is_empty() {
-        *shoe = new_shoe(rng);
-    }
-    shoe.pop().unwrap()
-}
-
 /// Best total <=21 (aces flex between 11 and 1), and whether it's soft.
 fn hand_total(cards: &[Card]) -> (u32, bool) {
-    let mut total: u32 = cards.iter().map(|c| c.value()).sum();
+    let mut total: u32 = cards.iter().map(|c| c.blackjack_value()).sum();
     let mut aces = cards.iter().filter(|c| c.rank == 1).count();
     let mut soft = aces > 0;
     while total > 21 && aces > 0 {
@@ -79,7 +25,7 @@ fn hand_total(cards: &[Card]) -> (u32, bool) {
 }
 
 pub fn play(ctx: &mut Ctx) {
-    let mut shoe = new_shoe(ctx.rng);
+    let mut shoe = Shoe::new(ctx.rng, 1);
     loop {
         {
             let mut w = Wallet::new(ctx.store);
@@ -106,8 +52,8 @@ pub fn play(ctx: &mut Ctx) {
             continue;
         }
 
-        let mut player = vec![draw(&mut shoe, ctx.rng), draw(&mut shoe, ctx.rng)];
-        let mut dealer = vec![draw(&mut shoe, ctx.rng), draw(&mut shoe, ctx.rng)];
+        let mut player = vec![shoe.draw(ctx.rng), shoe.draw(ctx.rng)];
+        let mut dealer = vec![shoe.draw(ctx.rng), shoe.draw(ctx.rng)];
         let mut bet = stake;
 
         render(ctx, &player, &dealer, true, stake, "");
@@ -134,7 +80,7 @@ pub fn play(ctx: &mut Ctx) {
                 }
                 match ui::choose_key(&valid, 's') {
                     Some('h') => {
-                        player.push(draw(&mut shoe, ctx.rng));
+                        player.push(shoe.draw(ctx.rng));
                         can_double = false;
                         render(ctx, &player, &dealer, true, bet, "");
                         ui::sleep_ms(400);
@@ -142,7 +88,7 @@ pub fn play(ctx: &mut Ctx) {
                     Some('d') => {
                         let _ = Wallet::new(ctx.store).spend_chips(bet);
                         bet *= 2;
-                        player.push(draw(&mut shoe, ctx.rng));
+                        player.push(shoe.draw(ctx.rng));
                         render(ctx, &player, &dealer, true, bet, "doubled down");
                         ui::sleep_ms(600);
                         break;
@@ -163,7 +109,7 @@ pub fn play(ctx: &mut Ctx) {
                     let _ = soft;
                     break;
                 }
-                dealer.push(draw(&mut shoe, ctx.rng));
+                dealer.push(shoe.draw(ctx.rng));
                 render(ctx, &player, &dealer, false, bet, "dealer hits...");
                 ui::sleep_ms(650);
             }
@@ -241,13 +187,13 @@ fn draw_hands(ctx: &mut Ctx, player: &[Card], dealer: &[Card], hide_hole: bool) 
 
     ctx.screen.line(&format!("  dealer {}", if hide_hole { String::new() } else { format!("({dtotal})") }));
     let hidden: Vec<bool> = (0..dealer.len()).map(|i| hide_hole && i == 1).collect();
-    let cards: Vec<(String, bool)> = dealer.iter().map(|c| (c.label(), c.is_red())).collect();
+    let cards = cards::labels(dealer);
     for line in card_art::hand_block(&theme, &cards, &hidden) {
         ctx.screen.line(&line);
     }
     ctx.screen.blank();
     ctx.screen.line(&format!("  you ({ptotal})"));
-    let cards: Vec<(String, bool)> = player.iter().map(|c| (c.label(), c.is_red())).collect();
+    let cards = cards::labels(player);
     let none_hidden = vec![false; player.len()];
     for line in card_art::hand_block(&theme, &cards, &none_hidden) {
         ctx.screen.line(&line);
@@ -286,12 +232,85 @@ fn render_prompt(ctx: &mut Ctx, player: &[Card], dealer: &[Card], bet: i64, can_
     ctx.screen.present();
 }
 
+/// A seat playing itself off the book: hit below seventeen, stand on it,
+/// and never touch the player's wallet doing so.
+pub fn idle(ctx: &mut Ctx) {
+    let mut shoe = Shoe::new(ctx.rng, 6);
+    loop {
+        let punter = table::BOT_NAMES[ctx.rng.below(table::BOT_NAMES.len())];
+        let bet = 10 + 5 * ctx.rng.below(5) as i64;
+        let mut player = vec![shoe.draw(ctx.rng), shoe.draw(ctx.rng)];
+        let mut dealer = vec![shoe.draw(ctx.rng), shoe.draw(ctx.rng)];
+
+        render(ctx, &player, &dealer, true, bet, &format!("{punter} is dealt in"));
+        if table::idle_hold(1_100) {
+            return;
+        }
+
+        while hand_total(&player).0 < 17 {
+            player.push(shoe.draw(ctx.rng));
+            render(ctx, &player, &dealer, true, bet, &format!("{punter} hits"));
+            if table::idle_hold(900) {
+                return;
+            }
+        }
+        if hand_total(&player).0 <= 21 {
+            while hand_total(&dealer).0 < 17 {
+                dealer.push(shoe.draw(ctx.rng));
+                render(ctx, &player, &dealer, false, bet, "the dealer draws");
+                if table::idle_hold(900) {
+                    return;
+                }
+            }
+        }
+
+        let p = hand_total(&player).0;
+        let d = hand_total(&dealer).0;
+        let won = if p > 21 {
+            -bet
+        } else if d > 21 || p > d {
+            bet
+        } else if p == d {
+            0
+        } else {
+            -bet
+        };
+
+        let theme = ctx.theme();
+        ctx.screen.begin();
+        ui::header(ctx.screen, "BLACKJACK");
+        ctx.screen.blank();
+        ctx.screen.line(&format!("  {} · {}", theme.accent(punter), theme.paint(ui::theme::GOLD, &format!("{bet} chips"))));
+        ctx.screen.blank();
+        draw_hands(ctx, &player, &dealer, false);
+        let theme = ctx.theme();
+        ctx.screen.blank();
+        ctx.screen.line(&format!(
+            "  {}",
+            if won > 0 {
+                theme.win(&format!("{p} against {d} — {punter} collects {won}"))
+            } else if won == 0 {
+                theme.accent(&format!("{p} against {d} — a push"))
+            } else if p > 21 {
+                theme.lose(&format!("{punter} busts on {p}"))
+            } else {
+                theme.lose(&format!("{p} against {d} — the dealer takes it"))
+            }
+        ));
+        table::idle_footer(ctx, "the seat plays itself — no bet of yours is on the table");
+        ctx.screen.present();
+        if table::idle_hold(2_400) {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn card(rank: u8, suit: u8) -> Card {
-        Card { rank, suit }
+        Card::new(rank, suit)
     }
 
     #[test]
@@ -318,10 +337,10 @@ mod tests {
     #[test]
     fn shoe_deals_all_fifty_two_cards_before_reshuffling() {
         let mut rng = crate::rng::Rng::from_seed(1);
-        let mut shoe = new_shoe(&mut rng);
+        let mut shoe = Shoe::new(&mut rng, 1);
         assert_eq!(shoe.len(), 52);
         for _ in 0..52 {
-            draw(&mut shoe, &mut rng);
+            shoe.draw(&mut rng);
         }
         assert!(shoe.is_empty());
     }

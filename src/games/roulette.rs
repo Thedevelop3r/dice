@@ -1,7 +1,7 @@
 //! Roulette — single-zero wheel. Straight numbers pay 35:1; the outside
 //! bets (red/black, odd/even, high/low, dozens) pay evens or 2:1.
 
-use super::Ctx;
+use super::{table, Ctx};
 use crate::economy::{House, Wallet};
 use crate::ui::{self, dice_art, widgets};
 
@@ -221,6 +221,49 @@ fn spin(ctx: &mut Ctx, bet: &Bet, stake: i64) -> u32 {
         ui::sleep_ms(delay);
     }
     landed
+}
+
+/// The wheel turning on its own, a fictional punter on each spin.
+pub fn idle(ctx: &mut Ctx) {
+    let board = [Bet::Red, Bet::Black, Bet::Odd, Bet::Even, Bet::High, Bet::Low, Bet::Dozen(1), Bet::Dozen(2), Bet::Dozen(3), Bet::Straight(7), Bet::Straight(17)];
+    loop {
+        let punter = table::BOT_NAMES[ctx.rng.below(table::BOT_NAMES.len())];
+        let bet = board[ctx.rng.below(board.len())];
+        let stake = 10 + 5 * ctx.rng.below(5) as i64;
+        let n = spin(ctx, &bet, stake);
+        let won = stake * bet.payout(n);
+
+        let theme = ctx.theme();
+        ctx.screen.begin();
+        ui::header(ctx.screen, "ROULETTE");
+        ctx.screen.blank();
+        ctx.screen.line(&format!("  {} was on {}", theme.accent(punter), theme.paint(ui::theme::GOLD, &bet.label())));
+        ctx.screen.blank();
+        let code = if n == 0 {
+            ui::theme::GREEN
+        } else if is_red(n) {
+            ui::theme::RED
+        } else {
+            ui::theme::WHITE
+        };
+        ctx.screen.line(&theme.paint(code, "  ╔═════╗"));
+        ctx.screen.line(&theme.paint(code, &format!("  ║ {n:^3} ║")));
+        ctx.screen.line(&theme.paint(code, "  ╚═════╝"));
+        ctx.screen.blank();
+        ctx.screen.line(&format!(
+            "  {}",
+            if won >= 0 {
+                theme.win(&format!("{punter} collects {won}"))
+            } else {
+                theme.lose(&format!("{punter} is down {}", -won))
+            }
+        ));
+        table::idle_footer(ctx, "the wheel turns itself — no chips of yours are on the felt");
+        ctx.screen.present();
+        if table::idle_hold(2_400) {
+            return;
+        }
+    }
 }
 
 #[cfg(test)]
