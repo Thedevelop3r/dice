@@ -5,6 +5,17 @@ and its own raw-terminal input (direct `termios(3)` FFI, no `crossterm`).
 Twenty-four tables across four rooms, every one of them animated, and every
 one of them able to run itself with nobody watching.
 
+*Install Deps*
+```
+cargo install --path .
+
+```
+*Build project*
+```
+cargo build --release
+
+```
+*Run Binary build*
 ```
 cargo run --release
 
