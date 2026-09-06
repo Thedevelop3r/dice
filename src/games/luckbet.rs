@@ -2,13 +2,13 @@
 //! one letter each, guessing the face it will land on (6 by default). Hits are
 //! paid by the house; misses feed a carried-over jackpot.
 //!
-//! `play_turbo` is the same game with no betting input: press Enter and the
+//! `turbo` is the same game with no betting input: press a key and the
 //! table spins at 20 frames a second for three seconds before it settles.
 
 use super::{Ctx, Difficulty};
 use crate::dice;
-use crate::economy::{Item, Wallet};
-use crate::ui::{self, *};
+use crate::economy::{House, Item, Wallet};
+use crate::ui::{self, dice_art, widgets};
 
 pub const DICE: usize = 8;
 pub const LETTERS: [char; DICE] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
@@ -64,81 +64,39 @@ pub fn play(ctx: &mut Ctx, opponents: usize, turbo: bool) {
     let name = ctx.store.get_str("player.name", "Player");
     let mut seats = vec![Seat::human(&name)];
     for i in 0..opponents.min(2) {
-        let d = pick_ai_difficulty(i + 1, turbo);
+        let d = if turbo { Difficulty::Normal } else { super::pick_difficulty(ctx, &format!("CPU-{} DIFFICULTY", i + 1)) };
         seats.push(Seat::bot(&format!("CPU-{}", i + 1), d));
     }
 
     let jackpot = ctx.store.get_i64("luckbet.jackpot", 0);
     let mut table = Table::new(jackpot);
     let mut last_bet: Option<Bet> = None;
-
-    ui::header(ctx.colors, if turbo { "LUCK BET — TURBO" } else { "LUCK BET" });
-    println!(
-        "  Eight dice, {}. Back one letter and the face you think it lands on.",
-        color(ctx.colors, BOLD, "A through H")
-    );
-    {
-        let w = Wallet::new(ctx.store);
-        println!(
-            "  A hit pays {}:1. Misses feed the jackpot — land {} copies of your number and you take it all.",
-            payout_multiplier(w.owns(Item::VipTable)),
-            SWEEP_COPIES
-        );
-    }
-    if turbo {
-        println!("  {}", color(ctx.colors, DIM, "Turbo: press Enter to spin. Bets repeat automatically."));
-    }
+    let title = if turbo { "LUCK BET — TURBO" } else { "LUCK BET" };
 
     loop {
         table.round += 1;
-        let (chips, dollars, vip, gold) = {
-            let w = Wallet::new(ctx.store);
-            (w.chips(), w.dollars(), w.owns(Item::VipTable), w.owns(Item::GoldDice))
-        };
-        println!();
-        ui::rule(ctx.colors, 60);
-        println!(
-            "  round {}   you: {}   jackpot: {}",
-            table.round,
-            ui::money(ctx.colors, chips, dollars),
-            color(ctx.colors, MAGENTA, &format!("{} chips", table.jackpot))
-        );
-        for s in seats.iter().filter(|s| s.ai.is_some()) {
-            println!(
-                "  {}",
-                color(ctx.colors, DIM, &format!("{} ({}) — {} chips", s.name, s.ai.unwrap().label(), s.chips))
-            );
-        }
-
         {
             let mut w = Wallet::new(ctx.store);
             if w.chips() <= 0 {
                 if w.dollars() > 0 {
-                    println!("  {}", color(ctx.colors, YELLOW, "out of chips — visit the store to exchange dollars."));
+                    info(ctx, title, "out of chips — visit the store to exchange dollars.");
                     break;
                 }
                 if w.ensure_solvent(50) {
-                    println!("  {}", color(ctx.colors, DIM, "the house stakes you 50 chips."));
+                    info(ctx, title, "the house stakes you 50 chips.");
                 }
             }
         }
 
-        // --- place bets ---
         let human_bet = if turbo {
-            let ans = ui::prompt("\n  press Enter to spin (or q to leave the table): ");
-            if ans.to_lowercase().starts_with('q') {
+            draw_spin_prompt(ctx, title, &seats, &table);
+            if !ui::confirm_key(true) {
                 break;
             }
             let b = auto_bet(ctx, last_bet);
-            println!(
-                "  auto-bet: {} chips on {} showing {}",
-                b.stake,
-                color(ctx.colors, BOLD, &LETTERS[b.letter].to_string()),
-                b.number
-            );
             Some(b)
         } else {
-            match ask_bet(ctx, last_bet) {
+            match ask_bet(ctx, title, &seats, &table, last_bet) {
                 Some(b) => Some(b),
                 None => break,
             }
@@ -147,36 +105,26 @@ pub fn play(ctx: &mut Ctx, opponents: usize, turbo: bool) {
         {
             let mut w = Wallet::new(ctx.store);
             if !w.spend_chips(hb.stake) {
-                println!("  {}", color(ctx.colors, RED, "not enough chips for that stake."));
+                info(ctx, title, "not enough chips for that stake.");
                 continue;
             }
         }
         seats[0].bet = Some(hb);
         last_bet = Some(hb);
 
-        for i in 1..seats.len() {
-            let b = ai_bet(ctx, &seats[i]);
-            seats[i].chips -= b.stake;
-            seats[i].bet = Some(b);
-            println!(
-                "  {} backs {} on {} for {} chips",
-                color(ctx.colors, MAGENTA, &seats[i].name),
-                color(ctx.colors, BOLD, &LETTERS[b.letter].to_string()),
-                b.number,
-                b.stake
-            );
+        for seat in seats.iter_mut().skip(1) {
+            let b = ai_bet(ctx, seat);
+            seat.chips -= b.stake;
+            seat.bet = Some(b);
         }
 
-        // --- spin ---
-        spin(ctx, &mut table, turbo, gold);
+        spin(ctx, title, &seats, &mut table, turbo);
 
-        // --- second chances (consumables) ---
         if !turbo {
-            offer_second_chance(ctx, &mut table, &seats[0], gold);
+            offer_second_chance(ctx, title, &mut table, &seats[0]);
         }
 
-        // --- settle ---
-        settle(ctx, &mut table, &mut seats, vip, gold);
+        settle(ctx, title, &mut table, &mut seats, turbo);
         ctx.store.set_i64("luckbet.jackpot", table.jackpot);
         ctx.store.bump("luckbet.rounds", 1);
         let _ = ctx.store.save();
@@ -184,68 +132,126 @@ pub fn play(ctx: &mut Ctx, opponents: usize, turbo: bool) {
         for s in seats.iter_mut() {
             if s.ai.is_some() && s.chips <= 0 {
                 s.chips = AI_START / 2;
-                println!("  {}", color(ctx.colors, DIM, &format!("{} rebuys.", s.name)));
             }
         }
 
-        if turbo {
-            ui::pause();
-        } else if !ui::confirm("\n  another round?") {
+        if !turbo && !ui::confirm_key(true) {
             break;
         }
     }
 
-    println!();
-    let w = Wallet::new(ctx.store);
-    println!("  leaving the table with {}", ui::money(ctx.colors, w.chips(), w.dollars()));
-    ui::pause();
+    let theme = ctx.theme();
+    let (chips, dollars) = {
+        let w = Wallet::new(ctx.store);
+        (w.chips(), w.dollars())
+    };
+    let msg = format!("leaving the table with {}", ui::money(&theme, chips, dollars));
+    info(ctx, title, &msg);
 }
 
-fn pick_ai_difficulty(n: usize, turbo: bool) -> Difficulty {
-    if turbo {
-        return Difficulty::Normal;
+fn table_header(ctx: &mut Ctx, title: &str, seats: &[Seat], table: &Table) {
+    let theme = ctx.theme();
+    ui::header(ctx.screen, title);
+    ctx.screen.blank();
+    let (chips, dollars, vip) = {
+        let w = Wallet::new(ctx.store);
+        (w.chips(), w.dollars(), w.owns(Item::VipTable))
+    };
+    ctx.screen.line(&format!(
+        "  round {}   you: {}   jackpot: {}",
+        table.round.max(1),
+        ui::money(&theme, chips, dollars),
+        theme.paint(ui::theme::MAGENTA, &format!("{} chips", table.jackpot))
+    ));
+    ctx.screen.line(&theme.dim(&format!("hits pay {}:1 · land {SWEEP_COPIES}+ copies of your number and sweep the jackpot", payout_multiplier(vip))));
+    for s in seats.iter().filter(|s| s.ai.is_some()) {
+        ctx.screen.line(&theme.dim(&format!("  {} ({}) — {} chips", s.name, s.ai.unwrap().label(), s.chips)));
     }
-    println!("   1. Easy   2. Normal   3. Hard");
-    Difficulty::from_index(ui::prompt_usize(&format!("  CPU-{n} difficulty"), 1, 3, 2))
+}
+
+fn draw_spin_prompt(ctx: &mut Ctx, title: &str, seats: &[Seat], table: &Table) {
+    let theme = ctx.theme();
+    ctx.screen.begin();
+    table_header(ctx, title, seats, table);
+    ctx.screen.blank();
+    let gold = Wallet::new(ctx.store).owns(Item::GoldDice);
+    let no_hits = [false; DICE];
+    for line in dice_art::table_block(&theme, &table.values, &LETTERS, &no_hits, gold, DICE) {
+        ctx.screen.line(&line);
+    }
+    ctx.screen.blank();
+    ctx.screen.line(&widgets::footer(&theme, &[('y', "spin"), ('n', "leave the table")]));
+    ctx.screen.present();
+}
+
+fn info(ctx: &mut Ctx, title: &str, msg: &str) {
+    let theme = ctx.theme();
+    ctx.screen.begin();
+    ui::header(ctx.screen, title);
+    ctx.screen.blank();
+    ctx.screen.line(&format!("  {}", theme.dim(msg)));
+    ctx.screen.present();
+    ui::pause(ctx.screen);
 }
 
 /// Reads the human's bet. `None` means they want to leave.
-fn ask_bet(ctx: &mut Ctx, last: Option<Bet>) -> Option<Bet> {
-    let chips = Wallet::new(ctx.store).chips();
-    println!();
-    let letter = loop {
-        let hint = last.map(|b| LETTERS[b.letter]).unwrap_or('A');
-        let ans = ui::prompt(&format!("  back which die? A-H [{hint}] (r = repeat last, q = leave): "));
-        if ui::eof_reached() {
-            return None;
-        }
-        let low = ans.to_lowercase();
-        match low.chars().next() {
-            None => break LETTERS.iter().position(|c| *c == hint).unwrap_or(0),
-            Some('q') => return None,
-            Some('r') => {
-                if let Some(b) = last {
-                    println!("  repeating: {} on {} for {}", LETTERS[b.letter], b.number, b.stake);
-                    let stake = b.stake.min(chips.max(1));
-                    return Some(Bet { stake, ..b });
-                }
-                println!("  ! no previous bet yet");
+fn ask_bet(ctx: &mut Ctx, title: &str, seats: &[Seat], table: &Table, last: Option<Bet>) -> Option<Bet> {
+    let theme = ctx.theme();
+    let gold = Wallet::new(ctx.store).owns(Item::GoldDice);
+
+    ctx.screen.begin();
+    table_header(ctx, title, seats, table);
+    ctx.screen.blank();
+    let no_hits = [false; DICE];
+    for line in dice_art::table_block(&theme, &table.values, &LETTERS, &no_hits, gold, DICE) {
+        ctx.screen.line(&line);
+    }
+    ctx.screen.blank();
+    if let Some(b) = last {
+        ctx.screen.line(&theme.dim(&format!("last bet: {} on {} for {}", LETTERS[b.letter], b.number, b.stake)));
+    }
+    ctx.screen.line("  back which die?");
+    ctx.screen.line(&widgets::footer(&theme, &[('a', "…"), ('h', "die A-H"), ('r', "repeat last"), ('q', "leave")]));
+    ctx.screen.present();
+
+    let mut valid: Vec<char> = LETTERS.iter().map(|c| c.to_ascii_lowercase()).collect();
+    valid.push('r');
+    valid.push('q');
+    let letter = match ui::choose_key(&valid, 'q') {
+        Some('q') | None => return None,
+        Some('r') => {
+            if let Some(b) = last {
+                let chips = Wallet::new(ctx.store).chips();
+                let stake = b.stake.min(chips.max(1));
+                return Some(Bet { stake, ..b });
             }
-            Some(c) if c.is_ascii_alphabetic() => {
-                let up = c.to_ascii_uppercase();
-                match LETTERS.iter().position(|l| *l == up) {
-                    Some(i) => break i,
-                    None => println!("  ! pick a letter A through H"),
-                }
-            }
-            _ => println!("  ! pick a letter A through H"),
+            LETTERS.iter().position(|c| *c == 'A').unwrap()
         }
+        Some(c) => LETTERS.iter().position(|l| l.to_ascii_lowercase() == c).unwrap_or(0),
     };
 
-    let number = ui::prompt_usize("  which face should it show? 1-6", 1, 6, 6) as u32;
+    ctx.screen.begin();
+    table_header(ctx, title, seats, table);
+    ctx.screen.blank();
+    ctx.screen.line(&format!("  backing {} — which face?", LETTERS[letter]));
+    ctx.screen.line(&widgets::footer(&theme, &[('1', "…"), ('6', "face")]));
+    ctx.screen.present();
+    let number = ui::choose_key(&['1', '2', '3', '4', '5', '6'], '6').and_then(|c| c.to_digit(10)).unwrap_or(6);
+
+    let chips = Wallet::new(ctx.store).chips();
     let max = chips.max(1);
     let default = 10.min(max);
-    let stake = ui::prompt_usize(&format!("  stake (1-{max})"), 1, max as usize, default as usize) as i64;
+    let stake = widgets::number_picker(ctx.screen, 1, max, default, 5, &[('m', max)], |s, v| {
+        let theme = s.theme;
+        s.begin();
+        ui::header(s, title);
+        s.blank();
+        s.line(&format!("  {} on {} — stake?", LETTERS[letter], number));
+        s.blank();
+        s.line(&format!("  {}", theme.paint(ui::theme::GOLD, &format!("{v} chips"))));
+        s.blank();
+        s.line(&widgets::footer(&theme, &[('↑', "+5"), ('↓', "-5"), ('m', "max"), ('\u{23ce}', "confirm")]));
+    })?;
     Some(Bet { letter, number, stake })
 }
 
@@ -261,7 +267,6 @@ fn ai_bet(ctx: &mut Ctx, seat: &Seat) -> Bet {
     let d = seat.ai.unwrap_or(Difficulty::Normal);
     let letter = ctx.rng.below(DICE);
     let number = match d {
-        // Easy scatters its guesses; the others chase the jackpot number.
         Difficulty::Easy => ctx.rng.roll(6),
         _ => 6,
     };
@@ -269,46 +274,39 @@ fn ai_bet(ctx: &mut Ctx, seat: &Seat) -> Bet {
     let stake = match d {
         Difficulty::Easy => (stack / 5).max(1),
         Difficulty::Normal => (stack / 10).max(1),
-        Difficulty::Hard => (stack / 12).max(1).min(25),
+        Difficulty::Hard => (stack / 12).clamp(1, 25),
     };
     Bet { letter, number, stake: stake.min(stack) }
 }
 
-/// Rolls the table. Turbo animates 20 frames a second for three seconds.
-fn spin(ctx: &mut Ctx, table: &mut Table, turbo: bool, gold: bool) {
+/// Rolls the table: a one-second settle normally, a sustained 20fps/3s
+/// spin in Turbo.
+fn spin(ctx: &mut Ctx, title: &str, seats: &[Seat], table: &mut Table, turbo: bool) {
+    let gold = Wallet::new(ctx.store).owns(Item::GoldDice);
+    let delays: &[u64] = if turbo { &dice_art::TURBO_FRAME_DELAYS } else { dice_art::standard_frames() };
     let no_hits = [false; DICE];
-    println!();
-    if turbo {
-        let frames = 60; // 20 fps * 3 s
-        ui::hide_cursor();
-        let mut lines = 0;
-        for f in 0..frames {
-            for v in table.values.iter_mut() {
-                *v = ctx.rng.roll(6);
-            }
-            if f > 0 {
-                ui::cursor_up(lines);
-            }
-            lines = ui::draw_table(&table.values, &LETTERS, &no_hits, ctx.colors, gold);
-            ui::sleep_ms(50);
+    let final_values = dice_art::animate_table_roll(ctx.screen, ctx.rng, DICE, delays, |screen, frame| {
+        let theme = screen.theme;
+        screen.begin();
+        ui::header(screen, title);
+        screen.blank();
+        screen.line(&format!("  round {}", table.round));
+        for s in seats.iter().filter(|s| s.ai.is_some()) {
+            screen.line(&theme.dim(&format!("  {} ({}) — {} chips", s.name, s.ai.unwrap().label(), s.chips)));
         }
-        ui::cursor_up(lines);
-        ui::show_cursor();
-    } else {
-        for _ in 0..6 {
-            for v in table.values.iter_mut() {
-                *v = ctx.rng.roll(6);
-            }
+        screen.blank();
+        for line in dice_art::table_block(&theme, frame, &LETTERS, &no_hits, gold, DICE) {
+            screen.line(&line);
         }
-    }
-    let final_roll = dice::roll_n(ctx.rng, DICE as u32, 6);
-    table.values.copy_from_slice(&final_roll);
+        screen.blank();
+        screen.line(&theme.dim("spinning..."));
+    });
+    table.values = final_values.try_into().expect("animate_table_roll returns exactly DICE values");
     ctx.store.bump("luckbet.rolls", DICE as i64);
-    ui::draw_table(&table.values, &LETTERS, &no_hits, ctx.colors, gold);
 }
 
 /// Uses a Reroll Token or Lucky Charm when the human's die missed.
-fn offer_second_chance(ctx: &mut Ctx, table: &mut Table, seat: &Seat, gold: bool) {
+fn offer_second_chance(ctx: &mut Ctx, title: &str, table: &mut Table, seat: &Seat) {
     let Some(bet) = seat.bet else { return };
     if table.values[bet.letter] == bet.number {
         return;
@@ -320,31 +318,42 @@ fn offer_second_chance(ctx: &mut Ctx, table: &mut Table, seat: &Seat, gold: bool
     if !has_reroll && !has_charm {
         return;
     }
-    println!(
-        "  {} — missed. {}{}",
-        color(ctx.colors, RED, &format!("{} showed {}", LETTERS[bet.letter], table.values[bet.letter])),
-        if has_charm { "(c)harm rerolls your die  " } else { "" },
-        if has_reroll { "(r)eroll spins the table  " } else { "" }
-    );
-    let ans = ui::prompt("  use an item? (c/r/n): ").to_lowercase();
-    match ans.chars().next() {
-        Some('c') if has_charm => {
-            if Wallet::new(ctx.store).consume(Item::LuckyCharm) {
+
+    let theme = ctx.theme();
+    let gold = Wallet::new(ctx.store).owns(Item::GoldDice);
+    ctx.screen.begin();
+    ui::header(ctx.screen, title);
+    ctx.screen.blank();
+    let no_hits = [false; DICE];
+    for line in dice_art::table_block(&theme, &table.values, &LETTERS, &no_hits, gold, DICE) {
+        ctx.screen.line(&line);
+    }
+    ctx.screen.blank();
+    ctx.screen.line(&theme.lose(&format!("{} showed {} — missed.", LETTERS[bet.letter], table.values[bet.letter])));
+    let mut hints = Vec::new();
+    if has_charm {
+        hints.push(('c', "charm rerolls your die"));
+    }
+    if has_reroll {
+        hints.push(('r', "reroll spins the table"));
+    }
+    hints.push(('n', "no thanks"));
+    ctx.screen.line(&widgets::footer(&theme, &hints));
+    ctx.screen.present();
+
+    let valid: Vec<char> = hints.iter().map(|(k, _)| *k).collect();
+    match ui::choose_key(&valid, 'n') {
+        Some('c') if has_charm
+            && Wallet::new(ctx.store).consume(Item::LuckyCharm) => {
                 table.values[bet.letter] = ctx.rng.roll(6);
-                println!("  {}", color(ctx.colors, CYAN, "the charm turns your die..."));
             }
-        }
-        Some('r') if has_reroll => {
-            if Wallet::new(ctx.store).consume(Item::Reroll) {
+        Some('r') if has_reroll
+            && Wallet::new(ctx.store).consume(Item::Reroll) => {
                 let roll = dice::roll_n(ctx.rng, DICE as u32, 6);
                 table.values.copy_from_slice(&roll);
-                println!("  {}", color(ctx.colors, CYAN, "the table spins again..."));
             }
-        }
-        _ => return,
+        _ => {}
     }
-    let no_hits = [false; DICE];
-    ui::draw_table(&table.values, &LETTERS, &no_hits, ctx.colors, gold);
 }
 
 /// Was the call right, and did the number land often enough to sweep the pot?
@@ -354,15 +363,17 @@ pub fn evaluate(bet: &Bet, values: &[u32], counts: &[u32]) -> (bool, bool) {
     (hit, sweep)
 }
 
-/// Pays winners, rakes losses into the jackpot, and prints the round summary.
-fn settle(ctx: &mut Ctx, table: &mut Table, seats: &mut [Seat], vip: bool, gold: bool) {
+/// Pays winners, rakes losses into the jackpot, and shows the round summary.
+fn settle(ctx: &mut Ctx, title: &str, table: &mut Table, seats: &mut [Seat], turbo: bool) {
     let counts = dice::tally(&table.values, 6);
+    let vip = Wallet::new(ctx.store).owns(Item::VipTable);
+    let gold = Wallet::new(ctx.store).owns(Item::GoldDice);
     let mult = payout_multiplier(vip);
     let mut hits = [false; DICE];
     let mut sweep_winner: Option<usize> = None;
 
-    for i in 0..seats.len() {
-        let Some(bet) = seats[i].bet else { continue };
+    for (i, seat) in seats.iter_mut().enumerate() {
+        let Some(bet) = seat.bet else { continue };
         let (won, can_sweep) = evaluate(&bet, &table.values, &counts);
         if won {
             hits[bet.letter] = true;
@@ -381,16 +392,14 @@ fn settle(ctx: &mut Ctx, table: &mut Table, seats: &mut [Seat], vip: bool, gold:
             let rake = (bet.stake * RAKE_PERCENT / 100).max(1);
             table.jackpot += rake;
             note.push_str("miss");
-            if seats[i].ai.is_none() && Wallet::new(ctx.store).count(Item::Insurance) > 0 {
-                if Wallet::new(ctx.store).consume(Item::Insurance) {
-                    let refund = bet.stake / 2;
-                    delta += refund;
-                    note.push_str(&format!(" (insurance refunded {refund})"));
-                }
+            if seat.ai.is_none() && Wallet::new(ctx.store).count(Item::Insurance) > 0 && Wallet::new(ctx.store).consume(Item::Insurance) {
+                let refund = bet.stake / 2;
+                delta += refund;
+                note.push_str(&format!(" (insurance refunded {refund})"));
             }
         }
-        seats[i].last_delta = delta;
-        seats[i].note = note;
+        seat.last_delta = delta;
+        seat.note = note;
     }
 
     if let Some(w) = sweep_winner {
@@ -401,10 +410,7 @@ fn settle(ctx: &mut Ctx, table: &mut Table, seats: &mut [Seat], vip: bool, gold:
         ctx.store.record_best("luckbet.best_jackpot", pot);
     }
 
-    // Apply balances: seat 0 is the human wallet, the rest are local stacks.
     for (i, s) in seats.iter_mut().enumerate() {
-        // The stake left the balance when the bet was placed, so hand back the
-        // stake plus the net result (zero on a plain loss).
         let credit = s.bet.map_or(0, |b| (b.stake + s.last_delta).max(0));
         if i == 0 {
             let mut w = Wallet::new(ctx.store);
@@ -414,39 +420,49 @@ fn settle(ctx: &mut Ctx, table: &mut Table, seats: &mut [Seat], vip: bool, gold:
         }
     }
 
-    // Redraw the settled table with the winning dice picked out.
-    if hits.iter().any(|h| *h) {
-        ui::cursor_up(6);
-        ui::draw_table(&table.values, &LETTERS, &hits, ctx.colors, gold);
-    }
-
-    println!();
-    for s in seats.iter() {
-        let Some(bet) = s.bet else { continue };
-        let sign = if s.last_delta >= 0 { "+" } else { "" };
-        println!(
-            "  {:<10} {} on {}  →  {}  {}",
-            s.name,
-            color(ctx.colors, BOLD, &LETTERS[bet.letter].to_string()),
-            bet.number,
-            color(
-                ctx.colors,
-                if s.last_delta >= 0 { GREEN } else { RED },
-                &format!("{sign}{} chips", s.last_delta)
-            ),
-            color(ctx.colors, DIM, &s.note)
-        );
-    }
-    if let Some(w) = sweep_winner {
-        println!("  {}", color(ctx.colors, MAGENTA, &format!("★ {} SWEEPS THE JACKPOT ★", seats[w].name)));
-    }
-
+    House::record(ctx.store, "luckbet", seats[0].last_delta);
     if seats[0].last_delta > 0 {
         ctx.store.bump("luckbet.wins", 1);
         ctx.store.record_best("luckbet.best_win", seats[0].last_delta);
     } else {
         ctx.store.bump("luckbet.losses", 1);
     }
+
+    let theme = ctx.theme();
+    ctx.screen.begin();
+    ui::header(ctx.screen, title);
+    ctx.screen.blank();
+    for line in dice_art::table_block(&theme, &table.values, &LETTERS, &hits, gold, DICE) {
+        ctx.screen.line(&line);
+    }
+    ctx.screen.blank();
+    for s in seats.iter() {
+        let Some(bet) = s.bet else { continue };
+        let sign = if s.last_delta >= 0 { "+" } else { "" };
+        ctx.screen.line(&format!(
+            "  {:<10} {} on {}  →  {}  {}",
+            s.name,
+            theme.bold(&LETTERS[bet.letter].to_string()),
+            bet.number,
+            theme.paint(if s.last_delta >= 0 { ui::theme::GREEN } else { ui::theme::RED }, &format!("{sign}{} chips", s.last_delta)),
+            theme.dim(&s.note)
+        ));
+    }
+    if let Some(w) = sweep_winner {
+        for line in widgets::banner(&theme, &format!("{} SWEEPS THE JACKPOT", seats[w].name), true) {
+            ctx.screen.line(&format!("  {line}"));
+        }
+    }
+    ctx.screen.blank();
+    if turbo {
+        ctx.screen.line(&theme.dim("··· press any key to continue ···"));
+        ctx.screen.present();
+        ui::wait_any_key();
+    } else {
+        ctx.screen.line(&widgets::footer(&theme, &[('y', "another round"), ('n', "leave the table")]));
+        ctx.screen.present();
+    }
+
     for s in seats.iter_mut() {
         s.bet = None;
     }
@@ -466,11 +482,8 @@ mod tests {
     fn hits_need_the_named_die_to_show_the_named_face() {
         let values = [6, 2, 6, 3, 1, 6, 4, 5];
         let counts = dice::tally(&values, 6);
-        // A shows a 6, and three dice on the table do: hit and sweep.
         assert_eq!(evaluate(&Bet { letter: 0, number: 6, stake: 10 }, &values, &counts), (true, true));
-        // B shows a 2 — right die, wrong face.
         assert_eq!(evaluate(&Bet { letter: 1, number: 6, stake: 10 }, &values, &counts), (false, false));
-        // D shows the 3 that was called, but only one 3 is on the table.
         assert_eq!(evaluate(&Bet { letter: 3, number: 3, stake: 10 }, &values, &counts), (true, false));
     }
 

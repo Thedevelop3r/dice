@@ -85,12 +85,29 @@ impl Store {
         self.set_str("player.name", &name);
         self.set_i64("cfg.colors", colors);
     }
+
+    /// An empty, disk-detached `Store` for unit tests — its `path` is a
+    /// scratch file nothing ever reads back, so tests stay hermetic
+    /// (never picking up a real player's save file) even though `save()`
+    /// still works as a harmless no-op write.
+    #[cfg(test)]
+    pub fn blank() -> Store {
+        Store { path: std::env::temp_dir().join("dice_arena_test_scratch.conf"), map: BTreeMap::new() }
+    }
 }
 
-fn data_path() -> PathBuf {
+/// The app's save directory — `$XDG_DATA_HOME/dice_arena` (falling back to
+/// `~/.local/share/dice_arena`, then the current directory). Shared with
+/// `history.rs`, which keeps its own plain-text log alongside `save.conf`
+/// rather than folding a growing log into this file's `key=value` format.
+pub fn data_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(|_| PathBuf::from("."));
-    base.join("dice_arena").join("save.conf")
+    base.join("dice_arena")
+}
+
+fn data_path() -> PathBuf {
+    data_dir().join("save.conf")
 }

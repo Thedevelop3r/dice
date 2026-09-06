@@ -3,113 +3,133 @@
 
 use crate::economy::{Item, Wallet, CHIPS_PER_DOLLAR, CHIPS_PER_DOLLAR_SELL};
 use crate::stats::Store as Save;
-use crate::ui::{self, *};
+use crate::ui::menu::{choose_from, MenuItem};
+use crate::ui::{self, widgets, Screen};
 
-pub fn open(save: &mut Save, colors: bool) {
+pub fn open(save: &mut Save, screen: &mut Screen) {
     loop {
-        ui::clear();
-        ui::header(colors, "THE STORE");
-        {
+        let theme = screen.theme;
+        let (chips, dollars) = {
             let w = Wallet::new(save);
-            println!("  balance: {}", ui::money(colors, w.chips(), w.dollars()));
-        }
-        println!(
-            "  {}",
-            color(colors, DIM, &format!("buy at {CHIPS_PER_DOLLAR} chips per $1 · cash out at {CHIPS_PER_DOLLAR_SELL} chips per $1"))
-        );
+            (w.chips(), w.dollars())
+        };
+        screen.begin();
+        ui::header(screen, "THE STORE");
+        screen.blank();
+        screen.line(&format!("  balance: {}", ui::money(&theme, chips, dollars)));
+        screen.line(&theme.dim(&format!("buy at {CHIPS_PER_DOLLAR} chips per $1 · cash out at {CHIPS_PER_DOLLAR_SELL} chips per $1")));
 
-        println!("\n  {}", color(colors, BOLD, "exchange"));
-        println!("   1. buy chips with dollars");
-        println!("   2. cash chips out for dollars");
-        println!("\n  {}", color(colors, BOLD, "goods"));
+        let mut items = vec![
+            MenuItem::new('1', "buy chips", "spend dollars for chips"),
+            MenuItem::new('2', "cash out", "trade chips back for dollars"),
+        ];
+        let mut goods_keys = Vec::new();
         for (i, item) in Item::ALL.iter().enumerate() {
+            let key = (b'3' + i as u8) as char;
+            goods_keys.push(*item);
             let w = Wallet::new(save);
             let owned = if item.permanent() {
                 if w.owns(*item) { " [OWNED]".to_string() } else { String::new() }
             } else {
                 format!(" [x{}]", w.count(*item))
             };
-            println!(
-                "   {}. {:<16} {}   {}{}",
-                i + 3,
-                item.name(),
-                color(colors, GREEN, &format!("{:>4}", format!("${}", item.price()))),
-                color(colors, DIM, item.blurb()),
-                color(colors, CYAN, &owned)
-            );
+            items.push(MenuItem::new(
+                key,
+                format!("{} — ${}", item.name(), item.price()),
+                format!("{}{}", item.blurb(), owned),
+            ));
         }
-        println!("\n   b. back");
+        items.push(MenuItem::new('b', "back", ""));
 
-        let choice = ui::prompt("\n  choose: ").to_lowercase();
-        match choice.as_str() {
-            "1" => buy_chips(save, colors),
-            "2" => sell_chips(save, colors),
-            "b" | "q" | "" => return,
-            other => match other.parse::<usize>() {
-                Ok(n) if (3..3 + Item::ALL.len()).contains(&n) => buy_item(save, colors, Item::ALL[n - 3]),
-                _ => {}
-            },
+        match choose_from(screen, "STORE", &items) {
+            Some('1') => buy_chips(save, screen),
+            Some('2') => sell_chips(save, screen),
+            Some('b') | None => return,
+            Some(c) if c.is_ascii_digit() => {
+                let idx = (c as u8).wrapping_sub(b'3') as usize;
+                if let Some(item) = goods_keys.get(idx) {
+                    buy_item(save, screen, *item);
+                }
+            }
+            _ => {}
         }
     }
 }
 
-fn buy_chips(save: &mut Save, colors: bool) {
+fn buy_chips(save: &mut Save, screen: &mut Screen) {
+    let theme = screen.theme;
     let dollars = Wallet::new(save).dollars();
     if dollars <= 0 {
-        println!("  {}", color(colors, RED, "no dollars to spend — cash some chips out first."));
-        ui::pause();
+        message(screen, &theme.lose("no dollars to spend — cash some chips out first."));
         return;
     }
-    let n = ui::prompt_usize(&format!("  spend how many dollars (1-{dollars})"), 1, dollars as usize, 5.min(dollars as usize)) as i64;
+    let Some(n) = widgets::number_picker(screen, 1, dollars, dollars.min(5), 1, &[('m', dollars)], |s, v| {
+        s.begin();
+        ui::header(s, "BUY CHIPS");
+        s.blank();
+        s.line(&format!("  spend ${v} → {} chips", v * CHIPS_PER_DOLLAR));
+        s.blank();
+        s.line(&widgets::footer(&s.theme, &[('↑', "more"), ('↓', "less"), ('m', "max"), ('\u{23ce}', "confirm")]));
+    }) else {
+        return;
+    };
     let mut w = Wallet::new(save);
     if w.spend_dollars(n) {
         let chips = n * CHIPS_PER_DOLLAR;
         w.add_chips(chips);
-        println!("  {}", color(colors, GREEN, &format!("+{chips} chips for ${n}")));
         save.bump("store.chips_bought", chips);
+        message(screen, &screen.theme.win(&format!("+{chips} chips for ${n}")));
     }
     let _ = save.save();
-    ui::pause();
 }
 
-fn sell_chips(save: &mut Save, colors: bool) {
+fn sell_chips(save: &mut Save, screen: &mut Screen) {
+    let theme = screen.theme;
     let chips = Wallet::new(save).chips();
     if chips < CHIPS_PER_DOLLAR_SELL {
-        println!(
-            "  {}",
-            color(colors, RED, &format!("need at least {CHIPS_PER_DOLLAR_SELL} chips to cash out."))
-        );
-        ui::pause();
+        message(screen, &theme.lose(&format!("need at least {CHIPS_PER_DOLLAR_SELL} chips to cash out.")));
         return;
     }
     let max = chips / CHIPS_PER_DOLLAR_SELL;
-    let n = ui::prompt_usize(&format!("  cash out for how many dollars (1-{max})"), 1, max as usize, 1) as i64;
+    let Some(n) = widgets::number_picker(screen, 1, max, 1, 1, &[('m', max)], |s, v| {
+        s.begin();
+        ui::header(s, "CASH OUT");
+        s.blank();
+        s.line(&format!("  trade {} chips → ${v}", v * CHIPS_PER_DOLLAR_SELL));
+        s.blank();
+        s.line(&widgets::footer(&s.theme, &[('↑', "more"), ('↓', "less"), ('m', "max"), ('\u{23ce}', "confirm")]));
+    }) else {
+        return;
+    };
     let cost = n * CHIPS_PER_DOLLAR_SELL;
     let mut w = Wallet::new(save);
     if w.spend_chips(cost) {
         w.add_dollars(n);
-        println!("  {}", color(colors, GREEN, &format!("-{cost} chips for ${n}")));
         save.bump("store.chips_sold", cost);
+        message(screen, &screen.theme.win(&format!("-{cost} chips for ${n}")));
     }
     let _ = save.save();
-    ui::pause();
 }
 
-fn buy_item(save: &mut Save, colors: bool, item: Item) {
+fn buy_item(save: &mut Save, screen: &mut Screen, item: Item) {
+    let theme = screen.theme;
     let mut w = Wallet::new(save);
     if item.permanent() && w.owns(item) {
-        println!("  {}", color(colors, DIM, "you already own that."));
-        ui::pause();
+        message(screen, &theme.dim("you already own that."));
         return;
     }
     if !w.spend_dollars(item.price()) {
-        println!("  {}", color(colors, RED, &format!("that costs ${} — you have ${}.", item.price(), w.dollars())));
-        ui::pause();
+        message(screen, &theme.lose(&format!("that costs ${} — you have ${}.", item.price(), w.dollars())));
         return;
     }
     w.grant(item, 1);
-    println!("  {}", color(colors, GREEN, &format!("bought {}", item.name())));
     save.bump("store.purchases", 1);
     let _ = save.save();
-    ui::pause();
+    message(screen, &screen.theme.win(&format!("bought {}", item.name())));
+}
+
+fn message(screen: &mut Screen, text: &str) {
+    screen.blank();
+    screen.line(&format!("  {text}"));
+    ui::pause(screen);
 }
