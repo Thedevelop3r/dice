@@ -548,10 +548,11 @@ fn settings(store: &mut Store, screen: &mut Screen) {
     }
 }
 
+/// The rules book. With twenty-three tables this is far longer than any
+/// terminal, so it pages the way the History screen does rather than
+/// letting the top scroll away unread.
 fn rules(screen: &mut Screen) {
     let theme = screen.theme;
-    screen.begin();
-    ui::header(screen, "RULES");
     let entries: [(&str, &str); 23] = [
         ("PIG", "Roll to build a turn total, hold to bank it. Roll a 1 and the turn total is gone. In the two-dice variant a single 1 ends the turn, snake eyes wipes your whole score, and doubles pay double. First to the target score wins."),
         ("YAHTZEE", "Thirteen rounds, three rolls each: keep dice between rolls, then commit the hand to one open category. 63+ in the upper section earns a 35-point bonus; each extra Yahtzee after the first is worth 100."),
@@ -577,16 +578,44 @@ fn rules(screen: &mut Screen) {
         ("SCRATCH CARDS", "Buy a card and scratch nine panels. Three matching symbols pays that symbol's prize, from 1x up to 1,000x for three stars. The prize is decided when the card is printed, which is why the panels always tell the truth about what it is worth."),
         ("HORSE RACING", "Six runners at fixed odds from 2:1 to 20:1. Back one and watch the race. The odds come first and each runner's chance is derived from them, so every horse on the card returns the same share of your stake over time."),
     ];
+    // Rendered once, then paged — so a page break never lands between a
+    // table's name and its rules.
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    let (_, rows) = screen.size();
+    let per_page = (rows as usize).saturating_sub(8).clamp(10, 40);
+    let mut page: Vec<String> = Vec::new();
     for (title, body) in entries {
-        screen.blank();
-        screen.line(&theme.bold(title));
+        let mut block = vec![String::new(), theme.bold(title)];
         for line in wrap(body, 74) {
-            screen.line(&format!("   {line}"));
+            block.push(format!("   {line}"));
+        }
+        if !page.is_empty() && page.len() + block.len() > per_page {
+            pages.push(std::mem::take(&mut page));
+        }
+        page.extend(block);
+    }
+    page.push(String::new());
+    page.push(theme.dim("tip: set DICE_SEED=<n> in the environment to seed the whole session."));
+    pages.push(page);
+
+    let total = pages.len();
+    let mut at = 0usize;
+    loop {
+        screen.begin();
+        ui::header(screen, "RULES");
+        for line in &pages[at] {
+            screen.line(line);
+        }
+        screen.blank();
+        screen.line(&theme.dim(&format!("page {}/{total}", at + 1)));
+        screen.line(&widgets::footer(&theme, &[('n', "next page"), ('p', "prev page"), ('q', "back")]));
+        screen.present();
+        match ui::choose_key(&['n', 'p', 'q'], 'q') {
+            Some('n') => at = (at + 1).min(total - 1),
+            Some('p') => at = at.saturating_sub(1),
+            _ => return,
         }
     }
-    screen.blank();
-    screen.line(&theme.dim("tip: set DICE_SEED=<n> in the environment to seed the whole session."));
-    ui::pause(screen);
 }
 
 fn wrap(text: &str, width: usize) -> Vec<String> {
