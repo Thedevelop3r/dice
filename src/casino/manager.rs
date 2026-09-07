@@ -22,6 +22,8 @@ use super::clock::Clock;
 use super::config::{self, Config};
 use super::event::{Departure, Event, Feed, Record, Weight};
 use super::instance::{Instance, Kind, RoundLog};
+use super::patron::Patron;
+use super::roster::{self, Roster};
 use super::sim::Sim;
 use crate::rng::Rng;
 use crate::ui::Badge;
@@ -47,8 +49,9 @@ struct Floor {
     cfg: Config,
     clock: Clock,
     feed: Feed,
-    /// Identity is minted at floor level, not table level.
-    next_patron: u64,
+    /// Everyone the casino knows. Owned here, so a patron outlives the
+    /// table they happen to be sitting at.
+    roster: Roster,
     started: Instant,
 }
 
@@ -58,13 +61,90 @@ impl Floor {
     /// the only place in the program that has to know it.
     fn sim(&mut self) -> Sim<'_> {
         let now = self.clock.now();
-        Sim {
-            rng: &mut self.rng,
-            bank: &mut self.bank,
-            feed: &mut self.feed,
-            cfg: &self.cfg,
-            now,
-            next_patron: &mut self.next_patron,
+        Sim { rng: &mut self.rng, bank: &mut self.bank, feed: &mut self.feed, cfg: &self.cfg, roster: &mut self.roster, now }
+    }
+
+    /// The whole lifecycle in one pass: people whose time away is up come
+    /// back, people who are done at a table get up and go home, and empty
+    /// seats are offered to whoever is in the building looking for a game.
+    ///
+    /// This lives at floor level rather than inside a table on purpose. A
+    /// table knows about seats; only the floor knows about *people*, and
+    /// choosing where to play is a decision made across tables. It is also
+    /// what keeps a patron from being destroyed by the table they happen to
+    /// be sitting at.
+    fn lifecycle(&mut self, now: Duration) {
+        // 1. Anyone whose spell away has elapsed walks back in.
+        for id in self.roster.due_back(now) {
+            self.roster.welcome_back(id);
+        }
+
+        // 2. Anyone done at a table gets up, cashes out, and goes home.
+        for i in 0..self.instances.len() {
+            if self.instances[i].paused {
+                continue;
+            }
+            let seated: Vec<u64> = self.instances[i].patrons.clone();
+            for pid in seated {
+                let Floor { roster, rng, cfg, bank, feed, instances, .. } = self;
+                let Some(p) = roster.get_mut(pid) else {
+                    instances[i].stand(pid);
+                    continue;
+                };
+                let Some(why) = p.leaving(rng, cfg.min_bet) else { continue };
+                let (who, net) = (p.name.clone(), p.net());
+                let back_at = super::roster::time_away(rng, cfg, now);
+                let chips = p.end_visit(back_at);
+                bank.cash_out(chips);
+                instances[i].stand(pid);
+                // A seat freed is also a moment to re-decide how busy this
+                // table should be, so a floor breathes over the night
+                // instead of every table sitting at a fixed size forever.
+                instances[i].reconsider_size(rng);
+                feed.push(now, Weight::Notable, Event::Left { patron: pid, who, table: instances[i].id, net, reason: why });
+            }
+        }
+
+        // 3. Empty seats are offered to whoever is here. A person picks the
+        //    table among those with room that most suits them — the "choose
+        //    a game" step — rather than being posted to the first vacancy.
+        loop {
+            let hungry: Vec<usize> =
+                (0..self.instances.len()).filter(|i| !self.instances[*i].paused && self.instances[*i].patrons.len() < self.instances[*i].wanted()).collect();
+            if hungry.is_empty() {
+                break;
+            }
+            let Floor { roster, rng, cfg, bank, feed, instances, .. } = self;
+            let Some(pid) = roster.someone(rng, cfg, now) else { break };
+            let Some(p) = roster.get_mut(pid) else { break };
+
+            // Where would they like to sit? Taste scores every table with
+            // room; the highest wins, with a wobble so identical people do
+            // not all pile onto the same table.
+            let mut best = hungry[0];
+            let mut best_score = i64::MIN;
+            for i in hungry.iter().copied() {
+                let kind = instances[i].kind;
+                let score = p.taste(kind.variants(), kind.pace().as_millis() as u64) + rng.below(25) as i64;
+                if score > best_score {
+                    best_score = score;
+                    best = i;
+                }
+            }
+
+            let dollars = p.buy_in(rng, cfg);
+            let chips = bank.buy_in(dollars);
+            p.begin_visit(chips);
+            let who = p.name.clone();
+            let table_id = instances[best].id;
+            let table_name = instances[best].name.clone();
+            roster.seat(pid, table_id);
+            instances[best].sit(pid);
+            feed.push(
+                now,
+                Weight::Notable,
+                Event::Arrived { patron: pid, who, table: table_id, table_name, chips },
+            );
         }
     }
 
@@ -72,6 +152,7 @@ impl Floor {
     fn tick(&mut self, wall: Instant) {
         self.clock.advance(wall);
         let now = self.clock.now();
+        self.lifecycle(now);
         let ceiling = self.cfg.max_catch_up.max(1);
         for i in 0..self.instances.len() {
             if self.instances[i].paused {
@@ -87,8 +168,8 @@ impl Floor {
                     bank: &mut self.bank,
                     feed: &mut self.feed,
                     cfg: &self.cfg,
+                    roster: &mut self.roster,
                     now,
-                    next_patron: &mut self.next_patron,
                 };
                 self.instances[i].play_round(&mut sim);
                 played += 1;
@@ -122,6 +203,9 @@ pub struct TableView {
     /// Simulated time this table has been open.
     pub open_for: Duration,
     pub seen: u32,
+    /// The tunables in force, so the drawing code can name a tier or a
+    /// threshold without writing the number down itself.
+    pub cfg: Config,
 }
 
 /// The whole floor at a glance.
@@ -147,6 +231,13 @@ pub struct FloorView {
     pub sim_time: Duration,
     /// The most recent readable events, oldest first.
     pub feed: Vec<Record>,
+    /// How many people are in the building, and how many the casino knows
+    /// of at all — the second number is the one that proves they persist.
+    pub crowd: usize,
+    pub known: usize,
+    /// The population by tier, lowest first.
+    pub by_tier: Vec<usize>,
+    pub cfg: Config,
     /// Whether the simulation thread is still turning.
     pub running: bool,
 }
@@ -174,10 +265,10 @@ impl Manager {
             next_id: 1,
             opened: BTreeMap::new(),
             rng: Rng::from_seed(seed),
+            roster: Roster::new(),
             cfg: Config::default(),
             clock: Clock::new(config::SPEED_UNIT),
             feed: Feed::new(Config::default().feed_capacity),
-            next_patron: 1,
             started: Instant::now(),
         }));
         if let Ok(mut f) = floor.lock() {
@@ -249,18 +340,19 @@ impl Manager {
         if let Some(i) = f.instances.iter().position(|t| t.id == id) {
             let inst = f.instances.remove(i);
             let now = f.clock.now();
-            for p in inst.patrons {
-                f.bank.cash_out(p.chips);
-                f.feed.push(
+            for pid in inst.patrons.iter() {
+                // The table closing under somebody is not the end of them:
+                // they cash out and go home, and the roster keeps them.
+                let Floor { roster, bank, feed, rng, cfg, .. } = &mut *f;
+                let back_at = roster::time_away(rng, cfg, now);
+                let Some(p) = roster.get_mut(*pid) else { continue };
+                let (who, net) = (p.name.clone(), p.net());
+                let chips = p.end_visit(back_at);
+                bank.cash_out(chips);
+                feed.push(
                     now,
                     Weight::Routine,
-                    Event::Left {
-                        patron: p.id,
-                        who: p.name.clone(),
-                        table: inst.id,
-                        net: p.net(),
-                        reason: Departure::TableClosed,
-                    },
+                    Event::Left { patron: *pid, who, table: inst.id, net, reason: Departure::TableClosed },
                 );
             }
             f.feed.push(
@@ -371,6 +463,10 @@ impl Manager {
                 running_for: Duration::ZERO,
                 sim_time: Duration::ZERO,
                 feed: Vec::new(),
+                crowd: 0,
+                known: 0,
+                by_tier: Vec::new(),
+                cfg: Config::default(),
                 running: false,
             };
         };
@@ -383,12 +479,16 @@ impl Manager {
             totals: f.bank.totals(),
             rounds: f.bank.rounds(),
             bets: f.bank.bets(),
-            tables: f.instances.iter().map(|t| view_of(t, now, false)).collect(),
+            tables: f.instances.iter().map(|t| view_of(t, &f.roster, &f.cfg, now, false)).collect(),
             by_table: f.bank.by_table(),
             speed: f.cfg.speed,
             running_for: Instant::now().duration_since(f.started),
             sim_time: now,
             feed: f.feed.recent(FEED_LINES, Weight::Notable),
+            crowd: f.roster.present(),
+            known: f.roster.len(),
+            by_tier: f.roster.by_tier(&f.cfg),
+            cfg: f.cfg.clone(),
             running: self.is_running(),
         }
     }
@@ -399,7 +499,7 @@ impl Manager {
     pub fn table(&self, id: u32) -> Option<TableView> {
         let f = self.floor.lock().ok()?;
         let now = f.clock.now();
-        f.instances.iter().find(|t| t.id == id).map(|t| view_of(t, now, true))
+        f.instances.iter().find(|t| t.id == id).map(|t| view_of(t, &f.roster, &f.cfg, now, true))
     }
 
     /// The ids currently on the floor, in the order they were opened —
@@ -409,7 +509,11 @@ impl Manager {
     }
 }
 
-fn view_of(t: &Instance, now: Duration, deep: bool) -> TableView {
+fn view_of(t: &Instance, roster: &Roster, cfg: &Config, now: Duration, deep: bool) -> TableView {
+    // Seats are ids; the view carries the people, copied out of the roster
+    // under the same lock, so the drawing code never learns that they live
+    // anywhere but at the table.
+    let people: Vec<Patron> = if deep { t.patrons.iter().filter_map(|id| roster.get(*id).cloned()).collect() } else { Vec::new() };
     TableView {
         id: t.id,
         name: t.name.clone(),
@@ -421,9 +525,10 @@ fn view_of(t: &Instance, now: Duration, deep: bool) -> TableView {
         staked: t.staked,
         last: t.last_round().cloned(),
         history: if deep { t.history.clone() } else { Vec::new() },
-        patrons: if deep { t.patrons.clone() } else { Vec::new() },
+        patrons: if deep { people } else { Vec::new() },
         open_for: now.saturating_sub(t.opened),
         seen: t.seen,
+        cfg: cfg.clone(),
     }
 }
 
@@ -532,9 +637,13 @@ mod tests {
         let m = Manager::start(6, 100_000, 1_000_000, Badge::new());
         let opening = m.balances();
         m.open(Kind::Slots, 4);
-        // Seating patrons already moves the books — chips leave the tray and
-        // cash enters the cage — before a single bet is struck.
-        assert_ne!(m.balances(), opening, "buying four tables in never touched the cage");
+        // Opening a table no longer seats anybody: people are the floor's
+        // business, so the cage moves on the next lifecycle pass, when
+        // somebody actually walks up and buys chips.
+        assert!(
+            wait_for(|| m.balances() != opening, Duration::from_secs(8)),
+            "nobody ever bought in at the cage"
+        );
         let after_seating = m.balances();
         assert!(wait_for(|| m.snapshot().bets > 0, Duration::from_secs(8)), "no bets were booked");
         assert!(
@@ -597,6 +706,78 @@ mod tests {
         m.open(Kind::Roulette, 1);
         let names: Vec<String> = m.snapshot().tables.iter().map(|t| t.name.clone()).collect();
         assert!(names.contains(&"Roulette #3".to_string()), "a table number was reused: {names:?}");
+    }
+
+    #[test]
+    fn people_outlive_the_tables_they_sit_at() {
+        // Rule 4, end to end. Somebody who gets up is still known to the
+        // building, with their record intact, and comes back to it.
+        let m = Manager::start(20, 500_000, 20_000_000, Badge::new());
+        // A small world, so the floor is forced to make the choice this
+        // test is about: recall somebody rather than invent a stranger.
+        let mut cfg = m.config();
+        cfg.roster_size = 6;
+        cfg.speed = 10_000;
+        cfg.away_for = (Duration::from_secs(5), Duration::from_secs(30));
+        m.configure(cfg);
+        m.open(Kind::Slots, 3);
+        assert!(wait_for(|| m.snapshot().known > 0, Duration::from_secs(5)), "nobody ever walked in");
+        // Let the night run long enough for people to come and go.
+        assert!(wait_for(|| m.snapshot().rounds > 300, Duration::from_secs(15)), "the floor never got going");
+        let view = m.snapshot();
+        assert!(view.crowd > 0, "the building emptied");
+        assert!(view.known >= view.crowd, "more people in the room than the casino knows of");
+        // Somebody at a table has been in before: they were recalled rather
+        // than invented.
+        let regulars: usize = view
+            .tables
+            .iter()
+            .filter_map(|t| m.table(t.id))
+            .flat_map(|t| t.patrons)
+            .filter(|p| p.lifetime.visits > 1)
+            .count();
+        assert!(regulars > 0, "nobody at any table has ever been in before");
+    }
+
+    #[test]
+    fn the_population_stays_bounded_however_long_the_night_runs() {
+        let m = Manager::start(21, 500_000, 20_000_000, Badge::new());
+        let mut cfg = m.config();
+        cfg.roster_size = 20;
+        cfg.speed = 10_000;
+        m.configure(cfg);
+        m.open(Kind::Slots, 4);
+        assert!(wait_for(|| m.snapshot().rounds > 400, Duration::from_secs(15)), "the floor never got going");
+        let view = m.snapshot();
+        assert!(view.known <= 20, "the world grew to {} people against a cap of 20", view.known);
+        assert!(view.crowd <= view.known);
+    }
+
+    #[test]
+    fn a_patron_belongs_to_the_floor_and_not_to_one_table() {
+        // Closing a table under somebody must send them home, not delete
+        // them — the difference between a person and a row in a Vec.
+        let m = Manager::start(22, 500_000, 20_000_000, Badge::new());
+        m.set_speed(6_000);
+        m.open(Kind::Baccarat, 2);
+        assert!(wait_for(|| m.snapshot().known >= 2, Duration::from_secs(5)), "nobody arrived");
+        let known_before = m.snapshot().known;
+        let id = m.ids()[0];
+        m.close(id);
+        std::thread::sleep(Duration::from_millis(200));
+        let after = m.snapshot();
+        assert_eq!(after.tables.len(), 1, "the other table went with it");
+        assert!(after.known >= known_before, "closing a table deleted {} people", known_before - after.known);
+    }
+
+    #[test]
+    fn the_tier_census_always_covers_everybody_exactly_once() {
+        let m = Manager::start(23, 1_000_000, 50_000_000, Badge::new());
+        m.set_speed(10_000);
+        m.open(Kind::Blackjack, 4);
+        assert!(wait_for(|| m.snapshot().known > 6, Duration::from_secs(15)), "not enough people came in");
+        let view = m.snapshot();
+        assert_eq!(view.by_tier.iter().sum::<usize>(), view.known, "somebody is in two tiers or none");
     }
 
     #[test]

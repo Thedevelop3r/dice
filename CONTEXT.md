@@ -32,15 +32,15 @@ The two constraints that define the whole codebase:
 
 | | |
 |---|---|
-| Source | 15,891 lines across 52 files |
-| Tests | 248, all passing |
+| Source | 16,975 lines across 53 files |
+| Tests | 268, all passing |
 | Starting balances | 10,000 chips / $9,000 — the user's own tuning in `economy.rs` |
 | Clippy | clean, zero warnings |
 | Dependencies | none |
 | Tables | 24 (8 dice, 6 card, 2 wheel, 8 arcade) |
 | Idle screens | 17 tables + a floor-wide cycler |
 | Background casino | a real simulation thread; 51 tables at 0.2% CPU |
-| Autonomous roadmap | Phases 0, 1, 7 (config), 20 (clock) done — see `ROADMAP.md` |
+| Autonomous roadmap | Phases 0, 1, 2, 3, 4, 7 (config), 20 (clock) done — see `ROADMAP.md` |
 
 ---
 
@@ -177,15 +177,16 @@ src/
     widgets.rs     143  number_picker, text_input, footer, banner, bar
   casino/                  ← the background simulation (session 6-7)
     mod.rs          40  what the nine pieces are and why they are separate
-    config.rs      237  every tunable: limits, tiers, thresholds, speed, costs
+    config.rs      256  every tunable: limits, tiers, thresholds, speed, costs
     clock.rs       248  simulated time, permille speed, the `Every` period
     event.rs       393  the event bus: Event, Weight, Record, Feed
-    sim.rs          68  the borrow bundle a table gets for one call
+    sim.rs          45  the borrow bundle a table gets for one call
     bank.rs        205  the economy manager: money, chips, the cage spread
-    patron.rs      327  simulated players and the traits that drive them
-    instance.rs    622  one running table + the Kind → real-game mapping
-    manager.rs     700  the simulation thread, snapshots, start/stop/pause
-    ui.rs          455  opening screen, floor overview + feed, live table view
+    patron.rs      751  archetypes, traits, presence, lifetime record
+    roster.rs      382  everyone the casino knows, seated or not
+    instance.rs    676  one running table + the Kind → real-game mapping
+    manager.rs     881  the simulation thread, the lifecycle pass, snapshots
+    ui.rs          498  opening screen, floor overview + feed, live table view
   games/
     mod.rs         109  Ctx, Difficulty, Player, pick_difficulty
     cards.rs       443  shared deck/shoe/hand rankings  ← every card table
@@ -363,6 +364,48 @@ Consequences worth knowing before touching this code:
 - The floor screen has an `ON THE FLOOR` strip fed from
   `FloorView::feed`, and shows casino time alongside wall time whenever the
   speed is not 1x.
+
+### The persistent roster (session 7, Phases 2-4)
+
+The single largest structural change since the casino itself: **people moved
+off the tables and onto the floor.**
+
+- `Instance::patrons` is now `Vec<u64>` — seat ids, not people. A table
+  holds seats; the people live in `casino/roster.rs`, owned by `Floor`.
+- `Patron` gained an `Archetype` (Conservative, Gambler, Strategist,
+  Chaser, Whale, Beginner, Lucky), a `Presence` (`Away { back_at }` /
+  `Looking` / `Seated { table }`) and a `Lifetime` record that accumulates
+  across visits. `begin_visit` / `end_visit` are the boundary: the per-visit
+  figures reset, the lifetime ones never do.
+- `Instance::seat_one` and `turn_over_seats` are **gone**. Seating is
+  `Floor::lifecycle(now)`, run once per tick before the rounds: people whose
+  time away is up walk back in, people done at a table get up and cash out,
+  and empty seats are offered to whoever is in the building. A patron picks
+  the table that best suits them via `Patron::taste(variants, pace_ms)`.
+- The population is **bounded** by `cfg.roster_size` (120). Past the cap a
+  seat is filled by somebody coming back, not by a stranger being invented —
+  which is what Rule 4 is actually asking for, and also what stops an
+  all-night run leaking a person per seat.
+
+Things that will bite if you forget them:
+
+- **An archetype never touches an outcome.** `Lucky` is a *staking*
+  behaviour (a wider jitter) and a table preference, nothing else. There is
+  a test — `a_lucky_player_is_a_behaviour_and_never_a_thumb_on_the_scale` —
+  whose whole job is to fail if anyone changes that.
+- `play_round` destructures `Sim` (`let Sim { rng, bank, feed, cfg, roster,
+  now } = sim;`) so a patron can be borrowed out of the roster while the rng
+  and bank are in use. A seat whose id is not in the roster is *skipped*,
+  never treated as a reason to stop the table.
+- The conservation invariant now sums the tray plus `roster.chips_in_play()`
+  rather than one table's stacks. Departed patrons hold no chips — they hand
+  them back in `end_visit`.
+- `Manager::open` no longer seats anybody, so the cage does not move until
+  the next lifecycle pass. A test that asserts otherwise is asserting the
+  old architecture.
+- `TableView` and `FloorView` now carry a `Config` clone, so the drawing
+  code names a tier through `cfg.tier_name(...)` instead of writing any
+  threshold down. `FloorView` also carries `crowd`, `known` and `by_tier`.
 
 ---
 

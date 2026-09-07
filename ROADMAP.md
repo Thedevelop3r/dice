@@ -198,8 +198,8 @@ nothing recomputed per frame that can be accumulated per event.
 | Config | Rule 7 | **done** — `casino/config.rs` |
 | Clock | 20 | **done** — `casino/clock.rs` |
 | Event bus | 1 | **done** — `casino/event.rs`, `casino/sim.rs` |
-| Roster | 2, 3, 4 | pending |
-| Limits and tiers | 5 | pending |
+| Roster | 2, 3, 4 | **done** — `casino/roster.rs`, `Floor::lifecycle` |
+| Limits and tiers | 5 | **partly done** — limits and tiers bind in `play_round`; no VIP-only tables or screen yet |
 | Transactions and expenses | 6, 7 | pending |
 | Demand | 8 | pending |
 | Feed, notifications, spectator, follow | 9, 10, 11, 12 | pending |

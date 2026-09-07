@@ -179,6 +179,20 @@ fn draw_floor(screen: &mut Screen, view: &FloorView, cursor: usize) {
         theme.dim(&duration(view.running_for)),
         theme.paint(ui::theme::GOLD, &config::speed_label(view.speed))
     ));
+    screen.line(&theme.dim(&format!(
+        "  {} in the building · {} people known · {}",
+        view.crowd,
+        view.known,
+        view
+            .by_tier
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, n)| **n > 0)
+            .map(|(i, n)| format!("{n} {}", view.cfg.tier_name(i)))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    )));
     if view.speed != config::SPEED_UNIT {
         // At anything but real time the two clocks diverge, and the one the
         // simulation actually runs on is the one worth showing.
@@ -240,6 +254,22 @@ fn draw_floor(screen: &mut Screen, view: &FloorView, cursor: usize) {
         &theme,
         &[('j', "next"), ('k', "prev"), ('w', "watch"), ('o', "open"), ('p', "pause"), ('x', "close"), ('s', "speed"), ('q', "back")],
     ));
+}
+
+/// How a seat's run reads: this visit, and — for somebody who has been in
+/// before — what they are up or down across every visit they have made.
+/// The second figure is the one that could not exist before people were
+/// persistent, so it is worth the column.
+fn run_column(p: &crate::casino::patron::Patron, bet: &str) -> String {
+    let this = format!("{}%", p.luck());
+    let head = if bet.is_empty() { this } else { format!("{bet} · {this}") };
+    if p.lifetime.visits > 1 {
+        let career = p.lifetime.net();
+        let sign = if career >= 0 { "+" } else { "-" };
+        format!("{head} · career {sign}{} ({}%)", thousands(career.abs()), p.lifetime_luck())
+    } else {
+        head
+    }
 }
 
 /// The strip of recent goings-on at the foot of the floor screen.
@@ -367,21 +397,34 @@ fn draw_table(screen: &mut Screen, t: &TableView, position: usize, total: usize)
     ));
     screen.blank();
 
-    screen.line(&theme.dim(&format!("  {:<22} {:<12} {:>8} {:>8} {:>9} {:>9}  {}", "AT THE TABLE", "STYLE", "STAKE", "BACK", "STACK", "NET", "RUN")));
+    screen.line(&theme.dim(&format!(
+        "  {:<22} {:<14} {:<12} {:>6} {:>8} {:>9} {:>9}  {}",
+        "AT THE TABLE", "STYLE", "STANDING", "VISITS", "STAKE", "STACK", "NET", "RUN"
+    )));
     let last = t.last.as_ref();
     for p in &t.patrons {
         let seat = last.and_then(|r| r.seats.iter().find(|s| s.name == p.name));
         let (staked, back) = seat.map(|s| (s.staked, s.returned)).unwrap_or((0, 0));
         let bet = seat.map(|s| s.bet.clone()).unwrap_or_default();
+        // A regular is worth pointing out — this is the visible proof
+        // that the people are not conjured up per seat.
+        let tier = p.tier(&t.cfg);
+        let standing = if tier >= t.cfg.top_tier() {
+            theme.paint(ui::theme::GOLD, &pad_end(t.cfg.tier_name(tier), 12))
+        } else {
+            pad_end(&theme.dim(t.cfg.tier_name(tier)), 12)
+        };
+        let _ = back;
         screen.line(&format!(
-            "  {:<22} {} {:>8} {:>8} {:>9} {}  {}",
+            "  {:<22} {} {} {:>6} {:>8} {:>9} {}  {}",
             p.name,
-            pad_end(&theme.dim(p.style()), 12),
+            pad_end(&theme.dim(p.style()), 14),
+            standing,
+            p.lifetime.visits,
             if staked > 0 { thousands(staked) } else { "—".into() },
-            if staked > 0 { thousands(back) } else { "—".into() },
             thousands(p.chips),
             pad_start(&signed(&theme, p.net()), 9),
-            theme.dim(&if bet.is_empty() { format!("{}%", p.luck()) } else { format!("{bet} · {}%", p.luck()) })
+            theme.dim(&run_column(p, &bet))
         ));
     }
 

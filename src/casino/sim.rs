@@ -22,47 +22,24 @@ use crate::rng::Rng;
 use super::bank::Bank;
 use super::config::Config;
 use super::event::{Event, Feed, Weight};
+use super::roster::Roster;
 
 pub struct Sim<'a> {
     pub rng: &'a mut Rng,
     pub bank: &'a mut Bank,
     pub feed: &'a mut Feed,
     pub cfg: &'a Config,
+    /// Everyone the casino knows. Tables hold ids; the people themselves
+    /// live here, so somebody can exist while not seated.
+    pub roster: &'a mut Roster,
     /// Simulated time since the doors opened, sampled once per tick. Every
     /// deadline in the simulation is expressed against this.
     pub now: Duration,
-    /// The next unused patron id. Identity is minted here rather than
-    /// inside a table so that an id is unique across the whole floor and
-    /// stays meaningful when a patron moves between tables.
-    pub next_patron: &'a mut u64,
 }
 
 impl Sim<'_> {
-    /// Mints a fresh patron identity.
-    pub fn patron_id(&mut self) -> u64 {
-        let id = *self.next_patron;
-        *self.next_patron += 1;
-        id
-    }
-
     /// Publishes an event, stamped with the current simulated time.
     pub fn emit(&mut self, weight: Weight, event: Event) {
         self.feed.push(self.now, weight, event);
-    }
-
-    /// Publishes a settled bet at whatever weight its size earns, using the
-    /// thresholds from configuration rather than any number written here.
-    pub fn emit_settlement(&mut self, event: Event) {
-        let weight = match &event {
-            Event::Settled { staked, returned, .. } => super::event::settlement_weight(
-                *staked,
-                *returned,
-                self.cfg.big_win,
-                self.cfg.huge_win,
-                self.cfg.jackpot_multiple,
-            ),
-            _ => Weight::Routine,
-        };
-        self.emit(weight, event);
     }
 }

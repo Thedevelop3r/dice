@@ -16,8 +16,11 @@
 //!   length of one call.
 //! - [`bank`] — the economy manager. One set of books, money and chips,
 //!   which every table reports into and nothing else keeps a copy of.
-//! - [`patron`] — a simulated player, with traits that change how they bet
-//!   rather than what the dice do.
+//! - [`patron`] — a simulated player, with an archetype and traits that
+//!   change how they bet rather than what the dice do.
+//! - [`roster`] — everyone the casino knows, here tonight or not. Tables
+//!   hold seat ids; the people themselves live here and outlive any table
+//!   they sit at.
 //! - [`instance`] — one running table: its seats, its clock, its history.
 //! - [`manager`] — the simulation thread. Owns every instance, advances
 //!   them, and hands out read-only snapshots.
@@ -34,6 +37,7 @@ pub mod event;
 pub mod instance;
 pub mod manager;
 pub mod patron;
+pub mod roster;
 pub mod sim;
 pub mod ui;
 

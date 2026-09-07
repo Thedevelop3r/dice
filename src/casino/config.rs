@@ -59,6 +59,15 @@ pub struct Config {
     /// Turnover thresholds for each tier, lowest first.
     pub tiers: [(&'static str, i64); 4],
 
+    // ---- the population (Phases 2-4) ---------------------------------
+    /// How many named people the world holds. Once it is full, a seat is
+    /// filled by somebody coming back rather than by a stranger being
+    /// invented — which is what makes the floor a place with regulars, and
+    /// what stops an all-night session leaking a person per seat.
+    pub roster_size: usize,
+    /// How long somebody stays away between visits, in simulated time.
+    pub away_for: (Duration, Duration),
+
     // ---- what a patron walks in with ---------------------------------
     /// A buy-in is drawn uniformly from this range, in dollars.
     pub buy_in: (i64, i64),
@@ -97,6 +106,13 @@ impl Default for Config {
             max_bet: 2_500,
             vip_max_bet: 50_000,
             tiers: DEFAULT_TIERS,
+
+            // Small enough that a night produces regulars — somebody you
+            // watched bust out turning up again two tables over is the
+            // whole point of the roster, and a cap of several hundred
+            // hides it behind an endless supply of strangers.
+            roster_size: 120,
+            away_for: (Duration::from_secs(60), Duration::from_secs(600)),
 
             buy_in: (20, 200),
             vip_buy_in_multiple: 12,
@@ -231,6 +247,9 @@ mod tests {
         assert!(cfg.min_bet > 0 && cfg.min_bet < cfg.max_bet);
         assert!(cfg.big_win < cfg.huge_win, "a huge win must clear the bar a big one sets");
         assert!(cfg.buy_in.0 > 0 && cfg.buy_in.0 < cfg.buy_in.1);
+        assert!(cfg.roster_size > 0, "a casino with nobody in it is not a casino");
+        assert!(cfg.away_for.0 < cfg.away_for.1, "the range somebody stays away must be a range");
+        assert!(cfg.away_for.0 > Duration::ZERO, "nobody turns straight round at the door");
         assert!(cfg.feed_capacity > 0);
         assert!(cfg.expense_period > Duration::ZERO, "costs must be periodic, never per frame");
     }
