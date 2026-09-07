@@ -32,14 +32,15 @@ The two constraints that define the whole codebase:
 
 | | |
 |---|---|
-| Source | 14,528 lines across 48 files |
-| Tests | 217, all passing |
+| Source | 15,891 lines across 52 files |
+| Tests | 248, all passing |
 | Starting balances | 10,000 chips / $9,000 — the user's own tuning in `economy.rs` |
 | Clippy | clean, zero warnings |
 | Dependencies | none |
 | Tables | 24 (8 dice, 6 card, 2 wheel, 8 arcade) |
 | Idle screens | 17 tables + a floor-wide cycler |
 | Background casino | a real simulation thread; 51 tables at 0.2% CPU |
+| Autonomous roadmap | Phases 0, 1, 7 (config), 20 (clock) done — see `ROADMAP.md` |
 
 ---
 
@@ -174,13 +175,17 @@ src/
     card_art.rs    281  cards at three sizes, block-art suits
     menu.rs         80  the boxed keyed menu
     widgets.rs     143  number_picker, text_input, footer, banner, bar
-  casino/                  ← the background simulation (session 6)
-    mod.rs          27  what the five pieces are and why they are separate
+  casino/                  ← the background simulation (session 6-7)
+    mod.rs          40  what the nine pieces are and why they are separate
+    config.rs      237  every tunable: limits, tiers, thresholds, speed, costs
+    clock.rs       248  simulated time, permille speed, the `Every` period
+    event.rs       393  the event bus: Event, Weight, Record, Feed
+    sim.rs          68  the borrow bundle a table gets for one call
     bank.rs        205  the economy manager: money, chips, the cage spread
-    patron.rs      313  simulated players and the traits that drive them
-    instance.rs    499  one running table + the Kind → real-game mapping
-    manager.rs     475  the simulation thread, snapshots, start/stop/pause
-    ui.rs          413  opening screen, floor overview, live table view
+    patron.rs      327  simulated players and the traits that drive them
+    instance.rs    622  one running table + the Kind → real-game mapping
+    manager.rs     700  the simulation thread, snapshots, start/stop/pause
+    ui.rs          455  opening screen, floor overview + feed, live table view
   games/
     mod.rs         109  Ctx, Difficulty, Player, pick_difficulty
     cards.rs       443  shared deck/shoe/hand rankings  ← every card table
@@ -309,6 +314,58 @@ Then register the idle function in `floor::ATTRACT` and it joins the cycler.
 
 ---
 
+### The autonomous-simulation layer (session 7)
+
+`ROADMAP.md` is the companion document for the 24-phase roadmap: the Phase 0
+audit of what already existed, the dependency order the phases are actually
+being built in, and a progress table. **Read it before picking up the next
+phase** — it is written so a fresh session does not have to re-derive where
+anything lives.
+
+Four things landed, in the order the dependency graph demanded:
+
+1. **`casino/config.rs`** — every tunable in one struct held by `Floor`:
+   bet limits, tier thresholds, buy-in range, event thresholds, feed size,
+   clock speed, operating costs. Nothing is hard-coded where it is used.
+   Read through `sim.cfg` in the simulation and `manager.config()` in the
+   UI. `Manager::configure` replaces it wholesale.
+2. **`casino/clock.rs`** — simulated time. `Instance::next_at` and
+   `Instance::opened` are now `Duration`s since the doors opened, not
+   `Instant`s, which is what makes 0.25x possible: a slow clock genuinely
+   means fewer rounds rather than the same rounds drawn more often. Speed is
+   permille (`1_000` = 1x) so no float touches anything. `Every` is the
+   periodic deadline Phase 7's expenses will hang off.
+   *Gotcha:* `Clock::started_at` and `set_speed` take the wall `Instant` as
+   an argument rather than sampling it. That is deliberate — a clock that
+   reads the machine's time on its own account cannot be tested.
+3. **`casino/event.rs`** — the bus. Publishers push, readers pull under the
+   lock they already take for a snapshot; there is no callback registry, so
+   no reader's code can ever run on the simulation thread. `Weight` is what
+   makes "don't display every low-level event" enforceable: `Routine`
+   traffic is *counted but never kept*, so a busy floor cannot evict the
+   readable feed with its own noise.
+4. **`casino/sim.rs`** — `Sim<'a>`, the bundle of floor-owned services a
+   table borrows for one call (`rng`, `bank`, `feed`, `cfg`, `now`,
+   `next_patron`). Every later phase adds a field here instead of changing
+   twenty signatures.
+
+Consequences worth knowing before touching this code:
+
+- `Instance::new` / `play_round` / `seat_one` / `turn_over_seats` all take
+  `&mut Sim` now. The instance tests use a `Bench` helper that stands up the
+  same five services.
+- `Patron` has an `id: u64`, minted by the *floor* (`Sim::patron_id`), not
+  by a table. `Patron::leaving` returns `Option<Departure>` rather than
+  `bool`, because the feed and the statistics both want the cause.
+- `instance::MIN_BET` is gone; it is `cfg.min_bet`. Bets are clamped to
+  `cfg.bet_ceiling(cfg.tier_of(p.staked))`, so the tier ladder already binds
+  even before Phase 5 gives it a screen.
+- The floor screen has an `ON THE FLOOR` strip fed from
+  `FloorView::feed`, and shows casino time alongside wall time whenever the
+  speed is not 1x.
+
+---
+
 ## Delivering changes
 
 The cloud workspace this is developed in is a *mirror*, not the repo. Two
@@ -415,6 +472,13 @@ Notes that will save time:
 ---
 
 ## Next steps
+
+**The roadmap comes first.** `ROADMAP.md` carries the ordered plan and the
+progress table; the next step there is the persistent NPC roster (Phases
+2–4), which means moving patron ownership off `Instance` and onto `Floor`
+so a patron can exist while not seated. The items below are the older
+backlog and sit behind it.
+
 
 Roughly in the order I would take them.
 

@@ -18,6 +18,7 @@
 //! have. Letting a "lucky" patron win more often would quietly undo the
 //! whole point of `games::audit`.
 
+use super::event::Departure;
 use crate::rng::Rng;
 
 const FIRST: [&str; 32] = [
@@ -31,6 +32,10 @@ const LAST: [&str; 24] = [
 
 #[derive(Debug, Clone)]
 pub struct Patron {
+    /// Unique on the floor, for the whole life of the casino. Minted by
+    /// the floor rather than by a table, so a patron keeps one identity
+    /// wherever they sit and whatever they are doing.
+    pub id: u64,
     pub name: String,
     /// Chips in front of them right now.
     pub chips: i64,
@@ -51,12 +56,13 @@ pub struct Patron {
 }
 
 impl Patron {
-    pub fn new(rng: &mut Rng, chips: i64) -> Patron {
+    pub fn new(rng: &mut Rng, chips: i64, id: u64) -> Patron {
         // Traits are rolled as the average of two draws, which clusters them
         // toward the middle: most patrons are unremarkable and the extremes
         // are rare, which is what makes the rare ones worth watching.
         let trait_roll = |rng: &mut Rng| ((rng.below(101) + rng.below(101)) / 2) as u8;
         Patron {
+            id,
             name: format!("{} {}", FIRST[rng.below(FIRST.len())], LAST[rng.below(LAST.len())]),
             chips,
             bought: chips,
@@ -145,23 +151,31 @@ impl Patron {
         (self.returned - self.staked) * 100 / self.staked
     }
 
-    /// Is this patron done? They leave when they are cleaned out, when a
-    /// disciplined player is well ahead, or when an undisciplined one has
-    /// finally had enough of losing.
-    pub fn leaving(&self, rng: &mut Rng, min_bet: i64) -> bool {
+    /// Is this patron done, and if so why? They leave when they are
+    /// cleaned out, when a disciplined player is well ahead, or when an
+    /// undisciplined one has finally had enough of losing.
+    ///
+    /// The reason comes back with the answer because the event feed and
+    /// the statistics both want to count departures by cause, and working
+    /// it out again afterwards from the numbers would get it wrong — a
+    /// patron can be both ahead and out of chips for the minimum.
+    pub fn leaving(&self, rng: &mut Rng, min_bet: i64) -> Option<Departure> {
         if self.chips < min_bet {
-            return true;
+            return Some(Departure::Busted);
         }
         let ahead = self.net() > self.bought / 2;
         let deep_down = self.net() < -(self.bought * 3 / 4);
         if ahead && rng.below(100) < self.discipline as usize {
-            return true;
+            return Some(Departure::Ahead);
         }
         if deep_down && rng.below(100) < (40 + self.discipline as usize / 4) {
-            return true;
+            return Some(Departure::Down);
         }
         // Everyone drifts off eventually.
-        self.rounds > 40 && rng.below(100) < 4
+        if self.rounds > 40 && rng.below(100) < 4 {
+            return Some(Departure::Drifted);
+        }
+        None
     }
 }
 
@@ -176,7 +190,7 @@ mod tests {
     #[test]
     fn patrons_come_through_the_door_different_from_each_other() {
         let mut rng = probe();
-        let crowd: Vec<Patron> = (0..200).map(|_| Patron::new(&mut rng, 1_000)).collect();
+        let crowd: Vec<Patron> = (0..200).map(|i| Patron::new(&mut rng, 1_000, i)).collect();
         // Not one uniform blob: traits must actually vary.
         let spread = |f: fn(&Patron) -> u8| {
             let vals: Vec<u8> = crowd.iter().map(f).collect();
@@ -194,7 +208,7 @@ mod tests {
     #[test]
     fn nerve_decides_how_much_goes_on_a_bet() {
         let mut rng = probe();
-        let mut timid = Patron::new(&mut rng, 1_000);
+        let mut timid = Patron::new(&mut rng, 1_000, 1);
         let mut bold = timid.clone();
         timid.nerve = 0;
         bold.nerve = 100;
@@ -210,7 +224,7 @@ mod tests {
         let mut rng = probe();
         for _ in 0..500 {
             let stack = 1 + rng.below(500) as i64;
-            let mut p = Patron::new(&mut rng, stack);
+            let mut p = Patron::new(&mut rng, stack, 1);
             p.nerve = 100;
             p.discipline = 0;
             p.chips = p.chips.min(30);
@@ -222,16 +236,16 @@ mod tests {
     #[test]
     fn a_patron_who_cannot_cover_the_minimum_stakes_nothing() {
         let mut rng = probe();
-        let mut p = Patron::new(&mut rng, 100);
+        let mut p = Patron::new(&mut rng, 100, 1);
         p.chips = 4;
         assert_eq!(p.stake(&mut rng, 5), 0);
-        assert!(p.leaving(&mut rng, 5), "and they should be on their way out");
+        assert_eq!(p.leaving(&mut rng, 5), Some(Departure::Busted), "and they should be on their way out");
     }
 
     #[test]
     fn appetite_reaches_further_up_the_bet_ladder() {
         let mut rng = probe();
-        let mut cautious = Patron::new(&mut rng, 1_000);
+        let mut cautious = Patron::new(&mut rng, 1_000, 1);
         let mut chancer = cautious.clone();
         cautious.appetite = 0;
         cautious.read = 0;
@@ -246,7 +260,7 @@ mod tests {
     #[test]
     fn a_good_read_pulls_back_from_the_long_shots() {
         let mut rng = probe();
-        let mut mug = Patron::new(&mut rng, 1_000);
+        let mut mug = Patron::new(&mut rng, 1_000, 1);
         let mut sharp = mug.clone();
         mug.appetite = 90;
         mug.read = 0;
@@ -261,7 +275,7 @@ mod tests {
         let mut rng = probe();
         for variants in 1..=10usize {
             for _ in 0..200 {
-                let p = Patron::new(&mut rng, 1_000);
+                let p = Patron::new(&mut rng, 1_000, 1);
                 assert!(p.pick_bet(&mut rng, variants) < variants);
             }
         }
@@ -270,7 +284,7 @@ mod tests {
     #[test]
     fn luck_is_measured_rather_than_rolled() {
         let mut rng = probe();
-        let mut p = Patron::new(&mut rng, 1_000);
+        let mut p = Patron::new(&mut rng, 1_000, 1);
         assert_eq!(p.luck(), 0, "a patron who has not played has not run well or badly");
         p.settle(100, 150);
         assert_eq!(p.luck(), 50);
@@ -282,7 +296,7 @@ mod tests {
     #[test]
     fn settling_tracks_the_stack_and_the_best_hit() {
         let mut rng = probe();
-        let mut p = Patron::new(&mut rng, 1_000);
+        let mut p = Patron::new(&mut rng, 1_000, 1);
         p.settle(50, 0);
         assert_eq!(p.chips, 950);
         p.settle(50, 400);
@@ -297,10 +311,10 @@ mod tests {
         let leaves = |discipline: u8, rng: &mut Rng| {
             let mut left = 0;
             for _ in 0..400 {
-                let mut p = Patron::new(rng, 1_000);
+                let mut p = Patron::new(rng, 1_000, 1);
                 p.discipline = discipline;
                 p.chips = 2_000; // well ahead
-                if p.leaving(rng, 5) {
+                if p.leaving(rng, 5).is_some() {
                     left += 1;
                 }
             }

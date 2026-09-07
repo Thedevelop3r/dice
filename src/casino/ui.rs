@@ -9,6 +9,8 @@
 //! Screens refresh on a timer and poll for keys rather than blocking on
 //! one, so a table redraws as it plays rather than only when prodded.
 
+use super::config;
+use super::event::Weight;
 use super::instance::Kind;
 
 /// A named opening plan: what to call it, how it reads, and the tables it
@@ -22,6 +24,9 @@ use std::time::Duration;
 /// read and cheap enough that a hundred background tables still get the
 /// processor.
 const REFRESH: Duration = Duration::from_millis(250);
+
+/// How many lines of the event feed the floor screen shows.
+const FEED_ROWS: usize = 6;
 
 fn signed(theme: &Theme, n: i64) -> String {
     if n >= 0 {
@@ -172,8 +177,13 @@ fn draw_floor(screen: &mut Screen, view: &FloorView, cursor: usize) {
         theme.accent(&thousands(view.rounds as i64)),
         theme.dim(&thousands(view.bets as i64)),
         theme.dim(&duration(view.running_for)),
-        theme.paint(ui::theme::GOLD, &format!("{}x", view.speed))
+        theme.paint(ui::theme::GOLD, &config::speed_label(view.speed))
     ));
+    if view.speed != config::SPEED_UNIT {
+        // At anything but real time the two clocks diverge, and the one the
+        // simulation actually runs on is the one worth showing.
+        screen.line(&theme.dim(&format!("  {} of casino time has passed", duration(view.sim_time))));
+    }
     let (collected, paid, bought, cashed) = view.totals;
     screen.line(&format!(
         "  tables {} · cage {} · together {}",
@@ -200,7 +210,11 @@ fn draw_floor(screen: &mut Screen, view: &FloorView, cursor: usize) {
     // Only as many rows as the window has, scrolled to keep the cursor in
     // view — a floor of two hundred tables must still be navigable.
     let (_, rows) = screen.size();
-    let room = (rows as usize).saturating_sub(12).max(4);
+    // The feed gets a fixed strip at the bottom; the table list takes what
+    // is left. Both shrink together on a small terminal rather than one
+    // pushing the other off the screen.
+    let feed_lines = if view.feed.is_empty() { 0 } else { FEED_ROWS.min(view.feed.len()) + 2 };
+    let room = (rows as usize).saturating_sub(12 + feed_lines).max(4);
     let first = cursor.saturating_sub(room / 2).min(view.tables.len().saturating_sub(room));
     for (i, t) in view.tables.iter().enumerate().skip(first).take(room) {
         let marker = if i == cursor { theme.paint(ui::theme::GOLD, " ▸ ") } else { "   ".to_string() };
@@ -220,11 +234,39 @@ fn draw_floor(screen: &mut Screen, view: &FloorView, cursor: usize) {
     if view.tables.len() > room {
         screen.line(&theme.dim(&format!("   … {} of {} shown", room, view.tables.len())));
     }
+    draw_feed(screen, view, FEED_ROWS);
     screen.blank();
     screen.line(&widgets::footer(
         &theme,
         &[('j', "next"), ('k', "prev"), ('w', "watch"), ('o', "open"), ('p', "pause"), ('x', "close"), ('s', "speed"), ('q', "back")],
     ));
+}
+
+/// The strip of recent goings-on at the foot of the floor screen.
+///
+/// What reaches it is decided by the simulation, not here: the snapshot
+/// carries only events the floor judged `Notable` or better, so the
+/// per-round traffic that would drown this panel never arrives in the first
+/// place. Events worth interrupting somebody for are marked, using the
+/// thresholds from configuration rather than any number written down in the
+/// drawing code.
+fn draw_feed(screen: &mut Screen, view: &FloorView, rows: usize) {
+    if view.feed.is_empty() {
+        return;
+    }
+    let theme = screen.theme;
+    screen.blank();
+    screen.line(&theme.dim("  ON THE FLOOR"));
+    let start = view.feed.len().saturating_sub(rows);
+    for r in view.feed.iter().skip(start) {
+        let stamp = theme.dim(&duration(r.at));
+        let line = r.event.describe();
+        if r.weight >= Weight::Major {
+            screen.line(&format!("  {} {}", stamp, theme.paint(ui::theme::GOLD, &line)));
+        } else {
+            screen.line(&format!("  {} {}", stamp, theme.dim(&line)));
+        }
+    }
 }
 
 /// Adds tables to a running floor without disturbing anything already on it.

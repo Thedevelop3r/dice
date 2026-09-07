@@ -18,7 +18,11 @@
 //! the floor can never stall the UI.
 
 use super::bank::{Bank, OPENING_CHIPS, OPENING_MONEY};
+use super::clock::Clock;
+use super::config::{self, Config};
+use super::event::{Departure, Event, Feed, Record, Weight};
 use super::instance::{Instance, Kind, RoundLog};
+use super::sim::Sim;
 use crate::rng::Rng;
 use crate::ui::Badge;
 use std::collections::BTreeMap;
@@ -27,15 +31,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// How often the simulation thread wakes. Tables are paced by their own
-/// clocks, so this only bounds how *promptly* a due round is played, not
-/// how often rounds happen.
-const TICK: Duration = Duration::from_millis(40);
-
-/// A ceiling on how much catch-up a single tick will do. If the machine is
-/// heavily loaded, or the process was suspended, tables resync to the clock
-/// rather than trying to replay an hour of missed rounds at once.
-const MAX_CATCH_UP: u32 = 4;
+/// How many feed lines a floor snapshot carries. Enough to fill a panel,
+/// small enough that copying it under the lock stays trivial.
+const FEED_LINES: usize = 64;
 
 /// Everything the running casino owns. Only ever touched behind the mutex.
 struct Floor {
@@ -46,14 +44,35 @@ struct Floor {
     /// climbing rather than being reused.
     opened: BTreeMap<&'static str, u32>,
     rng: Rng,
-    speed: u32,
+    cfg: Config,
+    clock: Clock,
+    feed: Feed,
+    /// Identity is minted at floor level, not table level.
+    next_patron: u64,
     started: Instant,
 }
 
 impl Floor {
-    /// Advances every table that has a round due.
-    fn tick(&mut self, now: Instant) {
-        let speed = self.speed.max(1);
+    /// The services a table borrows for the length of one call. All five
+    /// are distinct fields, which is the only reason this compiles — and
+    /// the only place in the program that has to know it.
+    fn sim(&mut self) -> Sim<'_> {
+        let now = self.clock.now();
+        Sim {
+            rng: &mut self.rng,
+            bank: &mut self.bank,
+            feed: &mut self.feed,
+            cfg: &self.cfg,
+            now,
+            next_patron: &mut self.next_patron,
+        }
+    }
+
+    /// Advances every table that has a round due, in simulated time.
+    fn tick(&mut self, wall: Instant) {
+        self.clock.advance(wall);
+        let now = self.clock.now();
+        let ceiling = self.cfg.max_catch_up.max(1);
         for i in 0..self.instances.len() {
             if self.instances[i].paused {
                 // A paused table must not accrue a backlog, or resuming it
@@ -62,14 +81,22 @@ impl Floor {
                 continue;
             }
             let mut played = 0;
-            while self.instances[i].next_at <= now && played < MAX_CATCH_UP * speed {
-                // `instances`, `rng` and `bank` are distinct fields, so all
-                // three can be borrowed at once.
-                self.instances[i].play_round(&mut self.rng, &mut self.bank);
+            while self.instances[i].next_at <= now && played < ceiling {
+                let mut sim = Sim {
+                    rng: &mut self.rng,
+                    bank: &mut self.bank,
+                    feed: &mut self.feed,
+                    cfg: &self.cfg,
+                    now,
+                    next_patron: &mut self.next_patron,
+                };
+                self.instances[i].play_round(&mut sim);
                 played += 1;
             }
             if self.instances[i].next_at + Duration::from_secs(5) < now {
-                // Fell too far behind to be worth catching up on.
+                // Fell too far behind to be worth catching up on. Speed is
+                // now the clock's business, so this is a genuine stall
+                // rather than the fast-forward doing its job.
                 self.instances[i].next_at = now;
             }
         }
@@ -92,6 +119,7 @@ pub struct TableView {
     pub last: Option<RoundLog>,
     pub history: Vec<RoundLog>,
     pub patrons: Vec<super::patron::Patron>,
+    /// Simulated time this table has been open.
     pub open_for: Duration,
     pub seen: u32,
 }
@@ -110,8 +138,15 @@ pub struct FloorView {
     pub bets: u64,
     pub tables: Vec<TableView>,
     pub by_table: Vec<(&'static str, i64)>,
+    /// Permille speed — `1_000` is real time.
     pub speed: u32,
+    /// Wall time since the doors opened.
     pub running_for: Duration,
+    /// Simulated time since the doors opened, which at anything but 1x is
+    /// a different number.
+    pub sim_time: Duration,
+    /// The most recent readable events, oldest first.
+    pub feed: Vec<Record>,
     /// Whether the simulation thread is still turning.
     pub running: bool,
 }
@@ -139,24 +174,37 @@ impl Manager {
             next_id: 1,
             opened: BTreeMap::new(),
             rng: Rng::from_seed(seed),
-            speed: 1,
+            cfg: Config::default(),
+            clock: Clock::new(config::SPEED_UNIT),
+            feed: Feed::new(Config::default().feed_capacity),
+            next_patron: 1,
             started: Instant::now(),
         }));
+        if let Ok(mut f) = floor.lock() {
+            let now = f.clock.now();
+            f.feed.push(now, Weight::Notable, Event::CasinoOpened { money, chips });
+        }
         let running = Arc::new(AtomicBool::new(true));
 
         let thread_floor = Arc::clone(&floor);
         let thread_running = Arc::clone(&running);
         badge.set(money, chips);
         let thread = std::thread::spawn(move || {
+            // Re-read from configuration each pass, so a change to the
+            // tick takes effect without restarting the casino.
+            let mut tick;
             while thread_running.load(Ordering::Relaxed) {
                 {
                     let now = Instant::now();
+                    let mut nap = Config::default().tick;
                     if let Ok(mut f) = thread_floor.lock() {
                         f.tick(now);
                         badge.set(f.bank.money(), f.bank.chips());
+                        nap = f.cfg.tick;
                     }
+                    tick = nap;
                 }
-                std::thread::sleep(TICK);
+                std::thread::sleep(tick);
             }
         });
 
@@ -189,8 +237,9 @@ impl Manager {
                 *c += 1;
                 *c
             };
-            let Floor { rng, bank, instances, .. } = &mut *f;
-            instances.push(Instance::new(id, kind, number, rng, bank));
+            let mut sim = f.sim();
+            let inst = Instance::new(id, kind, number, &mut sim);
+            f.instances.push(inst);
         }
     }
 
@@ -199,27 +248,100 @@ impl Manager {
         let Ok(mut f) = self.floor.lock() else { return };
         if let Some(i) = f.instances.iter().position(|t| t.id == id) {
             let inst = f.instances.remove(i);
+            let now = f.clock.now();
             for p in inst.patrons {
                 f.bank.cash_out(p.chips);
+                f.feed.push(
+                    now,
+                    Weight::Routine,
+                    Event::Left {
+                        patron: p.id,
+                        who: p.name.clone(),
+                        table: inst.id,
+                        net: p.net(),
+                        reason: Departure::TableClosed,
+                    },
+                );
             }
+            f.feed.push(
+                now,
+                Weight::Notable,
+                Event::TableClosed { table: inst.id, name: inst.name, take: inst.staked - inst.returned },
+            );
         }
     }
 
     pub fn toggle_pause(&self, id: u32) {
         let Ok(mut f) = self.floor.lock() else { return };
-        if let Some(t) = f.instances.iter_mut().find(|t| t.id == id) {
+        let now = f.clock.now();
+        let announce = f.instances.iter_mut().find(|t| t.id == id).map(|t| {
             t.paused = !t.paused;
+            Event::TablePaused { table: t.id, name: t.name.clone(), paused: t.paused }
+        });
+        if let Some(e) = announce {
+            f.feed.push(now, Weight::Notable, e);
         }
     }
 
-    /// 1x, 2x or 4x — how many rounds a table may catch up per tick.
+    /// Steps to the next rung of the configured speed ladder — 0.25x up to
+    /// 10x. Speed is now a property of the *clock*, so a slow speed really
+    /// does mean fewer rounds per minute rather than the same rounds drawn
+    /// more often, and a fast one advances every paced system together.
     pub fn cycle_speed(&self) {
         let Ok(mut f) = self.floor.lock() else { return };
-        f.speed = match f.speed {
-            1 => 2,
-            2 => 4,
-            _ => 1,
-        };
+        let next = f.cfg.next_speed();
+        self.set_speed_locked(&mut f, next);
+    }
+
+    /// Sets an exact permille speed. `1_000` is real time.
+    #[allow(dead_code, reason = "the settings screen of a later phase; exercised by tests now")]
+    pub fn set_speed(&self, speed: u32) {
+        let Ok(mut f) = self.floor.lock() else { return };
+        self.set_speed_locked(&mut f, speed);
+    }
+
+    fn set_speed_locked(&self, f: &mut Floor, speed: u32) {
+        f.cfg.speed = speed;
+        f.clock.set_speed(Instant::now(), speed);
+    }
+
+    /// A copy of the current tunables. The UI reads thresholds from here
+    /// rather than writing any of them down itself.
+    #[allow(dead_code, reason = "read by the settings and analytics screens of later phases")]
+    pub fn config(&self) -> Config {
+        self.floor.lock().map(|f| f.cfg.clone()).unwrap_or_default()
+    }
+
+    /// Replaces the tunables wholesale — how a settings screen applies a
+    /// change without reaching into the simulation.
+    #[allow(dead_code, reason = "written by the settings screen of a later phase")]
+    pub fn configure(&self, cfg: Config) {
+        let Ok(mut f) = self.floor.lock() else { return };
+        f.clock.set_speed(Instant::now(), cfg.speed);
+        f.cfg = cfg;
+    }
+
+    /// The most recent readable events, oldest first. `min` filters out the
+    /// low-level traffic; the default screens ask for `Notable` and up.
+    #[allow(dead_code, reason = "the floor screen reads the feed off the snapshot; the spectator and notification screens of later phases pull it directly")]
+    pub fn feed(&self, n: usize, min: Weight) -> Vec<Record> {
+        self.floor.lock().map(|f| f.feed.recent(n, min)).unwrap_or_default()
+    }
+
+    /// Everything published after `seq`, for a reader keeping its place.
+    /// Returns the records and the cursor to pass back next time.
+    #[allow(dead_code, reason = "for the notification layer, which must not re-read what it has already shown")]
+    pub fn feed_since(&self, seq: u64, min: Weight) -> (Vec<Record>, u64) {
+        self.floor
+            .lock()
+            .map(|f| (f.feed.since(seq, min), f.feed.cursor()))
+            .unwrap_or_else(|_| (Vec::new(), seq))
+    }
+
+    /// Where a fresh reader should start to see only what happens next.
+    #[allow(dead_code, reason = "paired with feed_since")]
+    pub fn feed_cursor(&self) -> u64 {
+        self.floor.lock().map(|f| f.feed.cursor()).unwrap_or(0)
     }
 
     pub fn table_count(&self) -> usize {
@@ -245,12 +367,14 @@ impl Manager {
                 bets: 0,
                 tables: Vec::new(),
                 by_table: Vec::new(),
-                speed: 1,
+                speed: config::SPEED_UNIT,
                 running_for: Duration::ZERO,
+                sim_time: Duration::ZERO,
+                feed: Vec::new(),
                 running: false,
             };
         };
-        let now = Instant::now();
+        let now = f.clock.now();
         FloorView {
             money: f.bank.money(),
             chips: f.bank.chips(),
@@ -261,8 +385,10 @@ impl Manager {
             bets: f.bank.bets(),
             tables: f.instances.iter().map(|t| view_of(t, now, false)).collect(),
             by_table: f.bank.by_table(),
-            speed: f.speed,
-            running_for: now.duration_since(f.started),
+            speed: f.cfg.speed,
+            running_for: Instant::now().duration_since(f.started),
+            sim_time: now,
+            feed: f.feed.recent(FEED_LINES, Weight::Notable),
             running: self.is_running(),
         }
     }
@@ -272,7 +398,7 @@ impl Manager {
     /// state, never a restart of it.
     pub fn table(&self, id: u32) -> Option<TableView> {
         let f = self.floor.lock().ok()?;
-        let now = Instant::now();
+        let now = f.clock.now();
         f.instances.iter().find(|t| t.id == id).map(|t| view_of(t, now, true))
     }
 
@@ -283,7 +409,7 @@ impl Manager {
     }
 }
 
-fn view_of(t: &Instance, now: Instant, deep: bool) -> TableView {
+fn view_of(t: &Instance, now: Duration, deep: bool) -> TableView {
     TableView {
         id: t.id,
         name: t.name.clone(),
@@ -296,7 +422,7 @@ fn view_of(t: &Instance, now: Instant, deep: bool) -> TableView {
         last: t.last_round().cloned(),
         history: if deep { t.history.clone() } else { Vec::new() },
         patrons: if deep { t.patrons.clone() } else { Vec::new() },
-        open_for: now.saturating_duration_since(t.opened),
+        open_for: now.saturating_sub(t.opened),
         seen: t.seen,
     }
 }
@@ -471,5 +597,104 @@ mod tests {
         m.open(Kind::Roulette, 1);
         let names: Vec<String> = m.snapshot().tables.iter().map(|t| t.name.clone()).collect();
         assert!(names.contains(&"Roulette #3".to_string()), "a table number was reused: {names:?}");
+    }
+
+    #[test]
+    fn the_floor_announces_itself_the_moment_the_doors_open() {
+        let m = Manager::start(11, 100_000, 1_000_000, Badge::new());
+        let feed = m.feed(16, Weight::Notable);
+        assert!(
+            matches!(feed.first().map(|r| &r.event), Some(Event::CasinoOpened { .. })),
+            "the first thing on the feed should be the doors opening: {feed:?}"
+        );
+    }
+
+    #[test]
+    fn events_accumulate_while_nobody_is_watching() {
+        // The whole point of the bus: it is the simulation that publishes,
+        // on its own thread, whether or not a screen ever asks.
+        let m = Manager::start(12, 500_000, 5_000_000, Badge::new());
+        // Wound forward so the test spends a second of wall time rather
+        // than half a minute; the clock is the thing under test elsewhere.
+        m.set_speed(6_000);
+        // The cursor is taken before anything is opened, so everything the
+        // floor goes on to publish is genuinely new to this reader.
+        let cursor = m.feed_cursor();
+        m.open(Kind::Slots, 3);
+        assert!(wait_for(|| m.snapshot().rounds > 20, Duration::from_secs(10)), "the floor never got going");
+        let (fresh, next) = m.feed_since(cursor, Weight::Notable);
+        assert!(fresh.len() >= 3, "three tables opened and only {} events were published", fresh.len());
+        assert!(next >= cursor);
+        // ...and a reader that catches up sees nothing twice.
+        let (again, _) = m.feed_since(next, Weight::Routine);
+        for r in &again {
+            assert!(r.seq > next, "a reader was handed an event it had already seen");
+        }
+    }
+
+    #[test]
+    fn the_per_round_traffic_never_reaches_the_snapshot() {
+        let m = Manager::start(13, 500_000, 5_000_000, Badge::new());
+        m.set_speed(6_000);
+        m.open(Kind::Slots, 4);
+        assert!(wait_for(|| m.snapshot().rounds > 40, Duration::from_secs(10)), "the floor never got going");
+        for r in m.snapshot().feed {
+            assert!(r.weight >= Weight::Notable, "low-level traffic reached a screen: {:?}", r.event);
+        }
+    }
+
+    #[test]
+    fn changing_speed_never_restarts_a_table() {
+        // Rule 2, applied to the clock: the fast-forward changes how quickly
+        // rounds fall due and nothing else. Round numbers, patrons and
+        // history all carry straight through the change.
+        let m = Manager::start(14, 500_000, 5_000_000, Badge::new());
+        m.set_speed(6_000);
+        m.open(Kind::Baccarat, 2);
+        let id = m.ids()[0];
+        assert!(wait_for(|| m.table(id).map(|t| t.round).unwrap_or(0) > 3, Duration::from_secs(10)), "no rounds");
+        let before = m.table(id).expect("table");
+        m.set_speed(10_000);
+        std::thread::sleep(Duration::from_millis(400));
+        let after = m.table(id).expect("the table survived the speed change");
+        assert_eq!(after.name, before.name);
+        assert!(after.round >= before.round, "the round counter went backwards");
+        assert!(after.staked >= before.staked, "the table's turnover was reset");
+        m.set_speed(250);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(m.table(id).expect("still there").round >= after.round);
+    }
+
+    #[test]
+    fn a_slow_clock_really_does_mean_fewer_rounds() {
+        let slow = Manager::start(15, 500_000, 5_000_000, Badge::new());
+        slow.set_speed(250);
+        slow.open(Kind::Slots, 2);
+        let fast = Manager::start(15, 500_000, 5_000_000, Badge::new());
+        fast.set_speed(4_000);
+        fast.open(Kind::Slots, 2);
+        std::thread::sleep(Duration::from_millis(1_200));
+        let (s, f) = (slow.snapshot().rounds, fast.snapshot().rounds);
+        assert!(f > s * 2, "quarter speed played {s} rounds, four times speed only {f}");
+    }
+
+    #[test]
+    fn the_configured_limits_are_the_ones_the_floor_actually_uses() {
+        let m = Manager::start(16, 500_000, 50_000_000, Badge::new());
+        let mut cfg = m.config();
+        cfg.max_bet = 25;
+        cfg.vip_max_bet = 25;
+        cfg.speed = 6_000;
+        m.configure(cfg);
+        m.open(Kind::Slots, 2);
+        assert!(wait_for(|| m.snapshot().rounds > 30, Duration::from_secs(10)), "the floor never got going");
+        for t in m.snapshot().tables {
+            let full = m.table(t.id).expect("table");
+            for round in full.history {
+                for seat in round.seats {
+                    assert!(seat.staked <= 25, "{} staked {} over a configured limit of 25", seat.name, seat.staked);
+                }
+            }
+        }
     }
 }

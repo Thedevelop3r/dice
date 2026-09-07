@@ -10,11 +10,12 @@
 //! table is therefore not an approximation of the real game: it *is* the
 //! real game, with the animation and the keyboard taken away.
 
-use super::bank::Bank;
+use super::event::{Departure, Event, Weight};
 use super::patron::Patron;
+use super::sim::Sim;
 use crate::games::{baccarat, bigsix, bingo, blackjack, chuck, crash, hilo, horses, keno, mines, plinko, roulette, scratch, slots, threecard, vidpoker, war};
 use crate::rng::Rng;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Every table the floor can run unattended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,8 +227,6 @@ impl RoundLog {
 /// How many finished rounds a table remembers. Enough to fill the view,
 /// bounded so a table left running all night cannot grow without limit.
 const HISTORY: usize = 12;
-/// Nobody sits down for less than this.
-pub const MIN_BET: i64 = 5;
 
 #[derive(Debug, Clone)]
 pub struct Instance {
@@ -237,23 +236,25 @@ pub struct Instance {
     pub patrons: Vec<Patron>,
     pub round: u64,
     pub paused: bool,
-    /// When the next round falls due. The manager compares this against the
-    /// clock rather than counting ticks, so a table keeps its own pace no
-    /// matter how often the manager happens to run.
-    pub next_at: Instant,
+    /// When the next round falls due, in *simulated* time since the doors
+    /// opened. The manager compares this against the casino clock rather
+    /// than counting ticks, so a table keeps its own pace no matter how
+    /// often the manager happens to run — or how fast time is running.
+    pub next_at: Duration,
     pub history: Vec<RoundLog>,
     pub staked: i64,
     pub returned: i64,
-    pub opened: Instant,
+    /// Simulated time at which this table opened.
+    pub opened: Duration,
     /// Patrons who have come and gone since the table opened.
     pub seen: u32,
 }
 
 impl Instance {
-    pub fn new(id: u32, kind: Kind, number: u32, rng: &mut Rng, bank: &mut Bank) -> Instance {
+    pub fn new(id: u32, kind: Kind, number: u32, sim: &mut Sim) -> Instance {
         let (lo, hi) = kind.seats();
-        let seats = lo + rng.below(hi - lo + 1);
-        let now = Instant::now();
+        let seats = lo + sim.rng.below(hi - lo + 1);
+        let now = sim.now;
         let mut inst = Instance {
             id,
             kind,
@@ -263,85 +264,114 @@ impl Instance {
             paused: false,
             // Stagger the first round so a batch of new tables does not
             // resolve in lockstep for the rest of the night.
-            next_at: now + Duration::from_millis(rng.below(kind.pace().as_millis() as usize) as u64),
+            next_at: now + Duration::from_millis(sim.rng.below(kind.pace().as_millis() as usize) as u64),
             history: Vec::new(),
             staked: 0,
             returned: 0,
             opened: now,
             seen: 0,
         };
+        sim.emit(Weight::Notable, Event::TableOpened { table: id, name: inst.name.clone() });
         for _ in 0..seats {
-            inst.seat_one(rng, bank);
+            inst.seat_one(sim);
         }
         inst
     }
 
     /// Sits a fresh patron down, buying their chips at the cage.
-    fn seat_one(&mut self, rng: &mut Rng, bank: &mut Bank) {
-        let dollars = 20 + rng.below(180) as i64;
-        let chips = bank.buy_in(dollars);
-        self.patrons.push(Patron::new(rng, chips));
+    fn seat_one(&mut self, sim: &mut Sim) {
+        let (lo, hi) = sim.cfg.buy_in;
+        let dollars = lo + sim.rng.below((hi - lo + 1).max(1) as usize) as i64;
+        let chips = sim.bank.buy_in(dollars);
+        let id = sim.patron_id();
+        let p = Patron::new(sim.rng, chips, id);
+        sim.emit(
+            Weight::Notable,
+            Event::Arrived { patron: id, who: p.name.clone(), table: self.id, table_name: self.name.clone(), chips },
+        );
+        self.patrons.push(p);
         self.seen += 1;
     }
 
     /// Fills empty seats and clears out anyone who is done. Called after a
     /// round so the table stays populated without ever being restarted.
-    fn turn_over_seats(&mut self, rng: &mut Rng, bank: &mut Bank) {
+    fn turn_over_seats(&mut self, sim: &mut Sim) {
         let (lo, hi) = self.kind.seats();
-        let mut leaving: Vec<usize> = Vec::new();
+        let mut leaving: Vec<(usize, Departure)> = Vec::new();
         for (i, p) in self.patrons.iter().enumerate() {
-            if p.leaving(rng, MIN_BET) {
-                leaving.push(i);
+            if let Some(why) = p.leaving(sim.rng, sim.cfg.min_bet) {
+                leaving.push((i, why));
             }
         }
-        for i in leaving.into_iter().rev() {
+        for (i, why) in leaving.into_iter().rev() {
             let p = self.patrons.remove(i);
-            bank.cash_out(p.chips);
+            sim.bank.cash_out(p.chips);
+            sim.emit(
+                Weight::Notable,
+                Event::Left { patron: p.id, who: p.name.clone(), table: self.id, net: p.net(), reason: why },
+            );
         }
-        let want = lo + rng.below(hi - lo + 1);
+        let want = lo + sim.rng.below(hi - lo + 1);
         while self.patrons.len() < want.max(lo) {
-            self.seat_one(rng, bank);
+            self.seat_one(sim);
         }
     }
 
     /// Plays one round. Every seat stakes, the table's own maths settles it,
     /// and the house books each bet separately.
-    pub fn play_round(&mut self, rng: &mut Rng, bank: &mut Bank) {
+    pub fn play_round(&mut self, sim: &mut Sim) {
         self.round += 1;
         let variants = self.kind.variants();
         let mut seats: Vec<Seat> = Vec::with_capacity(self.patrons.len());
         let (mut pot, mut paid) = (0i64, 0i64);
+        let mut settlements: Vec<Event> = Vec::new();
 
         for p in self.patrons.iter_mut() {
-            let stake = p.stake(rng, MIN_BET);
+            // The table's limit is a configured ceiling, raised for the top
+            // tier — which is what a tier is actually *for*. Turnover, not
+            // the stack in front of them, decides which tier they are in.
+            let ceiling = sim.cfg.bet_ceiling(sim.cfg.tier_of(p.staked));
+            let stake = p.stake(sim.rng, sim.cfg.min_bet).min(ceiling.max(sim.cfg.min_bet));
             if stake <= 0 {
                 continue;
             }
-            let variant = p.pick_bet(rng, variants);
-            let (unit_staked, unit_returned) = self.kind.resolve(rng, variant);
+            let variant = p.pick_bet(sim.rng, variants);
+            let (unit_staked, unit_returned) = self.kind.resolve(sim.rng, variant);
             // The table's maths is written against a unit stake; scale it to
             // what this patron actually put down.
             let returned = if unit_staked > 0 { unit_returned * stake / unit_staked } else { 0 };
             p.settle(stake, returned);
-            bank.settle(self.kind.key(), stake - returned);
+            sim.bank.settle(self.kind.key(), stake - returned);
             pot += stake;
             paid += returned;
-            seats.push(Seat {
-                name: p.name.clone(),
-                bet: self.kind.variant_name(variant),
+            let bet = self.kind.variant_name(variant);
+            settlements.push(Event::Settled {
+                patron: p.id,
+                who: p.name.clone(),
+                table: self.id,
+                table_name: self.name.clone(),
+                bet: bet.clone(),
                 staked: stake,
                 returned,
             });
+            seats.push(Seat { name: p.name.clone(), bet, staked: stake, returned });
         }
 
         self.staked += pot;
         self.returned += paid;
-        bank.count_round();
+        sim.bank.count_round();
+        // Each settlement is published at whatever weight its size earns,
+        // so the ordinary ones stay counted-but-unseen and only the ones
+        // worth reading reach the feed.
+        for e in settlements {
+            sim.emit_settlement(e);
+        }
+        sim.emit(Weight::Routine, Event::Round { table: self.id, number: self.round, pot, paid });
         self.history.push(RoundLog { number: self.round, pot, paid, seats });
         if self.history.len() > HISTORY {
             self.history.remove(0);
         }
-        self.turn_over_seats(rng, bank);
+        self.turn_over_seats(sim);
         self.next_at += self.kind.pace();
     }
 
@@ -368,9 +398,47 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::casino::bank::Bank;
+    use crate::casino::config::Config;
+    use crate::casino::event::Feed;
 
     fn probe() -> Rng {
         Rng::from_seed(404)
+    }
+
+    /// A floor's worth of services, standing in for the manager's, so a
+    /// table can be driven in isolation exactly as the real one drives it.
+    struct Bench {
+        rng: Rng,
+        bank: Bank,
+        feed: Feed,
+        cfg: Config,
+        now: Duration,
+        next_patron: u64,
+    }
+
+    impl Bench {
+        fn new(chips: i64) -> Bench {
+            Bench {
+                rng: probe(),
+                bank: Bank::new(1_000_000, chips),
+                feed: Feed::new(4_096),
+                cfg: Config::default(),
+                now: Duration::ZERO,
+                next_patron: 1,
+            }
+        }
+
+        fn sim(&mut self) -> Sim<'_> {
+            Sim {
+                rng: &mut self.rng,
+                bank: &mut self.bank,
+                feed: &mut self.feed,
+                cfg: &self.cfg,
+                now: self.now,
+                next_patron: &mut self.next_patron,
+            }
+        }
     }
 
     #[test]
@@ -409,10 +477,9 @@ mod tests {
 
     #[test]
     fn a_new_table_opens_with_someone_at_it() {
-        let mut rng = probe();
-        let mut bank = Bank::new(1_000_000, 10_000_000);
+        let mut b = Bench::new(10_000_000);
         for (i, kind) in Kind::ALL.iter().enumerate() {
-            let inst = Instance::new(i as u32, *kind, 1, &mut rng, &mut bank);
+            let inst = Instance::new(i as u32, *kind, 1, &mut b.sim());
             let (lo, hi) = kind.seats();
             assert!(inst.patrons.len() >= lo && inst.patrons.len() <= hi, "{} opened with {}", kind.label(), inst.patrons.len());
             assert_eq!(inst.round, 0);
@@ -426,23 +493,21 @@ mod tests {
         // every buy-in, every settlement and every cash-out is a transfer,
         // so the tray plus every stack in the room is a constant. If this
         // ever fails, the casino is printing money.
-        let mut rng = probe();
-        let mut bank = Bank::new(1_000_000, 10_000_000);
-        let mut inst = Instance::new(1, Kind::Baccarat, 1, &mut rng, &mut bank);
+        let mut b = Bench::new(10_000_000);
+        let mut inst = Instance::new(1, Kind::Baccarat, 1, &mut b.sim());
         let total = |bank: &Bank, inst: &Instance| bank.chips() + inst.patrons.iter().map(|p| p.chips).sum::<i64>();
-        let opening = total(&bank, &inst);
+        let opening = total(&b.bank, &inst);
         for _ in 0..400 {
-            inst.play_round(&mut rng, &mut bank);
-            assert_eq!(total(&bank, &inst), opening, "chips appeared or vanished at round {}", inst.round);
+            inst.play_round(&mut b.sim());
+            assert_eq!(total(&b.bank, &inst), opening, "chips appeared or vanished at round {}", inst.round);
         }
     }
 
     #[test]
     fn a_rounds_log_adds_up() {
-        let mut rng = probe();
-        let mut bank = Bank::new(100_000, 1_000_000);
-        let mut inst = Instance::new(1, Kind::Slots, 1, &mut rng, &mut bank);
-        inst.play_round(&mut rng, &mut bank);
+        let mut b = Bench::new(1_000_000);
+        let mut inst = Instance::new(1, Kind::Slots, 1, &mut b.sim());
+        inst.play_round(&mut b.sim());
         assert_eq!(inst.round, 1);
         let log = inst.last_round().expect("a round was played");
         assert_eq!(log.house(), log.pot - log.paid);
@@ -452,11 +517,10 @@ mod tests {
 
     #[test]
     fn a_table_keeps_only_a_bounded_history() {
-        let mut rng = probe();
-        let mut bank = Bank::new(1_000_000, 10_000_000);
-        let mut inst = Instance::new(1, Kind::Slots, 1, &mut rng, &mut bank);
+        let mut b = Bench::new(10_000_000);
+        let mut inst = Instance::new(1, Kind::Slots, 1, &mut b.sim());
         for _ in 0..HISTORY * 3 {
-            inst.play_round(&mut rng, &mut bank);
+            inst.play_round(&mut b.sim());
         }
         assert_eq!(inst.history.len(), HISTORY, "history grew without bound");
         assert_eq!(inst.history.last().unwrap().number, inst.round);
@@ -464,12 +528,11 @@ mod tests {
 
     #[test]
     fn a_table_refills_its_own_seats() {
-        let mut rng = probe();
-        let mut bank = Bank::new(1_000_000, 10_000_000);
-        let mut inst = Instance::new(1, Kind::Baccarat, 1, &mut rng, &mut bank);
+        let mut b = Bench::new(10_000_000);
+        let mut inst = Instance::new(1, Kind::Baccarat, 1, &mut b.sim());
         let (lo, _) = Kind::Baccarat.seats();
         for _ in 0..200 {
-            inst.play_round(&mut rng, &mut bank);
+            inst.play_round(&mut b.sim());
             assert!(inst.patrons.len() >= lo, "table emptied below its minimum");
         }
         assert!(inst.seen > lo as u32, "nobody ever came or went in 200 rounds");
@@ -477,23 +540,83 @@ mod tests {
 
     #[test]
     fn rounds_are_paced_by_the_clock_not_by_tick_count() {
-        let mut rng = probe();
-        let mut bank = Bank::new(1_000_000, 10_000_000);
-        let mut inst = Instance::new(1, Kind::Roulette, 1, &mut rng, &mut bank);
+        let mut b = Bench::new(10_000_000);
+        let mut inst = Instance::new(1, Kind::Roulette, 1, &mut b.sim());
         let first = inst.next_at;
-        inst.play_round(&mut rng, &mut bank);
+        inst.play_round(&mut b.sim());
         assert_eq!(inst.next_at - first, Kind::Roulette.pace());
     }
 
     #[test]
     fn the_house_take_is_the_difference_across_every_round() {
-        let mut rng = probe();
-        let mut bank = Bank::new(1_000_000, 10_000_000);
-        let mut inst = Instance::new(1, Kind::Chuck, 1, &mut rng, &mut bank);
+        let mut b = Bench::new(10_000_000);
+        let mut inst = Instance::new(1, Kind::Chuck, 1, &mut b.sim());
         for _ in 0..300 {
-            inst.play_round(&mut rng, &mut bank);
+            inst.play_round(&mut b.sim());
         }
         assert_eq!(inst.house_take(), inst.staked - inst.returned);
         assert!(inst.staked > 0);
+    }
+
+    #[test]
+    fn a_table_announces_itself_and_its_arrivals() {
+        let mut b = Bench::new(10_000_000);
+        let inst = Instance::new(7, Kind::Blackjack, 3, &mut b.sim());
+        let feed = b.feed.recent(64, Weight::Notable);
+        assert!(
+            matches!(feed.first().map(|r| &r.event), Some(Event::TableOpened { table: 7, .. })),
+            "the table must announce itself before anyone sits down"
+        );
+        let arrivals = feed.iter().filter(|r| matches!(r.event, Event::Arrived { .. })).count();
+        assert_eq!(arrivals, inst.patrons.len(), "one arrival announced per seat filled");
+    }
+
+    #[test]
+    fn every_patron_at_a_table_has_their_own_identity() {
+        let mut b = Bench::new(10_000_000);
+        let mut inst = Instance::new(1, Kind::Baccarat, 1, &mut b.sim());
+        let mut ever: Vec<u64> = inst.patrons.iter().map(|p| p.id).collect();
+        for _ in 0..300 {
+            inst.play_round(&mut b.sim());
+            ever.extend(inst.patrons.iter().map(|p| p.id));
+        }
+        let mut seated: Vec<u64> = inst.patrons.iter().map(|p| p.id).collect();
+        seated.sort_unstable();
+        let n = seated.len();
+        seated.dedup();
+        assert_eq!(seated.len(), n, "two patrons at one table share an id");
+        assert!(ever.iter().copied().max().unwrap() >= n as u64);
+    }
+
+    #[test]
+    fn the_round_traffic_never_crowds_out_the_readable_feed() {
+        let mut b = Bench::new(10_000_000);
+        let mut inst = Instance::new(1, Kind::Slots, 1, &mut b.sim());
+        for _ in 0..500 {
+            inst.play_round(&mut b.sim());
+        }
+        // Every round publishes a Round event; none of them are kept.
+        assert!(b.feed.seen(Weight::Routine) >= 500);
+        for r in b.feed.recent(4_096, Weight::Notable) {
+            assert!(!matches!(r.event, Event::Round { .. }), "per-round traffic reached the feed");
+        }
+    }
+
+    #[test]
+    fn nobody_bets_over_the_house_limit() {
+        let mut b = Bench::new(100_000_000);
+        b.cfg.max_bet = 40;
+        b.cfg.vip_max_bet = 40;
+        let mut inst = Instance::new(1, Kind::Roulette, 1, &mut b.sim());
+        for p in inst.patrons.iter_mut() {
+            p.chips = 10_000_000;
+            p.nerve = 100;
+        }
+        for _ in 0..50 {
+            inst.play_round(&mut b.sim());
+            for s in inst.last_round().unwrap().seats.iter() {
+                assert!(s.staked <= 40, "{} got {} down over a limit of 40", s.name, s.staked);
+            }
+        }
     }
 }

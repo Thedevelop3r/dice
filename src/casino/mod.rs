@@ -5,6 +5,15 @@
 //! simulation the manager is advancing on a clock, which you may or may not
 //! happen to be watching. The five pieces map onto that idea directly:
 //!
+//! - [`config`] — every tunable number: table limits, tier thresholds,
+//!   event thresholds, clock speed, what the lights cost. Nothing is
+//!   hard-coded at the point that uses it.
+//! - [`clock`] — simulated time. Everything paced reads it, so one speed
+//!   setting moves the whole casino together.
+//! - [`event`] — the bus. The simulation announces; screens read. There is
+//!   no path by which a reader's code runs on the simulation thread.
+//! - [`sim`] — the bundle of floor-owned services a table borrows for the
+//!   length of one call.
 //! - [`bank`] — the economy manager. One set of books, money and chips,
 //!   which every table reports into and nothing else keeps a copy of.
 //! - [`patron`] — a simulated player, with traits that change how they bet
@@ -19,9 +28,13 @@
 //! may hold game state.
 
 pub mod bank;
+pub mod clock;
+pub mod config;
+pub mod event;
 pub mod instance;
 pub mod manager;
 pub mod patron;
+pub mod sim;
 pub mod ui;
 
 pub use manager::Manager;
