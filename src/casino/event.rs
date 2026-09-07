@@ -144,10 +144,13 @@ impl Event {
             }
             Event::Settled { who, table_name, bet, staked, returned, .. } => {
                 let swing = returned - staked;
+                // A machine has no bets to name, so it gets no trailing
+                // "on ", which reads as a sentence that lost its ending.
+                let on = if bet.is_empty() { String::new() } else { format!(" on {bet}") };
                 if swing >= 0 {
-                    format!("{who} took {swing} off {table_name} on {bet}")
+                    format!("{who} took {swing} off {table_name}{on}")
                 } else {
-                    format!("{who} dropped {} at {table_name} on {bet}", -swing)
+                    format!("{who} dropped {} at {table_name}{on}", -swing)
                 }
             }
             Event::Round { number, pot, paid, .. } => {
@@ -381,6 +384,33 @@ mod tests {
         assert_eq!(w(5_000, 20_000), Weight::Major, "a big enough swing");
         assert_eq!(w(10, 300), Weight::Major, "a 30x on ten chips is a jackpot, small though it is");
         assert_eq!(w(10, 200), Weight::Routine, "20x is not");
+    }
+
+    #[test]
+    fn a_table_with_no_bets_to_name_still_reads_as_a_sentence() {
+        // A machine has one thing you can do at it, so its bet name is
+        // empty — and the line must not trail off into "... on ".
+        let machine = Event::Settled {
+            patron: 1,
+            who: "Ada".into(),
+            table: 1,
+            table_name: "Slots #3".into(),
+            bet: String::new(),
+            staked: 100,
+            returned: 900,
+        };
+        assert_eq!(machine.describe(), "Ada took 800 off Slots #3");
+        let board = Event::Settled {
+            patron: 1,
+            who: "Ada".into(),
+            table: 1,
+            table_name: "Roulette #1".into(),
+            bet: "straight up on 17 (35:1)".into(),
+            staked: 100,
+            returned: 3_600,
+        };
+        assert_eq!(board.describe(), "Ada took 3500 off Roulette #1 on straight up on 17 (35:1)");
+        assert!(!machine.describe().ends_with(' '));
     }
 
     #[test]

@@ -32,15 +32,15 @@ The two constraints that define the whole codebase:
 
 | | |
 |---|---|
-| Source | 18,388 lines across 54 files |
-| Tests | 299, all passing |
+| Source | 19,011 lines across 55 files |
+| Tests | 313, all passing |
 | Starting balances | 10,000 chips / $9,000 — the user's own tuning in `economy.rs` |
 | Clippy | clean, zero warnings |
 | Dependencies | none |
 | Tables | 24 (8 dice, 6 card, 2 wheel, 8 arcade) |
 | Idle screens | 17 tables + a floor-wide cycler |
 | Background casino | a real simulation thread; 51 tables at 0.2% CPU |
-| Autonomous roadmap | Phases 0-8 and 20 done — see `ROADMAP.md` |
+| Autonomous roadmap | Phases 0-12 and 20 done — see `ROADMAP.md` |
 
 ---
 
@@ -177,8 +177,9 @@ src/
     widgets.rs     143  number_picker, text_input, footer, banner, bar
   casino/                  ← the background simulation (session 6-7)
     mod.rs          40  what the nine pieces are and why they are separate
-    config.rs      325  every tunable: limits, tiers, thresholds, speed, costs
+    config.rs      352  every tunable: limits, tiers, thresholds, speed, costs
     demand.rs      371  what the room is in the mood for + occupancy
+    interest.rs    339  how worth watching a table is, and why
     clock.rs       248  simulated time, permille speed, the `Every` period
     event.rs       413  the event bus: Event, Weight, Record, Feed
     sim.rs          45  the borrow bundle a table gets for one call
@@ -186,8 +187,8 @@ src/
     patron.rs      751  archetypes, traits, presence, lifetime record
     roster.rs      392  everyone the casino knows, seated or not
     instance.rs    845  one running table, its limit, the Kind → game mapping
-    manager.rs    1218  the simulation thread, lifecycle, bills, mood, snapshots
-    ui.rs          665  opening, floor + feed, live table, the house books
+    manager.rs    1311  simulation thread, lifecycle, bills, mood, snapshots
+    ui.rs          826  floor, feed, spectator, live table, the house books
   games/
     mod.rs         109  Ctx, Difficulty, Player, pick_difficulty
     cards.rs       443  shared deck/shoe/hand rankings  ← every card table
@@ -487,6 +488,36 @@ the other up. Who counts as a VIP is `cfg.vip_tier` (default `2`, "high
 roller") rather than the top tier, because pinning it to the top would leave
 the high-limit tables empty all night. `Manager::open_at(kind, n, limit)`,
 and the open-a-table screen asks which.
+
+### Watching the place (session 7, Phases 9-12)
+
+Four screens, all of them read-only over things that already existed.
+
+- **`e` — the feed.** The whole event stream as a screen, filtered to
+  `Notable` and up, with `b` to narrow to `Major`. The filter is the point:
+  a floor publishes millions of things an hour, and it is the *publisher's*
+  weight that decides what can appear at all.
+- **Notifications.** The floor screen keeps a feed cursor and announces
+  anything new that clears `Weight::Major`. It starts from the current
+  cursor, so walking in does not replay the night at you, and `feed_since`
+  guarantees nothing is announced twice. The screen does not know what a big
+  win is — the simulation set the weight, from `cfg.big_win` / `huge_win` /
+  `jackpot_multiple`.
+- **`v` — spectator mode.** Holds on a table for `cfg.spectate_for`, then
+  moves to whatever is most worth watching. `h` holds, `n` steps, `f`
+  resumes following. **It never pauses anything** — `z` still pauses a
+  table, because that is the user asking by name.
+- **`casino/interest.rs` — follow the action.** Scores a table on money
+  through it, the biggest recent hit, the crowd, a VIP in a seat, and the
+  house losing. Every weight is configuration (`cfg.interest_*`), and the
+  score reports *why* it ranked a table where it did, so the spectator can
+  say "the players are winning" instead of silently teleporting you.
+
+The score reads only a table's bounded recent history, so it costs the same
+whether the casino opened a minute ago or has run all night, and it is
+computed once per snapshot under the lock rather than per frame. Scoring a
+table cannot touch it: there is a test that runs the scorer fifty times over
+and asserts the table is byte-for-byte where it was.
 
 ---
 

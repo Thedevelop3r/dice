@@ -106,6 +106,23 @@ pub struct Config {
     pub appeal_floor: i64,
     pub appeal_ceiling: i64,
 
+    // ---- what makes a table worth watching (Phase 12) -----------------
+    /// The pot size the money and upset parts of the interest score are
+    /// measured against — the yardstick that turns chips into a comparable
+    /// number.
+    pub interest_pot_yardstick: i64,
+    /// The weight given to money on the table, to the biggest recent hit,
+    /// to a crowd (per seat), to a VIP (per head), and to the house being
+    /// beaten. All of it configurable, none of it written down where it is
+    /// used.
+    pub interest_money: i64,
+    pub interest_swing: i64,
+    pub interest_crowd: i64,
+    pub interest_vip: i64,
+    pub interest_upset: i64,
+    /// How long the spectator holds on one table before moving on.
+    pub spectate_for: Duration,
+
     // ---- event thresholds (Phases 9, 10) -----------------------------
     /// A single settlement returning at least this many chips is notable.
     pub big_win: i64,
@@ -159,6 +176,14 @@ impl Default for Config {
             appeal_step: 60,
             appeal_floor: 550,
             appeal_ceiling: 1_600,
+
+            interest_pot_yardstick: 500,
+            interest_money: 100,
+            interest_swing: 220,
+            interest_crowd: 40,
+            interest_vip: 400,
+            interest_upset: 60,
+            spectate_for: Duration::from_secs(9),
 
             big_win: 1_500,
             huge_win: 15_000,
@@ -314,6 +339,8 @@ mod tests {
         assert!(cfg.roster_size > 0, "a casino with nobody in it is not a casino");
         assert!(cfg.away_for.0 < cfg.away_for.1, "the range somebody stays away must be a range");
         assert!(cfg.away_for.0 > Duration::ZERO, "nobody turns straight round at the door");
+        assert!(cfg.interest_pot_yardstick > 0, "the interest score would divide by zero");
+        assert!(cfg.spectate_for > Duration::ZERO, "the spectator would never see anything");
         assert!(cfg.arrivals_per_period > 0 && cfg.arrivals_period > Duration::ZERO, "nobody would ever come in");
         assert!(cfg.gives_up > 0 && cfg.gives_up < 100, "people must eventually give up, but not instantly");
         assert!(cfg.appeal_floor < 1_000 && cfg.appeal_ceiling > 1_000, "neutral must sit inside the band");

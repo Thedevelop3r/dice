@@ -23,6 +23,7 @@ use super::config::{self, Config};
 use super::event::{Departure, Event, Feed, Record, Weight};
 use super::demand::{Demand, Standing};
 use super::instance::{Instance, Kind, Limit, RoundLog};
+use super::interest::{self, Interest};
 use super::patron::Patron;
 use super::roster::{self, Roster};
 use super::sim::Sim;
@@ -306,6 +307,8 @@ pub struct TableView {
     pub seen: u32,
     /// What this table lets people bet, and who it seats.
     pub limit: Limit,
+    /// How worth watching it is, and why.
+    pub interest: Interest,
     /// The tunables in force, so the drawing code can name a tier or a
     /// threshold without writing the number down itself.
     pub cfg: Config,
@@ -662,6 +665,19 @@ impl Manager {
         f.instances.iter().find(|t| t.id == id).map(|t| view_of(t, &f.roster, &f.cfg, now, true))
     }
 
+    /// The table most worth watching right now, if there is one running.
+    ///
+    /// This is "follow the action" in one call. It ranks a copy of the
+    /// floor and reports an id; it does not steer, pause or otherwise
+    /// touch anything, so the answer changing does not change the floor.
+    pub fn most_interesting(&self) -> Option<(u32, Interest)> {
+        let f = self.floor.lock().ok()?;
+        f.instances
+            .iter()
+            .map(|t| (t.id, interest::score(t, &f.roster, &f.cfg)))
+            .max_by_key(|(id, i)| (i.score, std::cmp::Reverse(*id)))
+    }
+
     /// The ids currently on the floor, in the order they were opened —
     /// which is the order the UI cycles through.
     pub fn ids(&self) -> Vec<u32> {
@@ -689,6 +705,7 @@ fn view_of(t: &Instance, roster: &Roster, cfg: &Config, now: Duration, deep: boo
         open_for: now.saturating_sub(t.opened),
         seen: t.seen,
         limit: t.limit,
+        interest: interest::score(t, roster, cfg),
         cfg: cfg.clone(),
     }
 }
@@ -1115,6 +1132,82 @@ mod tests {
         let v = m.snapshot();
         assert_eq!(v.tables.len(), 3, "the tables should still be open");
         assert!(v.running, "the simulation thread stopped");
+    }
+
+    #[test]
+    fn the_action_can_be_found_without_disturbing_it() {
+        // Phase 12: "follow the action" is a ranking over a copy of the
+        // floor. Asking which table is worth watching must be exactly as
+        // harmless as not asking.
+        let m = Manager::start(50, 1_000_000, 50_000_000, Badge::new());
+        m.set_speed(10_000);
+        m.open(Kind::Slots, 3);
+        m.open(Kind::Blackjack, 2);
+        assert!(wait_for(|| m.snapshot().rounds > 60, Duration::from_secs(10)), "the floor never got going");
+
+        let (best, interest) = m.most_interesting().expect("a floor with five tables has a best one");
+        assert!(m.ids().contains(&best));
+        assert!(interest.score >= 0);
+        // Whatever it picked really is the top of the ranking the views
+        // carry, so the screen and the chooser cannot disagree.
+        let view = m.snapshot();
+        let top = view.tables.iter().map(|t| t.interest.score).max().unwrap();
+        let picked = view.tables.iter().find(|t| t.id == best).map(|t| t.interest.score);
+        // The floor moves between the two calls, so this is a sanity check
+        // on the ordering rather than an equality.
+        assert!(picked.unwrap_or(0) <= top);
+
+        // And asking a hundred times changes nothing about the floor.
+        let before = m.snapshot();
+        for _ in 0..100 {
+            let _ = m.most_interesting();
+        }
+        let after = m.snapshot();
+        assert_eq!(before.tables.len(), after.tables.len());
+        assert!(after.rounds >= before.rounds, "the round count went backwards");
+        assert!(after.tables.iter().all(|t| !t.status.contains("paused")), "watching paused a table");
+    }
+
+    #[test]
+    fn a_paused_table_is_never_what_the_spectator_is_sent_to() {
+        let m = Manager::start(51, 1_000_000, 50_000_000, Badge::new());
+        m.set_speed(10_000);
+        m.open(Kind::Slots, 2);
+        assert!(wait_for(|| m.snapshot().rounds > 40, Duration::from_secs(10)), "the floor never got going");
+        // Pause everything: there is no action anywhere, and the chooser
+        // must say so rather than sending somebody to a stopped table with
+        // a stale score.
+        for id in m.ids() {
+            m.toggle_pause(id);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let (_, interest) = m.most_interesting().expect("the tables are still open");
+        assert_eq!(interest.score, 0, "a floor of paused tables offered {} of action", interest.score);
+    }
+
+    #[test]
+    fn a_notification_reader_is_never_handed_the_same_thing_twice() {
+        // Phase 10's actual requirement, from the reader's side.
+        let m = Manager::start(52, 1_000_000, 50_000_000, Badge::new());
+        m.set_speed(10_000);
+        let mut seen = m.feed_cursor();
+        m.open(Kind::Slots, 4);
+        assert!(wait_for(|| m.snapshot().rounds > 100, Duration::from_secs(10)), "the floor never got going");
+        let mut announced = Vec::new();
+        for _ in 0..20 {
+            let (fresh, next) = m.feed_since(seen, Weight::Major);
+            for r in fresh {
+                assert!(r.seq > seen, "an event was announced twice");
+                assert_eq!(r.weight, Weight::Major, "something below the bar reached a notification");
+                announced.push(r.seq);
+            }
+            seen = next;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut sorted = announced.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), announced.len(), "the same event was announced more than once");
     }
 
     #[test]

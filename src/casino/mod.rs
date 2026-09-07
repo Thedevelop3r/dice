@@ -15,6 +15,8 @@
 //!   win.
 //! - [`event`] — the bus. The simulation announces; screens read. There is
 //!   no path by which a reader's code runs on the simulation thread.
+//! - [`interest`] — how worth watching a table is. A lens on the floor,
+//!   never a hand on it.
 //! - [`sim`] — the bundle of floor-owned services a table borrows for the
 //!   length of one call.
 //! - [`bank`] — the economy manager. One set of books, money and chips,
@@ -39,6 +41,7 @@ pub mod config;
 pub mod demand;
 pub mod event;
 pub mod instance;
+pub mod interest;
 pub mod manager;
 pub mod patron;
 pub mod roster;

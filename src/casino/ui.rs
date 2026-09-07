@@ -29,6 +29,11 @@ const REFRESH: Duration = Duration::from_millis(250);
 /// How many lines of the event feed the floor screen shows.
 const FEED_ROWS: usize = 6;
 
+/// How many frames a notification stays on screen. At `REFRESH` a frame is
+/// a quarter of a second, so this is a couple of seconds — long enough to
+/// read, short enough not to sit on top of the floor.
+const NOTICE_FRAMES: u32 = 8;
+
 fn signed(theme: &Theme, n: i64) -> String {
     if n >= 0 {
         theme.win(&format!("+{}", thousands(n)))
@@ -110,17 +115,40 @@ pub fn opening(screen: &mut Screen) -> Option<Vec<(Kind, usize)>> {
 /// Returns the id of a table to watch, if the user picked one.
 pub fn floor(manager: &Manager, screen: &mut Screen) -> Option<u32> {
     let mut cursor = 0usize;
+    // Where this screen has read up to on the feed, so a notification is
+    // shown once and is never re-announced. Starting at the current cursor
+    // means walking in does not replay the whole night at you.
+    let mut seen = manager.feed_cursor();
+    let mut notice: Option<(String, u32)> = None;
     loop {
         let view = manager.snapshot();
+
+        // Anything published since the last look that clears the "worth
+        // interrupting somebody for" bar gets announced. The bar itself is
+        // `Weight::Major`, which the *simulation* set from the thresholds
+        // in configuration — this screen does not know what a big win is.
+        let (fresh, next) = manager.feed_since(seen, Weight::Major);
+        seen = next;
+        if let Some(last) = fresh.last() {
+            notice = Some((last.event.describe(), NOTICE_FRAMES));
+        }
+
         if view.tables.is_empty() {
             draw_empty(screen, &view);
         } else {
             cursor = cursor.min(view.tables.len() - 1);
             draw_floor(screen, &view, cursor);
         }
+        if let Some((text, left)) = notice.take() {
+            let theme = screen.theme;
+            screen.line(&format!("  {} {}", theme.paint(ui::theme::GOLD, "▶"), theme.win(&text)));
+            if left > 1 {
+                notice = Some((text, left - 1));
+            }
+        }
         screen.present();
 
-        match poll(REFRESH, &['w', 'o', 'p', 'x', 's', 'j', 'k', 'n', 'b', 'm']) {
+        match poll(REFRESH, &['w', 'o', 'p', 'x', 's', 'j', 'k', 'n', 'b', 'm', 'e', 'v']) {
             Poll::Leave => return None,
             Poll::Pressed('w') => {
                 if let Some(t) = view.tables.get(cursor) {
@@ -145,6 +173,13 @@ pub fn floor(manager: &Manager, screen: &mut Screen) -> Option<u32> {
             }
             Poll::Pressed('s') => manager.cycle_speed(),
             Poll::Pressed('m') => books(manager, screen),
+            Poll::Pressed('e') => feed_screen(manager, screen),
+            Poll::Pressed('v') => {
+                let start = manager.most_interesting().map(|(id, _)| id).or_else(|| view.tables.first().map(|t| t.id));
+                if let Some(id) = start {
+                    spectate(manager, screen, id);
+                }
+            }
             Poll::Pressed('o') => {
                 if let Some((kind, n, limit)) = open_more(screen) {
                     manager.open_at(kind, n, limit);
@@ -270,6 +305,8 @@ fn draw_floor(screen: &mut Screen, view: &FloorView, cursor: usize) {
             ('o', "open"),
             ('p', "pause"),
             ('x', "close"),
+            ('v', "spectate"),
+            ('e', "feed"),
             ('m', "books"),
             ('s', "speed"),
             ('q', "back"),
@@ -316,6 +353,54 @@ fn draw_feed(screen: &mut Screen, view: &FloorView, rows: usize) {
             screen.line(&format!("  {} {}", stamp, theme.paint(ui::theme::GOLD, &line)));
         } else {
             screen.line(&format!("  {} {}", stamp, theme.dim(&line)));
+        }
+    }
+}
+
+/// The whole feed, as a screen rather than a strip.
+///
+/// The filter is the point. A floor publishes millions of things an hour
+/// and almost none of them are worth a person's attention; the weight a
+/// publisher gave an event is what decides whether it can appear here at
+/// all, and this screen only chooses between "worth reading" and "worth
+/// interrupting somebody for".
+fn feed_screen(manager: &Manager, screen: &mut Screen) {
+    let mut only_big = false;
+    loop {
+        let min = if only_big { Weight::Major } else { Weight::Notable };
+        let (_, rows) = screen.size();
+        let room = (rows as usize).saturating_sub(9).max(4);
+        let records = manager.feed(room, min);
+        let theme = screen.theme;
+        screen.begin();
+        ui::header(screen, "ON THE FLOOR");
+        screen.blank();
+        screen.line(&format!(
+            "  showing {} · {} on the feed so far",
+            if only_big { theme.paint(ui::theme::GOLD, "only the big ones") } else { theme.accent("everything worth reading") },
+            theme.dim(&thousands(records.len() as i64))
+        ));
+        screen.blank();
+        if records.is_empty() {
+            screen.line(&theme.dim("  nothing yet — open some tables and give it a moment"));
+        }
+        for r in records.iter() {
+            let stamp = theme.dim(&pad_start(&duration(r.at), 8));
+            let line = r.event.describe();
+            if r.weight >= Weight::Major {
+                screen.line(&format!("  {} {}", stamp, theme.paint(ui::theme::GOLD, &line)));
+            } else {
+                screen.line(&format!("  {} {}", stamp, line));
+            }
+        }
+        screen.blank();
+        screen.line(&widgets::footer(&theme, &[('b', "big ones only"), ('a', "everything"), ('q', "back")]));
+        screen.present();
+        match poll(REFRESH, &['b', 'a']) {
+            Poll::Leave => return,
+            Poll::Pressed('b') => only_big = true,
+            Poll::Pressed('a') => only_big = false,
+            _ => {}
         }
     }
 }
@@ -511,6 +596,77 @@ fn open_more(screen: &mut Screen) -> Option<(Kind, usize, Limit)> {
 /// Watches one running table, live. `←`/`→` move to the neighbouring table
 /// without stopping anything: the tables the user is not looking at carry
 /// on exactly as before.
+/// Spectator mode: the floor picks what you look at.
+///
+/// It holds on a table for a configured spell, then moves to whichever
+/// table is most worth watching — Phase 12's "follow the action", with the
+/// score itself living in `casino::interest` where it can be tuned.
+///
+/// The one rule this screen has to keep is that **it never pauses
+/// anything**. Watching is watching; the tables it is not showing carry on
+/// exactly as they were, and so does the one it is. The `z` key still
+/// pauses a table, because that is the user explicitly asking for it.
+pub fn spectate(manager: &Manager, screen: &mut Screen, start_at: u32) {
+    let mut id = start_at;
+    let mut held = Duration::ZERO;
+    let mut following = true;
+    let mut why = None;
+    loop {
+        let ids = manager.ids();
+        if ids.is_empty() {
+            return;
+        }
+        let hold = manager.config().spectate_for;
+        if following && (held >= hold || !ids.contains(&id)) {
+            if let Some((best, interest)) = manager.most_interesting() {
+                id = best;
+                why = Some(interest);
+            }
+            held = Duration::ZERO;
+        }
+        if !ids.contains(&id) {
+            id = ids[0];
+        }
+        let Some(view) = manager.table(id) else { return };
+        let at = ids.iter().position(|i| *i == id).unwrap_or(0);
+        draw_table(screen, &view, at + 1, ids.len());
+        let theme = screen.theme;
+        let left = hold.saturating_sub(held);
+        screen.line(&if following {
+            let reason = why.map(|i: super::interest::Interest| i.why.label()).unwrap_or("ticking over");
+            theme.dim(&format!("  following the action — {reason} · moving on in {}", duration(left)))
+        } else {
+            theme.dim("  holding on this table — [f] to follow the action again")
+        });
+        screen.line(&widgets::footer(
+            &theme,
+            &[('f', "follow"), ('h', "hold"), ('n', "next"), ('z', "pause table"), ('q', "back")],
+        ));
+        screen.present();
+
+        match poll(REFRESH, &['f', 'h', 'n', 'p', 'z']) {
+            Poll::Leave => return,
+            Poll::Pressed('f') => {
+                following = true;
+                held = hold; // move at once rather than serving out the spell
+            }
+            Poll::Pressed('h') => following = false,
+            Poll::Pressed('n') => {
+                id = ids[(at + 1) % ids.len()];
+                following = false;
+            }
+            Poll::Pressed('p') => {
+                id = ids[(at + ids.len() - 1) % ids.len()];
+                following = false;
+            }
+            // The only thing on this screen that touches the simulation,
+            // and only because the user asked for it by name.
+            Poll::Pressed('z') => manager.toggle_pause(id),
+            _ => held += REFRESH,
+        }
+    }
+}
+
 pub fn watch(manager: &Manager, screen: &mut Screen, start_at: u32) {
     let mut id = start_at;
     loop {
@@ -553,9 +709,14 @@ fn draw_table(screen: &mut Screen, t: &TableView, position: usize, total: usize)
         t.seen
     ));
     screen.line(&format!(
-        "  {} table · bets up to {}",
+        "  {} table · bets up to {} · {}",
         theme.dim(t.limit.label()),
-        theme.dim(&thousands(t.limit.ceiling(&t.cfg)))
+        theme.dim(&thousands(t.limit.ceiling(&t.cfg))),
+        if t.interest.score > 0 {
+            theme.paint(ui::theme::GOLD, t.interest.why.label())
+        } else {
+            theme.dim(t.interest.why.label())
+        }
     ));
     screen.line(&format!(
         "  {} staked here · the house is {}",
