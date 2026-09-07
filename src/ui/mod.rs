@@ -156,6 +156,46 @@ pub fn visible_len(s: &str) -> usize {
     n
 }
 
+/// Cuts a possibly-coloured string down to `width` visible columns.
+///
+/// Escapes are carried through rather than counted, and a colour left open
+/// by the cut is closed on the way out — otherwise a truncated line would
+/// bleed its colour across the rest of the screen. This is what lets a
+/// panel be laid out for one width and drawn safely in a narrower window.
+pub fn clip(s: &str, width: usize) -> String {
+    if visible_len(s) <= width {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut seen = 0;
+    let mut in_escape = false;
+    let mut painted = false;
+    for c in s.chars() {
+        if in_escape {
+            out.push(c);
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+            continue;
+        }
+        if c == '\u{1b}' {
+            out.push(c);
+            in_escape = true;
+            painted = true;
+            continue;
+        }
+        if seen == width {
+            break;
+        }
+        out.push(c);
+        seen += 1;
+    }
+    if painted {
+        out.push_str(theme::RESET);
+    }
+    out
+}
+
 /// Pads a possibly-coloured string to `width` visible columns, text first.
 /// `format!("{:<9}")` counts escape bytes as characters, so any column
 /// holding painted text has to be padded through here instead.

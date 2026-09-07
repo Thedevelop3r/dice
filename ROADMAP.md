@@ -196,7 +196,15 @@ Every phase of the roadmap is built. What was deliberately left out, and
 would be the next honest conversation rather than the next commit:
 
 - **`Config` is not persisted.** A reopened casino runs on this build's
-  defaults. It wants a settings screen more than it wants a save format.
+  defaults. There is now a casino settings screen (Options → casino
+  settings, or `[g]` on the dashboard) that changes speed, reseeds the
+  floor and starts a tournament, but what it changes still lives only for
+  as long as the floor does.
+- **The RNG seed is not persisted either, and that is deliberate.**
+  Reseeding changes a running floor; the next time the doors open, a fresh
+  seed is drawn from the clock exactly as it always was. Putting the seed
+  in the save file would mean a reopened casino replayed the same night,
+  which is not what anybody asked for.
 - **Nobody is restored into a seat**, and no tournament survives a restart.
   Both are stated in `casino/save.rs` with the reasoning; both are
   deliberate, not missing.
@@ -223,5 +231,6 @@ would be the next honest conversation rather than the next commit:
 | Analytics, leaderboards | 13, 14, 15 | **done** — `casino/analytics.rs`, the night screen, the customers screen |
 | Random events, tournaments | 16, 17 | **done** — `casino/happening.rs`, `casino/tournament.rs` |
 | Persistence | 18, 19 | **done** — `casino/save.rs`, wired into `main.rs` |
-| Tests, integration | 22, 24 | **done** — 380 tests, and `casino/walk.rs` walks all twenty-four steps |
+| Tests, integration | 22, 24 | **done** — 416 tests, and `casino/walk.rs` walks all twenty-four steps |
 | UI integration | 23 | **done** — floor, feed, spectator, night, customers, books, tourneys |
+| Operations centre | 25 | **done** — dashboard, reception/cage, operator tournaments, reseed |

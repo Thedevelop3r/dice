@@ -9,6 +9,11 @@
 //! Screens refresh on a timer and poll for keys rather than blocking on
 //! one, so a table redraws as it plays rather than only when prodded.
 
+pub mod dashboard;
+pub mod tourney_ops;
+
+pub use dashboard::dashboard;
+
 use super::config;
 use super::analytics;
 use crate::casino;
@@ -752,6 +757,111 @@ fn books(manager: &Manager, screen: &mut Screen) {
             return;
         }
     }
+}
+
+/// The casino's own settings, as opposed to the application's.
+///
+/// Small on purpose: the things here are the ones that change how the
+/// *floor* behaves, and each of them is an explicit operator command.
+pub fn settings(manager: &Manager, screen: &mut Screen) {
+    loop {
+        let view = manager.dashboard();
+        let theme = screen.theme;
+        screen.begin();
+        ui::header(screen, "CASINO SETTINGS");
+        screen.blank();
+        screen.line(&format!(
+            "  speed           {}",
+            theme.paint(ui::theme::GOLD, &config::speed_label(view.global.speed))
+        ));
+        screen.line(&format!("  tables open     {}", theme.accent(&view.global.tables.to_string())));
+        screen.line(&format!("  in the building {}", theme.accent(&view.global.crowd.to_string())));
+        screen.line(&format!("  seed            {}", theme.dim(&view.global.seed.to_string())));
+        screen.blank();
+        screen.line(&format!("   {}  {}", theme.paint(ui::theme::GOLD, "[s]"), "change the speed"));
+        screen.line(&format!("   {}  {}", theme.paint(ui::theme::GOLD, "[r]"), "reseed the casino"));
+        screen.line(&format!("   {}  {}", theme.paint(ui::theme::GOLD, "[t]"), "start a tournament"));
+        screen.blank();
+        screen.line(&theme.dim(
+            "  reseeding changes the numbers the floor rolls from here on. it does",
+        ));
+        screen.line(&theme.dim(
+            "  not touch the books, the people, the tables or anything already played.",
+        ));
+        screen.blank();
+        screen.line(&widgets::footer(&theme, &[('s', "speed"), ('r', "reseed"), ('t', "tournament"), ('q', "back")]));
+        screen.present();
+
+        match ui::choose_key(&['s', 'r', 't', 'q'], 'q') {
+            Some('s') => manager.cycle_speed(),
+            Some('r') => reseed(manager, screen),
+            Some('t') => tourney_ops::start(manager, screen),
+            _ => return,
+        }
+    }
+}
+
+/// Replaces the floor's random source, with the operator's say-so.
+///
+/// Reseeding is not resetting, and the difference is the whole reason this
+/// screen spells out what it will and will not do before it does it. What
+/// changes is the stream of numbers every future roll comes from. What
+/// stays is everything: the money, the people, the tables, the analytics,
+/// the tournaments already played. Destroying a casino would be a
+/// different command, and this one is not it.
+fn reseed(manager: &Manager, screen: &mut Screen) {
+    let theme = screen.theme;
+    let current = manager.seed();
+    // Drawn from the clock, the same way the casino's opening seed is.
+    let proposed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x5EED)
+        ^ current.rotate_left(17);
+
+    screen.begin();
+    ui::header(screen, "RESEED CASINO");
+    screen.blank();
+    screen.line(&format!("  current seed    {}", theme.dim(&current.to_string())));
+    screen.line(&format!("  new seed        {}", theme.paint(ui::theme::GOLD, &proposed.to_string())));
+    screen.blank();
+    screen.line("  this changes how the rest of the night will go — every roll, every");
+    screen.line("  arrival, every tournament draw from here comes from the new seed.");
+    screen.blank();
+    screen.line(&theme.dim("  it does NOT touch:"));
+    screen.line(&theme.dim("    the books, or a single figure in them"));
+    screen.line(&theme.dim("    the people the casino knows, or anything they have done"));
+    screen.line(&theme.dim("    the tables on the floor, or the rounds they have played"));
+    screen.line(&theme.dim("    tournaments, finished or under way"));
+    screen.blank();
+    screen.line(&theme.dim("  the floor is not stopped for this; the swap happens between two ticks."));
+    screen.blank();
+    screen.line(&widgets::footer(&theme, &[('y', "reseed"), ('n', "cancel")]));
+    screen.present();
+
+    if !ui::confirm_key(false) {
+        // Cancelling does nothing at all — not even a redraw of the floor.
+        return;
+    }
+    let (was, now) = manager.reseed(proposed);
+    screen.begin();
+    ui::header(screen, "RESEED CASINO");
+    screen.blank();
+    screen.line(&format!("  {}", theme.win("the shoe has been changed.")));
+    screen.blank();
+    screen.line(&format!("  was             {}", theme.dim(&was.to_string())));
+    screen.line(&format!("  now             {}", theme.paint(ui::theme::GOLD, &now.to_string())));
+    screen.blank();
+    screen.line(&theme.dim("  the casino carried on through it — nothing was stopped or lost."));
+    screen.blank();
+    screen.line(&theme.dim(
+        "  a seed is a property of a running floor, not of the saved casino: the",
+    ));
+    screen.line(&theme.dim(
+        "  next time the doors open, a fresh one is drawn, exactly as it always was.",
+    ));
+    screen.present();
+    ui::pause(screen);
 }
 
 /// Hundredths of a percent, as a percentage: `415` reads `4.15%`.

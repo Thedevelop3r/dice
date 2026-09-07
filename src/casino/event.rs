@@ -62,8 +62,12 @@ pub enum Event {
 
     /// A patron sat down, having bought in at the cage.
     Arrived { patron: u64, who: String, table: u32, table_name: String, chips: i64 },
-    /// A patron got up. `net` is chips against what they bought in for.
-    Left { patron: u64, who: String, table: u32, net: i64, reason: Departure },
+    /// A patron got up. `net` is chips against what they bought in for;
+    /// `cashed` is the cash the cage actually handed back for the chips
+    /// they were holding. The second figure is on the event because only
+    /// the bank knows the sell rate, and a reader must never have to guess
+    /// at the house's spread.
+    Left { patron: u64, who: String, table: u32, net: i64, reason: Departure, cashed: i64 },
 
     /// One settled bet. Almost always `Routine`; the weight is decided by
     /// the size of the swing, not by the variant.
@@ -85,6 +89,11 @@ pub enum Event {
 
     /// Something happened in a tournament.
     Tourney { name: String, what: String },
+
+    /// The floor's random source was replaced. Announced because it
+    /// changes how the rest of the night will go, and because an operator
+    /// who does it deserves to see that it happened.
+    Reseeded { was: u64, now: u64 },
 
     /// The building's running costs came due. Periodic, so it belongs on
     /// the feed — unlike a wager, there are only a handful an hour.
@@ -178,6 +187,7 @@ impl Event {
                 }
             }
             Event::Tourney { name, what } => format!("{name} {what}"),
+            Event::Reseeded { was, now } => format!("the shoe was changed — seed {was} is now {now}"),
             Event::Costs { overhead, staffing, tables } => {
                 format!("Costs: ${overhead} on the building, ${staffing} on staff for {tables} tables")
             }
@@ -435,7 +445,7 @@ mod tests {
             Event::TableClosed { table: 1, name: "T".into(), take: -5 },
             Event::TablePaused { table: 1, name: "T".into(), paused: true },
             Event::Arrived { patron: 1, who: "A".into(), table: 1, table_name: "T".into(), chips: 10 },
-            Event::Left { patron: 1, who: "A".into(), table: 1, net: -3, reason: Departure::Busted },
+            Event::Left { patron: 1, who: "A".into(), table: 1, net: -3, reason: Departure::Busted, cashed: 0 },
             Event::Settled {
                 patron: 1,
                 who: "A".into(),

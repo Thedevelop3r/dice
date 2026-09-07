@@ -314,6 +314,11 @@ pub struct Instance {
     pub returned: i64,
     /// Simulated time at which this table opened.
     pub opened: Duration,
+    /// Simulated time at which this table last settled a round. Stamped
+    /// when the round happens rather than worked out afterwards from
+    /// `next_at`, so "quiet for a minute" means what it says even on a
+    /// table that has been paused, resumed, or had its pace changed.
+    pub last_at: Duration,
     /// Patrons who have come and gone since the table opened.
     pub seen: u32,
     /// How many seats the table currently wants filled.
@@ -348,6 +353,7 @@ impl Instance {
             staked: 0,
             returned: 0,
             opened: now,
+            last_at: now,
             seen: 0,
             wanted: seats,
             number,
@@ -463,6 +469,7 @@ impl Instance {
         if self.history.len() > HISTORY {
             self.history.remove(0);
         }
+        self.last_at = *now;
         self.next_at += self.kind.pace();
     }
 
