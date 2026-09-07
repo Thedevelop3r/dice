@@ -3,8 +3,9 @@
 A casino console in Rust — **zero external crates**, including its own PRNG
 and its own raw-terminal input (direct `termios(3)` FFI, no `crossterm`).
 Twenty-four tables across four rooms, every one of them animated, every one
-able to run itself with nobody watching — and a whole casino that keeps
-running on its own thread while you play something else.
+able to run itself with nobody watching — a whole casino that keeps running
+on its own thread while you play something else, and an operations centre
+to watch the lot of it from.
 
 ```
 cargo run --release
@@ -38,8 +39,9 @@ and your prompt looks exactly as it did before you ran it once you quit.
 ## The floor
 
 Two dozen tables will not fit on one readable menu, so the floor is grouped
-the way a real one is. The dashboard opens four rooms, plus the idle
-screens, the Store, your Stats, the Casino's own books and the Rules.
+the way a real one is. The main menu opens four rooms, plus the idle
+screens, the Store, your Stats, the Casino's own books, the Rules — and
+`[D]`, the casino's operations centre.
 
 ### Dice tables
 
@@ -154,6 +156,69 @@ independently of whatever screen you happen to be looking at.
   stay on screen everywhere in the app, including in the middle of a hand
   you are playing yourself.
 
+### The operations centre
+
+`[D]` from the main menu opens the casino from the other side of the desk —
+one screen showing the whole building at once, in four sections:
+
+```
+┌──────────────────────────────────┬──────────────────────────────────┐
+│ 1. LIVE GAMES                    │ 2. FINANCIALS                    │
+│   every table, round, seats,     │   money, chips, GGR, hold,       │
+│   pot, utilization, house take   │   costs, the bottom line,        │
+│   and which ones have gone quiet │   buy-ins, cash-outs, cage flow  │
+├──────────────────────────────────┼──────────────────────────────────┤
+│ 3. EVENTS & TOURNAMENTS          │ 4. RECEPTION / CAGE              │
+│   what is on, who is leading,    │   who is in the building, what   │
+│   prize pools — and the feed     │   they are holding, and every    │
+│   of what just happened          │   movement across the counter    │
+└──────────────────────────────────┴──────────────────────────────────┘
+```
+
+`J`/`K` move within a section, `H`/`L` or Tab move between them, `Enter`
+opens whatever is selected, `Q` goes back. The layout follows your window:
+four panels side by side on a wide terminal, four stacked on a tall narrow
+one, and one at a time behind a `[1][2][3][4]` tab strip when there is no
+room for more. Nothing is ever drawn wider than the window it is in.
+
+Opening something never builds a second version of it. Selecting a table
+opens the table that has been running all along; the books drill down into
+the ledger screen that already existed; a tournament opens its own overview,
+its whole field, and — once it is over — its final standings and what it
+came to. The floor carries on the entire time, and closing the dashboard is
+as invisible to the simulation as opening it.
+
+- **The cage** is new, and it is where the casino stops being an abstraction.
+  Somebody walks in, hands over cash, gets chips at 10 to the dollar, plays,
+  and brings whatever is left back to the counter at 12 to the dollar. All of
+  that was already happening; now there is a day book of it — who came in,
+  what they bought, who cashed out and for how much, and the biggest movement
+  either way tonight. Select anybody in the building to see their visit: what
+  they brought, what they are holding, what it is worth back at the counter,
+  and what they are up or down across every visit they have ever made.
+- **`T` — start a tournament.** Pick the game, the size of the field, the
+  entry and the starting stack; the runners are drawn from the people the
+  casino already knows, and only if the building genuinely cannot field
+  enough are more minted into the roster proper — they keep their names and
+  their records afterwards. Nobody is topped up to afford a ticket they
+  cannot afford. It then plays itself down on the simulation thread whether
+  or not you stay to watch, and you can leave, come back and find it three
+  rounds further on.
+- **`G` — casino settings.** Speed, starting a tournament, and reseeding.
+
+### Reseeding
+
+**Reseed is not reset**, and the two are deliberately different things.
+Reseeding replaces the stream of numbers the floor rolls from here on — and
+touches nothing else. The books, the people the casino knows, the tables on
+the floor, the rounds already played, the analytics and every finished
+tournament all stay exactly as they were. The simulation is not even stopped
+for it: the swap happens between two ticks.
+
+The seed belongs to a *running* floor rather than to the saved casino, so it
+is not written to the save file. Open the doors again tomorrow and a fresh
+one is drawn, exactly as it always was.
+
 Patrons are people the building knows. Each has an archetype — conservative,
 gambler, strategist, chaser, whale, beginner, hunch player — which sets the
 bands four traits are rolled within: nerve, appetite, discipline and read.
@@ -176,15 +241,13 @@ suddenly wants a seat at, a short-staffed shift. Every one of them moves a
 rate or a cost. Not one of them touches a payout.
 
 Money and chips are separate quantities, and the books say so: the handle
-and the gaming win are counted in chips, the bottom line in cash. Tables
-have limits, the top tier gets a higher one and a room of its own, the
-building charges its own running costs, and it all carries on from where it
-was the next time you open the doors.
-
-Money and chips are separate quantities. Chips move bet by bet at the
-tables; money moves only at the cage, where the house sells chips at 10 to
-the dollar and buys them back at 12 — so it takes a cut on every visit
-before anyone places a bet.
+and the gaming win are counted in chips, the bottom line in cash. Chips move
+bet by bet at the tables; money moves only at the cage, where the house
+sells chips at 10 to the dollar and buys them back at 12 — so it takes a cut
+on every visit before anyone places a bet. Tables have limits, the top tier
+gets a higher one and a room of its own, the building charges its own
+running costs, and it all carries on from where it was the next time you
+open the doors.
 
 ## Idle screens
 
@@ -211,7 +274,7 @@ house's balance moves by exactly the opposite of whatever the player's
 wallet just did, so the two ledgers are always mirror images of each other.
 Store currency exchanges, item purchases and anything an idle screen does
 don't touch it: those move chips around, but they aren't a game's outcome.
-The **Casino** screen (`[C]` on the dashboard) shows the running balance,
+The **Casino** screen (`[C]` on the main menu) shows the running balance,
 lifetime collected/paid totals and a per-table breakdown; the same per-table
 numbers appear as a `house_pl` line under each game on the **Stats** screen.
 
@@ -243,7 +306,7 @@ that touch nothing in the games that came before them.
   uses to time-slice tables that don't know they're being cycled.
 - `src/games/floor.rs` — which tables exist, and the screensaver that walks
   them.
-- `src/casino/` — the background simulation, in fourteen pieces:
+- `src/casino/` — the background simulation, in sixteen pieces:
   `config.rs` (every tunable, so no threshold is written down where it is
   used), `clock.rs` (simulated time, so 0.25x means fewer rounds rather than
   the same rounds drawn slower), `event.rs` (the bus; publishers push,
@@ -254,9 +317,22 @@ that touch nothing in the games that came before them.
   table), `demand.rs` (what the room is in the mood for, and how full it has
   been), `happening.rs` (what is going on tonight), `interest.rs` (how worth
   watching a table is), `analytics.rs` (the night in bounded time buckets,
-  never recomputed), `tournament.rs`, `save.rs` (versioned, migrated,
-  written atomically), `manager.rs` (the simulation thread), and `ui.rs`
+  never recomputed), `tournament.rs`, `reception.rs` (the front desk and the
+  cage, fed from the event bus and owning no money of its own),
+  `dashboard.rs` (the operations centre's read models — views over
+  everything above, and a source of truth for nothing), `save.rs`
+  (versioned, migrated, written atomically), `manager.rs` (the simulation
+  thread), and `ui.rs` with `ui/dashboard.rs` and `ui/tourney_ops.rs`
   (screens that draw snapshots and never run anything).
+
+  The rule that keeps that honest: **the UI is a viewer, not a driver.**
+  Nothing under `casino/ui` may advance a simulation, and nothing above
+  `manager` may hold game state. The dashboard is the sharpest test of it —
+  it shows the whole building and owns not one figure on the screen. Every
+  number is a copy of one the bank, the roster, the feed, the analytics or
+  the tournament system already had, taken in a single pass under the
+  simulation's own lock and drawn only after the lock is released, so
+  reading the casino can never stall it.
 - `src/economy.rs` — `Wallet` (the player's chips, dollars and inventory)
   and `House`, the casino's mirror-image ledger, recorded explicitly at each
   game's settlement point rather than hooked generically into `Wallet`
@@ -276,6 +352,9 @@ that touch nothing in the games that came before them.
   Dice history log alongside it
 - A live house ledger (`Casino` screen) tracking the casino's own profit
   and loss, mirror-image to the player's wallet, across every wagering table
+- A four-section operations dashboard (`[D]`) over the running casino —
+  tables, books, events and the cage — that adapts to the terminal and
+  cannot disturb the thing it is watching
 - Idle/attract mode for every wagering table, plus a floor-wide screensaver
 - Reproducible sessions: `DICE_SEED=42 cargo run`
 - Persistent inventory: consumables (reroll, insurance, charm) and permanent
@@ -288,7 +367,7 @@ that touch nothing in the games that came before them.
 cargo test
 ```
 
-380 tests, covering dice-notation parsing, roll uniformity, seeded
+416 tests, covering dice-notation parsing, roll uniformity, seeded
 reproducibility, every Yahtzee scoring category, Luck Bet hit/sweep
 resolution, Roulette's payout table, Blackjack's hand totals, Ultra Casino
 Dice's pot math, the house ledger's zero-sum invariant, and the render
@@ -302,6 +381,14 @@ fails to write leaves the previous one exactly where it was, and — in
 `casino/walk.rs` — one long test that opens a casino, runs a night through
 it, and checks all twenty-four things end to end, from the doors opening to
 reopening it from disk afterwards.
+
+The operations centre is tested for what it must *not* do as much as for
+what it shows: that hammering the dashboard leaves the floor plan, the seed,
+the books and the rounds untouched; that opening a table from it inspects
+the one already running rather than making another; that reseeding changes
+the seed and nothing else; that a tournament nobody can afford is refused
+and every chip taken is handed back; and that no panel ever draws wider than
+the box it was given, at eight terminal widths and five heights.
 
 ### The house auditor
 
