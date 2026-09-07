@@ -194,6 +194,16 @@ impl Roster {
         all
     }
 
+    /// The `n` people who have been in most often, best first — the
+    /// regulars, which is a different list from the big spenders and often
+    /// a more interesting one.
+    pub fn by_visits(&self, n: usize) -> Vec<&Patron> {
+        let mut all: Vec<&Patron> = self.people.values().collect();
+        all.sort_by(|a, b| b.lifetime.visits.cmp(&a.lifetime.visits).then(a.id.cmp(&b.id)));
+        all.truncate(n);
+        all
+    }
+
     /// How the population breaks down by tier, lowest tier first.
     pub fn by_tier(&self, cfg: &Config) -> Vec<usize> {
         let mut counts = vec![0usize; cfg.tiers.len()];

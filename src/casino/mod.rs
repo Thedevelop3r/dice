@@ -8,6 +8,8 @@
 //! - [`config`] — every tunable number: table limits, tier thresholds,
 //!   event thresholds, clock speed, what the lights cost. Nothing is
 //!   hard-coded at the point that uses it.
+//! - [`analytics`] — what the night has looked like: bucketed time ranges
+//!   and per-game figures, all of it accumulated, none of it recomputed.
 //! - [`clock`] — simulated time. Everything paced reads it, so one speed
 //!   setting moves the whole casino together.
 //! - [`demand`] — what the floor is in the mood for, and how full its
@@ -35,6 +37,7 @@
 //! Nothing under `ui` may advance a simulation, and nothing above `manager`
 //! may hold game state.
 
+pub mod analytics;
 pub mod bank;
 pub mod clock;
 pub mod config;

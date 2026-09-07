@@ -17,6 +17,7 @@
 //! across a render or a keypress, so the UI can never stall the floor and
 //! the floor can never stall the UI.
 
+use super::analytics::{Games, Series, Span, Tally};
 use super::bank::{Bank, Expense, Movement, OPENING_CHIPS, OPENING_MONEY};
 use super::clock::{Clock, Every};
 use super::config::{self, Config};
@@ -39,6 +40,10 @@ use std::time::{Duration, Instant};
 /// small enough that copying it under the lock stays trivial.
 const FEED_LINES: usize = 64;
 
+/// How many names a leaderboard carries, and how many buckets the shape of
+/// the night is drawn from.
+const BOARD: usize = 8;
+
 /// Everything the running casino owns. Only ever touched behind the mutex.
 struct Floor {
     bank: Bank,
@@ -60,6 +65,11 @@ struct Floor {
     door: Every,
     /// What the room is in the mood for, and how full it has been.
     demand: Demand,
+    /// What the night has looked like: a bounded bucketed history, and the
+    /// same six figures for every game. Written once per round, never
+    /// recomputed.
+    series: Series,
+    games: Games,
     started: Instant,
 }
 
@@ -94,7 +104,7 @@ impl Floor {
             }
             let seated: Vec<u64> = self.instances[i].patrons.clone();
             for pid in seated {
-                let Floor { roster, rng, cfg, bank, feed, instances, .. } = self;
+                let Floor { roster, rng, cfg, bank, feed, instances, series, .. } = self;
                 let Some(p) = roster.get_mut(pid) else {
                     instances[i].stand(pid);
                     continue;
@@ -110,6 +120,7 @@ impl Floor {
                 // instead of every table sitting at a fixed size forever.
                 instances[i].reconsider_size(rng);
                 feed.push(now, Weight::Notable, Event::Left { patron: pid, who, table: instances[i].id, net, reason: why });
+                series.record(&Tally { departures: 1, ..Tally::default() });
             }
         }
 
@@ -144,7 +155,7 @@ impl Floor {
             if hungry.is_empty() {
                 break;
             }
-            let Floor { roster, rng, cfg, bank, feed, instances, demand, .. } = self;
+            let Floor { roster, rng, cfg, bank, feed, instances, demand, series, .. } = self;
             let Some(pid) = roster.waiting(rng) else { break };
             let Some(p) = roster.get_mut(pid) else { break };
 
@@ -189,6 +200,7 @@ impl Floor {
                 Weight::Notable,
                 Event::Arrived { patron: pid, who, table: table_id, table_name, chips },
             );
+            series.record(&Tally { arrivals: 1, ..Tally::default() });
         }
 
         // 5. Anybody still standing about with nowhere to sit may give up
@@ -252,6 +264,7 @@ impl Floor {
     fn tick(&mut self, wall: Instant) {
         self.clock.advance(wall);
         let now = self.clock.now();
+        self.series.advance(now);
         self.lifecycle(now);
         self.pay_the_bills(now);
         self.read_the_room(now);
@@ -274,6 +287,22 @@ impl Floor {
                     now,
                 };
                 self.instances[i].play_round(&mut sim);
+                // The round that just happened is folded into the night's
+                // figures here, once, from the log it already produced.
+                // Nothing walks history to work any of this out later.
+                if let Some(log) = self.instances[i].last_round() {
+                    let t = Tally {
+                        handle: log.pot,
+                        payouts: log.paid,
+                        bets: log.seats.len() as u64,
+                        rounds: 1,
+                        arrivals: 0,
+                        departures: 0,
+                        biggest_win: log.seats.iter().map(|s| s.returned - s.staked).max().unwrap_or(0).max(0),
+                    };
+                    self.series.record(&t);
+                    self.games.record(self.instances[i].kind.key(), &t);
+                }
                 played += 1;
             }
             if self.instances[i].next_at + Duration::from_secs(5) < now {
@@ -359,6 +388,15 @@ pub struct FloorView {
     /// The whole floor's occupancy, in permille of seats offered.
     pub occupancy: i64,
     pub movements: Vec<(Movement, u64, i64)>,
+    /// The night in slices, and every game measured the same way.
+    pub spans: Vec<(Span, Tally)>,
+    pub games: Vec<(&'static str, Tally)>,
+    /// The handle in each of the last few buckets, oldest first.
+    pub shape: Vec<i64>,
+    /// The leaderboards: most turnover, most won, most visits.
+    pub top_turnover: Vec<(String, i64, u32)>,
+    pub top_winners: Vec<(String, i64, i64)>,
+    pub top_regulars: Vec<(String, u32, &'static str)>,
     pub cfg: Config,
     /// Whether the simulation thread is still turning.
     pub running: bool,
@@ -391,6 +429,8 @@ impl Manager {
             rent: Every::new(Config::default().expense_period, Duration::ZERO),
             door: Every::new(Config::default().arrivals_period, Duration::ZERO),
             demand: Demand::new(&Config::default(), Duration::ZERO),
+            series: Series::new(),
+            games: Games::new(),
             cfg: Config::default(),
             clock: Clock::new(config::SPEED_UNIT),
             feed: Feed::new(Config::default().feed_capacity),
@@ -619,6 +659,12 @@ impl Manager {
                 demand: Vec::new(),
                 occupancy: 0,
                 movements: Vec::new(),
+                spans: Vec::new(),
+                games: Vec::new(),
+                shape: Vec::new(),
+                top_turnover: Vec::new(),
+                top_winners: Vec::new(),
+                top_regulars: Vec::new(),
                 cfg: Config::default(),
                 running: false,
             };
@@ -651,6 +697,30 @@ impl Manager {
             demand: f.demand.ranked(),
             occupancy: f.demand.overall_utilization(),
             movements: f.bank.movements(),
+            spans: Span::ALL.iter().map(|s| (*s, f.series.range(*s, now))).collect(),
+            games: f.games.by_handle(),
+            shape: f.series.recent_handle(BOARD),
+            top_turnover: f
+                .roster
+                .by_turnover(BOARD)
+                .iter()
+                .filter(|p| p.lifetime.staked > 0)
+                .map(|p| (p.name.clone(), p.lifetime.staked, p.lifetime.visits))
+                .collect(),
+            top_winners: f
+                .roster
+                .by_winnings(BOARD)
+                .iter()
+                .filter(|p| p.lifetime.net() > 0)
+                .map(|p| (p.name.clone(), p.lifetime.net(), p.lifetime_luck()))
+                .collect(),
+            top_regulars: f
+                .roster
+                .by_visits(BOARD)
+                .iter()
+                .filter(|p| p.lifetime.visits > 0)
+                .map(|p| (p.name.clone(), p.lifetime.visits, p.style()))
+                .collect(),
             cfg: f.cfg.clone(),
             running: self.is_running(),
         }

@@ -203,7 +203,7 @@ nothing recomputed per frame that can be accumulated per event.
 | Transactions and expenses | 6, 7 | **done** — `Movement`/`Expense` in `bank.rs`, `Floor::pay_the_bills`, the books screen |
 | Demand | 8 | **done** — `casino/demand.rs`, arrival rate, occupancy |
 | Feed, notifications, spectator, follow | 9, 10, 11, 12 | **done** — feed screen, Major notifications, `spectate`, `casino/interest.rs` |
-| Analytics, leaderboards | 13, 14, 15 | pending |
+| Analytics, leaderboards | 13, 14, 15 | **done** — `casino/analytics.rs`, the night screen, the customers screen |
 | Random events, tournaments | 16, 17 | pending |
 | Persistence | 18, 19 | pending |
 | Tests, integration | 22, 24 | pending |

@@ -32,15 +32,15 @@ The two constraints that define the whole codebase:
 
 | | |
 |---|---|
-| Source | 19,011 lines across 55 files |
-| Tests | 313, all passing |
+| Source | 19,715 lines across 56 files |
+| Tests | 325, all passing |
 | Starting balances | 10,000 chips / $9,000 — the user's own tuning in `economy.rs` |
 | Clippy | clean, zero warnings |
 | Dependencies | none |
 | Tables | 24 (8 dice, 6 card, 2 wheel, 8 arcade) |
 | Idle screens | 17 tables + a floor-wide cycler |
 | Background casino | a real simulation thread; 51 tables at 0.2% CPU |
-| Autonomous roadmap | Phases 0-12 and 20 done — see `ROADMAP.md` |
+| Autonomous roadmap | Phases 0-15 and 20 done — see `ROADMAP.md` |
 
 ---
 
@@ -179,16 +179,17 @@ src/
     mod.rs          40  what the nine pieces are and why they are separate
     config.rs      352  every tunable: limits, tiers, thresholds, speed, costs
     demand.rs      371  what the room is in the mood for + occupancy
+    analytics.rs   435  the night in bucketed time ranges + per-game figures
     interest.rs    339  how worth watching a table is, and why
     clock.rs       248  simulated time, permille speed, the `Every` period
     event.rs       413  the event bus: Event, Weight, Record, Feed
     sim.rs          45  the borrow bundle a table gets for one call
     bank.rs        471  the economy manager: movements, GGR/NGR, expenses
     patron.rs      751  archetypes, traits, presence, lifetime record
-    roster.rs      392  everyone the casino knows, seated or not
+    roster.rs      402  everyone the casino knows, seated or not
     instance.rs    845  one running table, its limit, the Kind → game mapping
-    manager.rs    1311  simulation thread, lifecycle, bills, mood, snapshots
-    ui.rs          826  floor, feed, spectator, live table, the house books
+    manager.rs    1381  simulation thread, lifecycle, bills, mood, snapshots
+    ui.rs          982  floor, feed, spectator, night, customers, books
   games/
     mod.rs         109  Ctx, Difficulty, Player, pick_difficulty
     cards.rs       443  shared deck/shoe/hand rankings  ← every card table
@@ -518,6 +519,37 @@ whether the casino opened a minute ago or has run all night, and it is
 computed once per snapshot under the lock rather than per frame. Scoring a
 table cannot touch it: there is a test that runs the scorer fifty times over
 and asserts the table is byte-for-byte where it was.
+
+### The night in numbers (session 7, Phases 13-15)
+
+`casino/analytics.rs`, and two screens: **`t`** for the night, **`c`** for
+the customers.
+
+The rule the whole file exists to enforce, stated as strongly as it can be:
+**nothing is ever recomputed from history.** Every figure on every screen is
+a sum of counters that were incremented once, when the thing they count
+happened.
+
+- **`Series`** — a bounded ring of 30-second buckets, 120 of them. A range
+  query adds up the handful of buckets it covers, so "the last ten minutes"
+  costs the same as "the last minute", both cost the same at 3am as at
+  opening, and an all-night run stops growing after the first hour.
+  `Span::AllNight` is answered from a single running total and costs
+  nothing. A long stall resyncs rather than walking ten thousand empty
+  buckets — the night's totals survive, only the shape of the recent past is
+  lost, which is the honest outcome.
+- **`Games`** — Phase 14's "common interface", and deliberately *not* a
+  trait: every game is measured by the same six numbers, keyed by the same
+  string the books and the stats file already use. A new table gets
+  analytics for free and has nowhere to hide a special case.
+- **Leaderboards** — three lists that are rarely the same people: biggest
+  spenders (lifetime turnover), up on the house (lifetime net), and
+  regulars (visits). The third could not have existed at all before patrons
+  became persistent, which is why it is worth its own column.
+
+Rounds are folded in at the point they are played, from the `RoundLog` the
+table already produced; arrivals and departures are counted in the lifecycle
+pass. `Series::advance` runs once per tick, before anything else.
 
 ---
 

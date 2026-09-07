@@ -10,6 +10,7 @@
 //! one, so a table redraws as it plays rather than only when prodded.
 
 use super::config;
+use super::analytics;
 use super::demand;
 use super::event::Weight;
 use super::instance::{Kind, Limit};
@@ -148,7 +149,7 @@ pub fn floor(manager: &Manager, screen: &mut Screen) -> Option<u32> {
         }
         screen.present();
 
-        match poll(REFRESH, &['w', 'o', 'p', 'x', 's', 'j', 'k', 'n', 'b', 'm', 'e', 'v']) {
+        match poll(REFRESH, &['w', 'o', 'p', 'x', 's', 'j', 'k', 'n', 'b', 'm', 'e', 'v', 't', 'c']) {
             Poll::Leave => return None,
             Poll::Pressed('w') => {
                 if let Some(t) = view.tables.get(cursor) {
@@ -174,6 +175,8 @@ pub fn floor(manager: &Manager, screen: &mut Screen) -> Option<u32> {
             Poll::Pressed('s') => manager.cycle_speed(),
             Poll::Pressed('m') => books(manager, screen),
             Poll::Pressed('e') => feed_screen(manager, screen),
+            Poll::Pressed('t') => night(manager, screen),
+            Poll::Pressed('c') => leaderboards(manager, screen),
             Poll::Pressed('v') => {
                 let start = manager.most_interesting().map(|(id, _)| id).or_else(|| view.tables.first().map(|t| t.id));
                 if let Some(id) = start {
@@ -307,6 +310,8 @@ fn draw_floor(screen: &mut Screen, view: &FloorView, cursor: usize) {
             ('x', "close"),
             ('v', "spectate"),
             ('e', "feed"),
+            ('t', "the night"),
+            ('c', "customers"),
             ('m', "books"),
             ('s', "speed"),
             ('q', "back"),
@@ -401,6 +406,157 @@ fn feed_screen(manager: &Manager, screen: &mut Screen) {
             Poll::Pressed('b') => only_big = true,
             Poll::Pressed('a') => only_big = false,
             _ => {}
+        }
+    }
+}
+
+/// The night so far: how it has been going, and which games carried it.
+///
+/// Every figure here is a sum of counters that were incremented once, when
+/// the thing they count happened — see `casino::analytics`. Changing the
+/// span does not recompute anything; it adds up a different handful of
+/// buckets.
+fn night(manager: &Manager, screen: &mut Screen) {
+    let mut span = analytics::Span::LastTenMinutes;
+    loop {
+        let view = manager.snapshot();
+        let theme = screen.theme;
+        screen.begin();
+        ui::header(screen, "THE NIGHT SO FAR");
+        screen.blank();
+
+        let t = view.spans.iter().find(|(s, _)| *s == span).map(|(_, t)| *t).unwrap_or_default();
+        screen.line(&format!("  {}", theme.paint(ui::theme::GOLD, span.label())));
+        screen.line(&format!(
+            "  {} staked over {} bets · average {} a bet",
+            theme.accent(&thousands(t.handle)),
+            theme.dim(&thousands(t.bets as i64)),
+            theme.dim(&thousands(t.average_bet()))
+        ));
+        screen.line(&format!(
+            "  the house kept {} — a hold of {}",
+            signed(&theme, t.ggr()),
+            theme.paint(ui::theme::GOLD, &percent(t.hold()))
+        ));
+        screen.line(&format!(
+            "  {} sat down, {} got up · biggest single hit {}",
+            theme.dim(&t.arrivals.to_string()),
+            theme.dim(&t.departures.to_string()),
+            theme.accent(&thousands(t.biggest_win))
+        ));
+        screen.blank();
+
+        // The shape of the recent past, as a bar per bucket. A picture of
+        // whether the room is picking up or dying off.
+        if view.shape.iter().any(|h| *h > 0) {
+            let peak = view.shape.iter().copied().max().unwrap_or(1).max(1);
+            screen.line(&theme.dim("  how busy it has been, oldest first"));
+            for h in view.shape.iter() {
+                let width = (h * 48 / peak).max(0) as usize;
+                screen.line(&format!(
+                    "  {} {}",
+                    pad_start(&thousands(*h), 10),
+                    theme.dim(&"\u{2588}".repeat(width))
+                ));
+            }
+            screen.blank();
+        }
+
+        screen.line(&theme.dim(&format!(
+            "  {:<14} {:>14} {:>12} {:>9} {:>12}",
+            "GAME", "STAKED", "HOUSE WIN", "HOLD", "BIGGEST HIT"
+        )));
+        if view.games.is_empty() {
+            screen.line(&theme.dim("  nothing has been played yet"));
+        }
+        for (game, g) in view.games.iter().take(10) {
+            screen.line(&format!(
+                "  {} {} {} {} {}",
+                pad_end(game, 14),
+                pad_start(&thousands(g.handle), 14),
+                pad_start(&signed(&theme, g.ggr()), 12),
+                pad_start(&percent(g.hold()), 9),
+                pad_start(&thousands(g.biggest_win), 12)
+            ));
+        }
+
+        screen.blank();
+        screen.line(&widgets::footer(&theme, &[('t', "change the span"), ('q', "back")]));
+        screen.present();
+        match poll(REFRESH, &['t']) {
+            Poll::Leave => return,
+            Poll::Pressed('t') => span = span.next(),
+            _ => {}
+        }
+    }
+}
+
+/// Who the house's customers actually are.
+///
+/// Three different questions, deliberately kept apart: who puts the most
+/// through, who is up on the house, and who keeps coming back. They are
+/// rarely the same people, and the third list is the one that could not
+/// exist at all before patrons became persistent.
+fn leaderboards(manager: &Manager, screen: &mut Screen) {
+    loop {
+        let view = manager.snapshot();
+        let theme = screen.theme;
+        screen.begin();
+        ui::header(screen, "THE HOUSE'S CUSTOMERS");
+        screen.blank();
+        screen.line(&format!(
+            "  {} people known · {} in the building",
+            theme.accent(&view.known.to_string()),
+            theme.dim(&view.crowd.to_string())
+        ));
+        screen.blank();
+
+        screen.line(&theme.dim(&format!("  BIGGEST SPENDERS{:<8} {:>14} {:>9}", "", "PUT THROUGH", "VISITS")));
+        if view.top_turnover.is_empty() {
+            screen.line(&theme.dim("  nobody has played a hand yet"));
+        }
+        for (name, staked, visits) in view.top_turnover.iter() {
+            screen.line(&format!(
+                "  {} {} {}",
+                pad_end(name, 24),
+                pad_start(&thousands(*staked), 14),
+                pad_start(&visits.to_string(), 9)
+            ));
+        }
+        screen.blank();
+
+        screen.line(&theme.dim(&format!("  UP ON THE HOUSE{:<9} {:>14} {:>9}", "", "AHEAD BY", "RUN")));
+        if view.top_winners.is_empty() {
+            screen.line(&theme.dim("  the house is beating everybody, for now"));
+        }
+        for (name, net, luck) in view.top_winners.iter() {
+            screen.line(&format!(
+                "  {} {} {}",
+                pad_end(name, 24),
+                pad_start(&theme.win(&thousands(*net)), 14),
+                pad_start(&format!("{luck}%"), 9)
+            ));
+        }
+        screen.blank();
+
+        screen.line(&theme.dim(&format!("  REGULARS{:<16} {:>14} {:>9}", "", "VISITS", "")));
+        if view.top_regulars.is_empty() {
+            screen.line(&theme.dim("  nobody has been in yet"));
+        }
+        for (name, visits, style) in view.top_regulars.iter() {
+            screen.line(&format!(
+                "  {} {} {}",
+                pad_end(name, 24),
+                pad_start(&visits.to_string(), 14),
+                pad_start(&theme.dim(style), 16)
+            ));
+        }
+
+        screen.blank();
+        screen.line(&widgets::footer(&theme, &[('q', "back to the floor")]));
+        screen.present();
+        if let Poll::Leave = poll(REFRESH, &[]) {
+            return;
         }
     }
 }
