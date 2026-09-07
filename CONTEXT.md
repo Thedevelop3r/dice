@@ -32,15 +32,15 @@ The two constraints that define the whole codebase:
 
 | | |
 |---|---|
-| Source | 19,715 lines across 56 files |
-| Tests | 325, all passing |
+| Source | 21,267 lines across 58 files |
+| Tests | 355, all passing |
 | Starting balances | 10,000 chips / $9,000 — the user's own tuning in `economy.rs` |
 | Clippy | clean, zero warnings |
 | Dependencies | none |
 | Tables | 24 (8 dice, 6 card, 2 wheel, 8 arcade) |
 | Idle screens | 17 tables + a floor-wide cycler |
 | Background casino | a real simulation thread; 51 tables at 0.2% CPU |
-| Autonomous roadmap | Phases 0-15 and 20 done — see `ROADMAP.md` |
+| Autonomous roadmap | Phases 0-17 and 20 done — see `ROADMAP.md` |
 
 ---
 
@@ -177,19 +177,21 @@ src/
     widgets.rs     143  number_picker, text_input, footer, banner, bar
   casino/                  ← the background simulation (session 6-7)
     mod.rs          40  what the nine pieces are and why they are separate
-    config.rs      352  every tunable: limits, tiers, thresholds, speed, costs
+    config.rs      411  every tunable: limits, tiers, thresholds, speed, costs
     demand.rs      371  what the room is in the mood for + occupancy
     analytics.rs   435  the night in bucketed time ranges + per-game figures
+    happening.rs   420  things that happen to the room: rates and costs only
+    tournament.rs  600  a fixed field playing down to one winner
     interest.rs    339  how worth watching a table is, and why
     clock.rs       248  simulated time, permille speed, the `Every` period
-    event.rs       413  the event bus: Event, Weight, Record, Feed
+    event.rs       460  the event bus: Event, Weight, Record, Feed
     sim.rs          45  the borrow bundle a table gets for one call
     bank.rs        471  the economy manager: movements, GGR/NGR, expenses
     patron.rs      751  archetypes, traits, presence, lifetime record
     roster.rs      402  everyone the casino knows, seated or not
     instance.rs    845  one running table, its limit, the Kind → game mapping
-    manager.rs    1381  simulation thread, lifecycle, bills, mood, snapshots
-    ui.rs          982  floor, feed, spectator, night, customers, books
+    manager.rs    1762  simulation thread, lifecycle, bills, mood, tourneys
+    ui.rs         1043  floor, feed, spectator, night, customers, books, tourneys
   games/
     mod.rs         109  Ctx, Difficulty, Player, pick_difficulty
     cards.rs       443  shared deck/shoe/hand rankings  ← every card table
@@ -550,6 +552,52 @@ happened.
 Rounds are folded in at the point they are played, from the `RoundLog` the
 table already produced; arrivals and departures are counted in the lifecycle
 pass. `Series::advance` runs once per tick, before anything else.
+
+### Weather and tournaments (session 7, Phases 16-17)
+
+**`casino/happening.rs`** — things that happen to the room: a rush on the
+doors, a quiet spell, word getting round about one game, somebody worth
+looking at walking in, being short-staffed, a comp night. Shown at the top
+of the floor screen (`tonight: …`) and announced on the feed.
+
+Every one of them moves **a rate or a cost, and nothing else**. There is no
+variant that can make a table pay better, and the test
+`no_happening_can_ever_touch_a_payout` is written so that adding one breaks
+the build. Effects multiply rather than override, so a rush during a comp
+night is genuinely busier and a lull cancels a rush out instead of one of
+them silently winning.
+
+**`casino/tournament.rs`** — a fixed field, everybody level, playing down to
+one winner. Press **`r`**. The bracket is by *survival* rather than pairings:
+every survivor plays the same hands at the same ante each round and the
+short stacks go out, so the field halves (128 → 64 → 32 …) to a final table
+and then to a winner. Hands are resolved by the same `Kind::resolve` a cash
+table uses — a short stack does not get luckier because it would be a better
+story.
+
+Money: entries come out of patrons' own chips, the house takes
+`cfg.tourney_rake` **once, at the door**, and the pool is paid back out in
+full — the last place paid absorbs the rounding, so nothing is lost to
+integer division. Tournament chips are a separate scoring currency that
+never touches the tray. A tournament that does not fill is called off and
+every chip goes back, rake included.
+
+Two ordering facts that are load-bearing, both found by a failing test:
+
+- **`run_tournaments` runs before `seat_the_room`.** Registration and
+  seating draw from the same pool of people standing about, and whichever
+  runs first takes the lot. With seating first, a tournament could never
+  field anybody at all. That is why the lifecycle's seating pass is now its
+  own method.
+- **A finished tournament's retention window is measured from when it
+  *finished*, not when it started.** Measured from the start, one that took
+  an hour to play down was forgotten the instant somebody won it — exactly
+  the moment anybody would want to look at it.
+
+Entering a tournament counts as starting a visit, so somebody who has just
+walked in buys chips at the cage first, exactly as they would sitting down.
+Entrants are `Presence::InTournament`, which is why the seating loop leaves
+them alone.
 
 ---
 

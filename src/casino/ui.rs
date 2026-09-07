@@ -149,7 +149,7 @@ pub fn floor(manager: &Manager, screen: &mut Screen) -> Option<u32> {
         }
         screen.present();
 
-        match poll(REFRESH, &['w', 'o', 'p', 'x', 's', 'j', 'k', 'n', 'b', 'm', 'e', 'v', 't', 'c']) {
+        match poll(REFRESH, &['w', 'o', 'p', 'x', 's', 'j', 'k', 'n', 'b', 'm', 'e', 'v', 't', 'c', 'r']) {
             Poll::Leave => return None,
             Poll::Pressed('w') => {
                 if let Some(t) = view.tables.get(cursor) {
@@ -177,6 +177,7 @@ pub fn floor(manager: &Manager, screen: &mut Screen) -> Option<u32> {
             Poll::Pressed('e') => feed_screen(manager, screen),
             Poll::Pressed('t') => night(manager, screen),
             Poll::Pressed('c') => leaderboards(manager, screen),
+            Poll::Pressed('r') => tourneys(manager, screen),
             Poll::Pressed('v') => {
                 let start = manager.most_interesting().map(|(id, _)| id).or_else(|| view.tables.first().map(|t| t.id));
                 if let Some(id) = start {
@@ -233,6 +234,13 @@ fn draw_floor(screen: &mut Screen, view: &FloorView, cursor: usize) {
             .collect::<Vec<_>>()
             .join(" · ")
     )));
+    // Whatever is going on in the building tonight, said plainly at the
+    // top where it belongs — it is the reason the numbers below look the
+    // way they do.
+    if !view.weather.is_empty() {
+        let going: Vec<String> = view.weather.iter().map(|g| theme.paint(ui::theme::GOLD, g.what.label())).collect();
+        screen.line(&format!("  tonight: {}", going.join(theme.dim(" · ").as_str())));
+    }
     if view.speed != config::SPEED_UNIT {
         // At anything but real time the two clocks diverge, and the one the
         // simulation actually runs on is the one worth showing.
@@ -312,6 +320,7 @@ fn draw_floor(screen: &mut Screen, view: &FloorView, cursor: usize) {
             ('e', "feed"),
             ('t', "the night"),
             ('c', "customers"),
+            ('r', "tourneys"),
             ('m', "books"),
             ('s', "speed"),
             ('q', "back"),
@@ -553,6 +562,58 @@ fn leaderboards(manager: &Manager, screen: &mut Screen) {
         }
 
         screen.blank();
+        screen.line(&widgets::footer(&theme, &[('q', "back to the floor")]));
+        screen.present();
+        if let Poll::Leave = poll(REFRESH, &[]) {
+            return;
+        }
+    }
+}
+
+/// The tournaments, live.
+///
+/// A tournament is not a table you can sit at, so it gets its own screen
+/// rather than a row on the floor: a field playing itself down, the
+/// standings, and — when it is over — who got paid what.
+fn tourneys(manager: &Manager, screen: &mut Screen) {
+    loop {
+        let view = manager.snapshot();
+        let theme = screen.theme;
+        screen.begin();
+        ui::header(screen, "TOURNAMENTS");
+        screen.blank();
+        if view.tourneys.is_empty() {
+            screen.line(&theme.dim("  none on at the moment — one starts up every so often"));
+            screen.line(&theme.dim(&format!(
+                "  entry {} chips, {}% to the house, {} to start with",
+                thousands(view.cfg.tourney_buy_in),
+                view.cfg.tourney_rake,
+                thousands(view.cfg.tourney_stack)
+            )));
+        }
+        for t in view.tourneys.iter().take(3) {
+            screen.line(&format!(
+                "  {} · {} · {}",
+                theme.accent(&t.name),
+                theme.paint(ui::theme::GOLD, &t.stage.label()),
+                theme.dim(&format!("{} entered · pool {}", t.entered(), thousands(t.pool)))
+            ));
+            if !t.paid.is_empty() {
+                for pay in t.paid.iter().take(6) {
+                    screen.line(&format!(
+                        "    {} {} {}",
+                        pad_start(&format!("{}.", pay.place), 5),
+                        pad_end(&pay.name, 24),
+                        pad_start(&theme.win(&thousands(pay.prize)), 12)
+                    ));
+                }
+            } else {
+                for e in t.standings(8) {
+                    screen.line(&format!("    {} {}", pad_end(&e.name, 26), pad_start(&thousands(e.stack), 12)));
+                }
+            }
+            screen.blank();
+        }
         screen.line(&widgets::footer(&theme, &[('q', "back to the floor")]));
         screen.present();
         if let Poll::Leave = poll(REFRESH, &[]) {

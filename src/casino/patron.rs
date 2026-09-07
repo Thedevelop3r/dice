@@ -164,6 +164,9 @@ pub enum Presence {
     Looking,
     /// Sat at this table.
     Seated { table: u32 },
+    /// In a tournament. In the building and busy, but not at a cash table
+    /// — which is what stops the seating loop offering them a chair.
+    InTournament { id: u32 },
 }
 
 impl Presence {
@@ -176,6 +179,11 @@ impl Presence {
 
     pub fn is_here(self) -> bool {
         !matches!(self, Presence::Away { .. })
+    }
+
+    /// Whether they are free to be offered a seat.
+    pub fn is_free(self) -> bool {
+        matches!(self, Presence::Looking)
     }
 }
 

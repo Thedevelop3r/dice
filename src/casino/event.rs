@@ -80,6 +80,12 @@ pub enum Event {
     /// weather, not news.
     Mood { game: &'static str, appeal: i64 },
 
+    /// Something started or finished going on in the building.
+    Happening { what: super::happening::Happening, game: Option<&'static str>, on: bool },
+
+    /// Something happened in a tournament.
+    Tourney { name: String, what: String },
+
     /// The building's running costs came due. Periodic, so it belongs on
     /// the feed — unlike a wager, there are only a handful an hour.
     Costs { overhead: i64, staffing: i64, tables: usize },
@@ -164,6 +170,14 @@ impl Event {
                     format!("{game} has gone quiet")
                 }
             }
+            Event::Happening { what, game, on } => {
+                if *on {
+                    what.blurb(*game)
+                } else {
+                    format!("{} — over", what.label())
+                }
+            }
+            Event::Tourney { name, what } => format!("{name} {what}"),
             Event::Costs { overhead, staffing, tables } => {
                 format!("Costs: ${overhead} on the building, ${staffing} on staff for {tables} tables")
             }
@@ -435,6 +449,9 @@ mod tests {
             Event::Tier { patron: 1, who: "A".into(), tier: 2, name: "high roller" },
             Event::Costs { overhead: 400, staffing: 90, tables: 2 },
             Event::Mood { game: "slots", appeal: 1_200 },
+            Event::Tourney { name: "Blackjack Tournament #1".into(), what: "is under way".into() },
+            Event::Happening { what: crate::casino::happening::Happening::Rush, game: None, on: true },
+            Event::Happening { what: crate::casino::happening::Happening::Craze, game: Some("keno"), on: false },
         ];
         for e in all {
             assert!(!e.describe().is_empty());

@@ -28,9 +28,13 @@
 //! - [`roster`] — everyone the casino knows, here tonight or not. Tables
 //!   hold seat ids; the people themselves live here and outlive any table
 //!   they sit at.
+//! - [`happening`] — things that happen to the room. Every one of them
+//!   moves a rate or a cost; not one of them touches a payout.
 //! - [`instance`] — one running table: its seats, its clock, its history.
 //! - [`manager`] — the simulation thread. Owns every instance, advances
 //!   them, and hands out read-only snapshots.
+//! - [`tournament`] — a fixed field playing down to one winner, on its own
+//!   clock, using the same maths the cash tables use.
 //! - [`ui`] — the screens. They draw snapshots. They never run anything.
 //!
 //! The rule that keeps it honest: **the UI is a viewer, not a driver.**
@@ -43,12 +47,14 @@ pub mod clock;
 pub mod config;
 pub mod demand;
 pub mod event;
+pub mod happening;
 pub mod instance;
 pub mod interest;
 pub mod manager;
 pub mod patron;
 pub mod roster;
 pub mod sim;
+pub mod tournament;
 pub mod ui;
 
 pub use manager::Manager;

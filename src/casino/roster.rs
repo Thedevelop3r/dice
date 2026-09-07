@@ -80,7 +80,7 @@ impl Roster {
 
     /// Everyone in the building who is not yet at a table.
     pub fn looking(&self) -> Vec<u64> {
-        self.people.iter().filter(|(_, p)| p.presence == Presence::Looking).map(|(id, _)| *id).collect()
+        self.people.iter().filter(|(_, p)| p.presence.is_free()).map(|(id, _)| *id).collect()
     }
 
     /// Everyone whose time away is up, oldest booking first.

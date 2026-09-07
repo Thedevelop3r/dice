@@ -123,6 +123,16 @@ pub struct Config {
     /// How long the spectator holds on one table before moving on.
     pub spectate_for: Duration,
 
+    // ---- things that happen to the room (Phase 16) --------------------
+    /// How often the dice are rolled on whether something happens.
+    pub happening_period: Duration,
+    /// The chance in a hundred that a roll produces one.
+    pub happening_chance: usize,
+    /// How long one runs for.
+    pub happening_for: (Duration, Duration),
+    /// How many can be going on at the same time.
+    pub happenings_at_once: usize,
+
     // ---- event thresholds (Phases 9, 10) -----------------------------
     /// A single settlement returning at least this many chips is notable.
     pub big_win: i64,
@@ -134,6 +144,30 @@ pub struct Config {
     pub jackpot_multiple: i64,
     /// How many events the feed keeps. Old ones fall off the back.
     pub feed_capacity: usize,
+
+    // ---- tournaments (Phase 17) ---------------------------------------
+    /// What it costs to enter, in chips, and what the house takes off that
+    /// as a percentage. The rake is the house's only cut: the rest of the
+    /// pool is paid back out in full.
+    pub tourney_buy_in: i64,
+    pub tourney_rake: i64,
+    /// The tournament chips everybody starts with. A score, not money.
+    pub tourney_stack: i64,
+    /// How few people it will still run with, how many hands each survivor
+    /// plays per round, and what each hand costs them.
+    pub tourney_min_field: usize,
+    pub tourney_hands: usize,
+    pub tourney_ante: i64,
+    /// How many are left when it becomes the final table.
+    pub tourney_final_table: usize,
+    /// How often a round is played, and how long registration stays open.
+    pub tourney_round_every: Duration,
+    pub tourney_registration: Duration,
+    /// How often a new one starts up.
+    pub tourney_every: Duration,
+    /// How the pool is split, as percentages, best place first. The last
+    /// place paid takes the remainder, so the pool always pays out whole.
+    pub tourney_prizes: Vec<i64>,
 
     // ---- house costs (Phase 7) ---------------------------------------
     /// How often operating costs are charged. Periodic, never per frame.
@@ -177,6 +211,11 @@ impl Default for Config {
             appeal_floor: 550,
             appeal_ceiling: 1_600,
 
+            happening_period: Duration::from_secs(45),
+            happening_chance: 35,
+            happening_for: (Duration::from_secs(120), Duration::from_secs(420)),
+            happenings_at_once: 2,
+
             interest_pot_yardstick: 500,
             interest_money: 100,
             interest_swing: 220,
@@ -189,6 +228,18 @@ impl Default for Config {
             huge_win: 15_000,
             jackpot_multiple: 25,
             feed_capacity: 512,
+
+            tourney_buy_in: 250,
+            tourney_rake: 8,
+            tourney_stack: 5_000,
+            tourney_min_field: 6,
+            tourney_hands: 12,
+            tourney_ante: 120,
+            tourney_final_table: 6,
+            tourney_round_every: Duration::from_secs(25),
+            tourney_registration: Duration::from_secs(90),
+            tourney_every: Duration::from_secs(900),
+            tourney_prizes: vec![45, 25, 15, 8, 4, 3],
 
             expense_period: Duration::from_secs(300),
             overhead_per_period: 400,
@@ -339,6 +390,14 @@ mod tests {
         assert!(cfg.roster_size > 0, "a casino with nobody in it is not a casino");
         assert!(cfg.away_for.0 < cfg.away_for.1, "the range somebody stays away must be a range");
         assert!(cfg.away_for.0 > Duration::ZERO, "nobody turns straight round at the door");
+        assert!(cfg.tourney_buy_in > 0 && (0..100).contains(&cfg.tourney_rake), "the rake must be a slice, not the lot");
+        assert!(cfg.tourney_min_field >= 2, "a tournament needs somebody to beat");
+        assert!(cfg.tourney_hands > 0 && cfg.tourney_ante > 0);
+        assert!(cfg.tourney_stack > cfg.tourney_ante, "nobody could play a single hand");
+        assert!(!cfg.tourney_prizes.is_empty() && cfg.tourney_prizes.iter().sum::<i64>() <= 100);
+        assert!(cfg.tourney_prizes.windows(2).all(|w| w[0] >= w[1]), "the prizes must fall away, not climb");
+        assert!(cfg.happening_chance > 0 && cfg.happening_chance <= 100, "nothing would ever happen");
+        assert!(cfg.happening_for.0 < cfg.happening_for.1 && cfg.happenings_at_once > 0);
         assert!(cfg.interest_pot_yardstick > 0, "the interest score would divide by zero");
         assert!(cfg.spectate_for > Duration::ZERO, "the spectator would never see anything");
         assert!(cfg.arrivals_per_period > 0 && cfg.arrivals_period > Duration::ZERO, "nobody would ever come in");

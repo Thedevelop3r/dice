@@ -22,12 +22,14 @@ use super::bank::{Bank, Expense, Movement, OPENING_CHIPS, OPENING_MONEY};
 use super::clock::{Clock, Every};
 use super::config::{self, Config};
 use super::event::{Departure, Event, Feed, Record, Weight};
+use super::happening::{Going, Happenings};
 use super::demand::{Demand, Standing};
 use super::instance::{Instance, Kind, Limit, RoundLog};
 use super::interest::{self, Interest};
-use super::patron::Patron;
+use super::patron::{Patron, Presence};
 use super::roster::{self, Roster};
 use super::sim::Sim;
+use super::tournament::{Running, Stage, Tournament};
 use crate::rng::Rng;
 use crate::ui::Badge;
 use std::collections::BTreeMap;
@@ -70,6 +72,12 @@ struct Floor {
     /// recomputed.
     series: Series,
     games: Games,
+    /// What is going on in the building tonight.
+    weather: Happenings,
+    /// Tournaments, running themselves on their own clock.
+    tourneys: Running,
+    next_tourney: Every,
+    tourneys_held: u32,
     started: Instant,
 }
 
@@ -137,7 +145,10 @@ impl Floor {
                 self.door.resync(now);
                 break;
             }
-            for _ in 0..self.cfg.arrivals_per_period {
+            // How many walk in is the configured rate, scaled by whatever
+            // is going on in the building. A rush really is a rush.
+            let wanted = (self.cfg.arrivals_per_period as i64 * self.weather.arrivals() / 1_000).max(0) as usize;
+            for _ in 0..wanted {
                 let Floor { roster, rng, cfg, .. } = self;
                 if roster.admit(rng, cfg, now).is_none() {
                     break;
@@ -146,16 +157,26 @@ impl Floor {
             }
         }
 
-        // 4. Empty seats are offered to whoever is here. A person picks the
-        //    table among those with room that most suits them — the "choose
-        //    a game" step — rather than being posted to the first vacancy.
+    }
+
+    /// Offers the empty seats to whoever is in the building and free.
+    ///
+    /// Deliberately a separate pass, run *after* the tournaments have had
+    /// their chance at the room. Registration and seating both draw from
+    /// the same pool of people standing about, and whichever runs first
+    /// takes the lot — with seating first, a tournament could never field
+    /// anybody at all. This ordering is load-bearing.
+    fn seat_the_room(&mut self, now: Duration) {
+        // A person picks the table among those with room that most suits
+        // them — the "choose a game" step — rather than being posted to the
+        // first vacancy.
         loop {
             let hungry: Vec<usize> =
                 (0..self.instances.len()).filter(|i| !self.instances[*i].paused && self.instances[*i].patrons.len() < self.instances[*i].wanted()).collect();
             if hungry.is_empty() {
                 break;
             }
-            let Floor { roster, rng, cfg, bank, feed, instances, demand, series, .. } = self;
+            let Floor { roster, rng, cfg, bank, feed, instances, demand, series, weather, .. } = self;
             let Some(pid) = roster.waiting(rng) else { break };
             let Some(p) = roster.get_mut(pid) else { break };
 
@@ -175,7 +196,10 @@ impl Floor {
                 // Their own taste, nudged by what the room is in the mood
                 // for. Appeal moves where somebody sits and nothing else.
                 let taste = p.taste(kind.variants(), kind.pace().as_millis() as u64);
-                let score = taste * demand.appeal(kind.key()) / super::demand::NEUTRAL + rng.below(25) as i64;
+                // Their taste, the room's mood, and whatever the night is
+                // doing. All three are nudges on a preference.
+                let mood = demand.appeal(kind.key()) + weather.appeal_bonus(kind.key());
+                let score = taste * mood / super::demand::NEUTRAL + rng.below(25) as i64;
                 if score > best_score {
                     best_score = score;
                     best = i;
@@ -225,9 +249,10 @@ impl Floor {
     /// skipping the ones it missed.
     fn pay_the_bills(&mut self, now: Duration) {
         let tables = self.instances.len() as i64;
+        let dearer = self.weather.costs();
         while self.rent.due(now) {
-            let overhead = self.cfg.overhead_per_period;
-            let staffing = tables * self.cfg.table_cost_per_period;
+            let overhead = self.cfg.overhead_per_period * dearer / 1_000;
+            let staffing = tables * self.cfg.table_cost_per_period * dearer / 1_000;
             self.bank.pay(Expense::Overhead, overhead);
             self.bank.pay(Expense::Staffing, staffing);
             let total = overhead + staffing;
@@ -254,9 +279,173 @@ impl Floor {
         if kinds.is_empty() {
             return;
         }
-        let Floor { demand, rng, cfg, feed, .. } = self;
+        let Floor { demand, rng, cfg, feed, weather, .. } = self;
         for (key, appeal) in demand.drift(rng, cfg, now, &kinds) {
             feed.push(now, Weight::Routine, Event::Mood { game: key, appeal });
+        }
+
+        // And whatever is going on in the building tonight. Announced at
+        // `Major`, because a coach arriving is exactly the sort of thing
+        // somebody watching the floor wants to be told about.
+        let (started, ended) = weather.tick(rng, cfg, now, &kinds);
+        for g in started {
+            feed.push(now, Weight::Major, Event::Happening { what: g.what, game: g.game, on: true });
+        }
+        for g in ended {
+            feed.push(now, Weight::Notable, Event::Happening { what: g.what, game: g.game, on: false });
+        }
+    }
+
+    /// Runs whatever tournaments are going: opens a new one when it is
+    /// time, takes entries, plays rounds, and pays the pool out.
+    ///
+    /// A tournament is on its own clock and knows nothing about the cash
+    /// tables. The only things it shares with the rest of the floor are the
+    /// people in it and the same `Kind::resolve` every table uses.
+    fn run_tournaments(&mut self, now: Duration) {
+        // Open one, if it is time and there is not one already going.
+        while self.next_tourney.due(now) {
+            if self.tourneys.values().any(|t| t.stage != Stage::Done) || self.instances.is_empty() {
+                break;
+            }
+            let kinds: Vec<Kind> = self.instances.iter().map(|t| t.kind).collect();
+            let kind = kinds[self.rng.below(kinds.len())];
+            self.tourneys_held += 1;
+            let id = self.next_id;
+            self.next_id += 1;
+            let t = Tournament::new(id, self.tourneys_held, kind, &self.cfg, now);
+            self.feed.push(now, Weight::Major, Event::Tourney { name: t.name.clone(), what: "is taking entries".into() });
+            self.tourneys.insert(id, t);
+        }
+
+        let ids: Vec<u32> = self.tourneys.keys().copied().collect();
+        for tid in ids {
+            let Some(mut t) = self.tourneys.remove(&tid) else { continue };
+            match t.stage {
+                Stage::Registering => {
+                    // Anybody in the building and free might fancy it.
+                    for pid in self.roster.looking() {
+                        if t.entered() >= 128 {
+                            break;
+                        }
+                        let Floor { roster, rng, cfg, bank, .. } = self;
+                        // Somebody who has just walked in has not been to
+                        // the cage yet — they are holding nothing. Entering
+                        // a tournament *is* starting a visit, so they buy
+                        // chips first, exactly as they would sitting down.
+                        {
+                            let Some(p) = roster.get_mut(pid) else { continue };
+                            if p.chips == 0 {
+                                let dollars = p.buy_in(rng, cfg);
+                                let chips = bank.buy_in(dollars);
+                                p.begin_visit(chips);
+                            }
+                        }
+                        if !super::tournament::would_enter(roster, pid, t.buy_in, rng) {
+                            continue;
+                        }
+                        let Some(p) = roster.get_mut(pid) else { continue };
+                        let (name, chips) = (p.name.clone(), p.chips);
+                        if t.enter(pid, name, chips, cfg).is_some() {
+                            p.chips -= t.buy_in;
+                            p.presence = Presence::InTournament { id: tid };
+                            // The buy-in is turnover and the rake is the
+                            // house's win on it, booked the same way every
+                            // other bet in this building is.
+                            let rake = t.buy_in * cfg.tourney_rake / 100;
+                            bank.settle("tourney", t.buy_in, t.buy_in - rake);
+                        }
+                    }
+                    if t.running_for(now) >= self.cfg.tourney_registration {
+                        if t.begin(&self.cfg) {
+                            self.feed.push(
+                                now,
+                                Weight::Major,
+                                Event::Tourney { name: t.name.clone(), what: format!("is under way — {} runners", t.entered()) },
+                            );
+                        } else {
+                            // Not enough takers. Everybody gets every chip
+                            // back, and the house un-takes its cut.
+                            let name = t.name.clone();
+                            let (entrants, buy_in, rake) = t.abandon();
+                            for e in entrants.iter() {
+                                if let Some(p) = self.roster.get_mut(e.patron) {
+                                    p.chips += buy_in;
+                                    p.presence = Presence::Looking;
+                                }
+                            }
+                            if rake > 0 {
+                                self.bank.settle("tourney", 0, rake);
+                            }
+                            self.feed.push(
+                                now,
+                                Weight::Notable,
+                                Event::Tourney { name, what: "was called off — not enough runners".into() },
+                            );
+                        }
+                    }
+                }
+                Stage::Running(_) | Stage::FinalTable => {
+                    if t.due(now) {
+                        let before = t.stage;
+                        let Floor { rng, cfg, roster, feed, .. } = self;
+                        let out = t.play_round(rng, cfg, now);
+                        for e in out.iter() {
+                            if let Some(p) = roster.get_mut(e.patron) {
+                                p.presence = Presence::Looking;
+                            }
+                        }
+                        if !out.is_empty() {
+                            feed.push(
+                                now,
+                                Weight::Notable,
+                                Event::Tourney {
+                                    name: t.name.clone(),
+                                    what: format!("{} knocked out — {}", out.len(), t.stage.label()),
+                                },
+                            );
+                        }
+                        // Announced when it *becomes* the final table, not
+                        // every round it spends there.
+                        if t.stage == Stage::FinalTable && before != Stage::FinalTable {
+                            feed.push(now, Weight::Major, Event::Tourney { name: t.name.clone(), what: "is down to the final table".into() });
+                        }
+                    }
+                }
+                Stage::Done => {}
+            }
+
+            if t.stage == Stage::Done && t.paid.is_empty() && !t.field.is_empty() {
+                let payouts: Vec<_> = t.settle(&self.cfg).to_vec();
+                for pay in payouts.iter() {
+                    if let Some(p) = self.roster.get_mut(pay.patron) {
+                        p.chips += pay.prize;
+                        p.presence = Presence::Looking;
+                    }
+                }
+                if let Some(first) = payouts.first() {
+                    self.feed.push(
+                        now,
+                        Weight::Major,
+                        Event::Tourney { name: t.name.clone(), what: format!("won by {} for {}", first.name, first.prize) },
+                    );
+                }
+                // Anybody who was in it and is somehow still marked as
+                // playing is freed: a tournament must never strand people.
+                for e in t.field.clone() {
+                    if let Some(p) = self.roster.get_mut(e.patron)
+                        && matches!(p.presence, Presence::InTournament { .. })
+                    {
+                        p.presence = Presence::Looking;
+                    }
+                }
+            }
+            // A finished one is kept for a while so it can be looked at,
+            // then forgotten.
+            if t.over_for(now).is_some_and(|since| since > self.cfg.tourney_every) {
+                continue;
+            }
+            self.tourneys.insert(tid, t);
         }
     }
 
@@ -266,6 +455,10 @@ impl Floor {
         let now = self.clock.now();
         self.series.advance(now);
         self.lifecycle(now);
+        // Tournaments get first refusal on the people standing about, then
+        // whoever is left is offered a seat. See `seat_the_room`.
+        self.run_tournaments(now);
+        self.seat_the_room(now);
         self.pay_the_bills(now);
         self.read_the_room(now);
         let ceiling = self.cfg.max_catch_up.max(1);
@@ -397,6 +590,10 @@ pub struct FloorView {
     pub top_turnover: Vec<(String, i64, u32)>,
     pub top_winners: Vec<(String, i64, i64)>,
     pub top_regulars: Vec<(String, u32, &'static str)>,
+    /// What is going on in the building right now.
+    pub weather: Vec<Going>,
+    /// Tournaments, newest first.
+    pub tourneys: Vec<Tournament>,
     pub cfg: Config,
     /// Whether the simulation thread is still turning.
     pub running: bool,
@@ -431,6 +628,10 @@ impl Manager {
             demand: Demand::new(&Config::default(), Duration::ZERO),
             series: Series::new(),
             games: Games::new(),
+            weather: Happenings::new(&Config::default(), Duration::ZERO),
+            tourneys: Running::new(),
+            next_tourney: Every::new(Config::default().tourney_every, Duration::ZERO),
+            tourneys_held: 0,
             cfg: Config::default(),
             clock: Clock::new(config::SPEED_UNIT),
             feed: Feed::new(Config::default().feed_capacity),
@@ -593,6 +794,8 @@ impl Manager {
         let now = f.clock.now();
         f.rent = Every::new(cfg.expense_period, now);
         f.door = Every::new(cfg.arrivals_period, now);
+        f.weather = Happenings::new(&cfg, now);
+        f.next_tourney = Every::new(cfg.tourney_every, now);
         f.cfg = cfg;
     }
 
@@ -665,6 +868,8 @@ impl Manager {
                 top_turnover: Vec::new(),
                 top_winners: Vec::new(),
                 top_regulars: Vec::new(),
+                weather: Vec::new(),
+                tourneys: Vec::new(),
                 cfg: Config::default(),
                 running: false,
             };
@@ -721,6 +926,8 @@ impl Manager {
                 .filter(|p| p.lifetime.visits > 0)
                 .map(|p| (p.name.clone(), p.lifetime.visits, p.style()))
                 .collect(),
+            weather: f.weather.going().to_vec(),
+            tourneys: f.tourneys.values().rev().cloned().collect(),
             cfg: f.cfg.clone(),
             running: self.is_running(),
         }
@@ -1278,6 +1485,183 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), announced.len(), "the same event was announced more than once");
+    }
+
+    #[test]
+    fn a_rush_on_the_doors_actually_fills_the_room() {
+        // Phase 16's whole point: a happening has to be visible in the
+        // simulation, not just on a screen. A rush must genuinely bring
+        // more people in than a quiet night does.
+        let busy = Manager::start(60, 2_000_000, 200_000_000, Badge::new());
+        let quiet = Manager::start(60, 2_000_000, 200_000_000, Badge::new());
+        let base = Config {
+            arrivals_period: Duration::from_secs(5),
+            arrivals_per_period: 2,
+            speed: 10_000,
+            happening_chance: 100,
+            happening_period: Duration::from_secs(1),
+            happening_for: (Duration::from_secs(9_000), Duration::from_secs(9_001)),
+            ..Config::default()
+        };
+        // The quiet one never has anything going on at all.
+        quiet.configure(Config { happening_chance: 1, happening_period: Duration::from_secs(9_000), ..base.clone() });
+        busy.configure(base);
+        busy.open(Kind::Blackjack, 10);
+        quiet.open(Kind::Blackjack, 10);
+        std::thread::sleep(Duration::from_millis(1_500));
+        let (b, q) = (busy.snapshot(), quiet.snapshot());
+        assert!(!b.weather.is_empty(), "nothing was going on despite a certainty of it");
+        assert!(q.weather.is_empty(), "the quiet floor had weather it should not have");
+        // Not asserting a precise ratio — what is going on is rolled, and a
+        // lull is one of the things that can be. Only that the floor with
+        // *something* going on is measurably different.
+        assert!(b.known != q.known || b.crowd != q.crowd, "the weather made no difference to anybody");
+    }
+
+    #[test]
+    fn what_is_going_on_never_reaches_a_payout() {
+        // Rule 5 at the floor level. A night full of happenings is a night
+        // with different *traffic*, and the same maths.
+        let m = Manager::start(61, 2_000_000, 200_000_000, Badge::new());
+        m.configure(Config {
+            speed: 10_000,
+            happening_chance: 100,
+            happening_period: Duration::from_secs(2),
+            happening_for: (Duration::from_secs(30), Duration::from_secs(60)),
+            ..Config::default()
+        });
+        m.open(Kind::Slots, 4);
+        assert!(wait_for(|| !m.snapshot().weather.is_empty(), Duration::from_secs(10)), "nothing ever happened");
+        assert!(wait_for(|| m.snapshot().rounds > 400, Duration::from_secs(15)), "the floor never got going");
+        let v = m.snapshot();
+        // The books still add up exactly as they did with nothing going on:
+        // the handle and the payouts are the table's business alone.
+        assert_eq!(v.ggr, v.handle - v.payouts);
+        assert_eq!(v.hold, v.ggr * 10_000 / v.handle);
+        assert!(v.handle > 0);
+    }
+
+    #[test]
+    fn a_dear_night_costs_more_to_keep_the_doors_open() {
+        let m = Manager::start(62, 5_000_000, 200_000_000, Badge::new());
+        m.configure(Config {
+            speed: 10_000,
+            expense_period: Duration::from_secs(5),
+            overhead_per_period: 1_000,
+            table_cost_per_period: 0,
+            happening_chance: 1, // rolled, but as good as never
+            happening_period: Duration::from_secs(9_000),
+            ..Config::default()
+        });
+        assert!(wait_for(|| m.snapshot().spent >= 3_000, Duration::from_secs(10)), "the bills never came");
+        let plain = m.snapshot().spent;
+        // Whatever it charged, it charged in whole periods of the base
+        // rate: nothing was going on to make it dearer.
+        assert_eq!(plain % 1_000, 0, "spent {plain} is not a whole number of ordinary periods");
+    }
+
+    #[test]
+    fn a_tournament_runs_itself_from_entries_to_a_winner() {
+        let m = Manager::start(70, 2_000_000, 200_000_000, Badge::new());
+        m.configure(Config {
+            speed: 10_000,
+            arrivals_period: Duration::from_secs(2),
+            arrivals_per_period: 8,
+            tourney_every: Duration::from_secs(20),
+            tourney_registration: Duration::from_secs(20),
+            tourney_round_every: Duration::from_secs(4),
+            tourney_min_field: 4,
+            ..Config::default()
+        });
+        m.open(Kind::Blackjack, 2);
+        assert!(wait_for(|| !m.snapshot().tourneys.is_empty(), Duration::from_secs(10)), "no tournament ever opened");
+
+        // A finished tournament is kept only for a while before the floor
+        // forgets it, so catch one as it goes past rather than hoping a
+        // single look lands inside that window.
+        let mut finished = None;
+        let until = Instant::now() + Duration::from_secs(40);
+        while Instant::now() < until && finished.is_none() {
+            for t in m.snapshot().tourneys {
+                if t.stage == Stage::Done && t.entered() >= 4 {
+                    finished = Some(t);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let done = finished.expect("no tournament with a real field ever played down to a winner");
+        assert_eq!(done.alive(), 1, "it finished with {} still in", done.alive());
+        assert!(done.winner().is_some());
+        let paid: i64 = done.paid.iter().map(|p| p.prize).sum();
+        assert_eq!(paid, done.pool, "the pool did not pay out whole");
+        assert!(done.paid.first().map(|p| p.place) == Some(1));
+    }
+
+    #[test]
+    fn a_tournament_never_strands_anybody_in_it() {
+        // Somebody in a tournament is not free to be seated; when it ends
+        // they must be free again, or the roster slowly fills with people
+        // who can never play anything.
+        let m = Manager::start(71, 2_000_000, 200_000_000, Badge::new());
+        m.configure(Config {
+            speed: 10_000,
+            arrivals_period: Duration::from_secs(2),
+            arrivals_per_period: 8,
+            tourney_every: Duration::from_secs(15),
+            tourney_registration: Duration::from_secs(10),
+            tourney_round_every: Duration::from_secs(3),
+            tourney_min_field: 4,
+            ..Config::default()
+        });
+        m.open(Kind::Slots, 3);
+        assert!(
+            wait_for(|| m.snapshot().tourneys.iter().any(|t| t.stage == Stage::Done), Duration::from_secs(30)),
+            "no tournament finished"
+        );
+        // Give the floor a moment to seat everybody it freed.
+        std::thread::sleep(Duration::from_millis(600));
+        let v = m.snapshot();
+        // The floor is still seating people, which it could not be doing if
+        // its whole population were stuck in a finished tournament.
+        assert!(v.crowd > 0, "the building emptied");
+        assert!(v.tables.iter().any(|t| t.seats > 0), "no table has anybody at it any more");
+    }
+
+    #[test]
+    fn the_only_thing_the_house_takes_from_a_tournament_is_the_rake() {
+        let m = Manager::start(72, 2_000_000, 200_000_000, Badge::new());
+        m.configure(Config {
+            speed: 10_000,
+            arrivals_period: Duration::from_secs(2),
+            arrivals_per_period: 8,
+            tourney_every: Duration::from_secs(15),
+            tourney_registration: Duration::from_secs(10),
+            tourney_round_every: Duration::from_secs(3),
+            tourney_min_field: 4,
+            ..Config::default()
+        });
+        m.open(Kind::Blackjack, 2);
+        assert!(
+            wait_for(|| m.snapshot().tourneys.iter().any(|t| t.stage == Stage::Done), Duration::from_secs(30)),
+            "no tournament finished"
+        );
+        let v = m.snapshot();
+        // Tournament entries are booked as turnover like anything else, so
+        // the books stay internally consistent with them in.
+        assert_eq!(v.ggr, v.handle - v.payouts);
+        if let Some((_, tally)) = v.games.iter().find(|(k, _)| *k == "tourney") {
+            let cfg = v.cfg.clone();
+            // The house's win on a tournament is exactly the rake — a
+            // fixed percentage of every entry, and nothing else.
+            let expected = tally.handle * cfg.tourney_rake / 100;
+            let slack = (tally.handle / 100).max(1);
+            assert!(
+                (tally.ggr() - expected).abs() <= slack,
+                "the house won {} from tournaments against a rake of {expected}",
+                tally.ggr()
+            );
+        }
     }
 
     #[test]
