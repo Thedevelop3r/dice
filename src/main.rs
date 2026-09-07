@@ -124,6 +124,7 @@ fn main() {
     }
 
     if let Some(mut m) = casino.take() {
+        let _ = m.saved().write(&casino::save::path());
         let (money, chips) = m.stop();
         store.set_i64("casino.money", money);
         store.set_i64("casino.chips", chips);
@@ -294,20 +295,38 @@ fn arcade_room(store: &mut Store, rng: &mut Rng, screen: &mut Screen) {
 /// single table.
 fn casino_floor(casino: &mut Option<Manager>, badge: &Badge, store: &mut Store, screen: &mut Screen) {
     if casino.is_none() {
-        let Some(plan) = casino::ui::opening(screen) else { return };
-        // Pick up where the last casino left off, or open the doors fresh.
-        let (money, chips) = casino::manager::opening_balances();
-        let money = store.get_i64("casino.money", money);
-        let chips = store.get_i64("casino.chips", chips);
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x5EED);
-        let m = Manager::start(seed, money, chips, badge.clone());
-        for (kind, n) in plan {
-            m.open(kind, n);
+
+        // A casino that has run before is reopened rather than rebuilt:
+        // the books, the regulars and the floor plan all carry on. Only if
+        // there is nothing saved — or what is saved cannot be read — does
+        // the opening screen ask what sort of floor to lay out.
+        match casino::save::Save::load(&casino::save::path()) {
+            Ok(save) if !save.tables.is_empty() => {
+                *casino = Some(Manager::resume(seed, &save, badge.clone()));
+            }
+            other => {
+                if let Err(fault) = other
+                    && fault != casino::save::Fault::Missing
+                {
+                    // Say so rather than silently starting a new casino
+                    // over the top of one somebody has hours in.
+                    casino::ui::trouble(screen, &fault.describe());
+                }
+                let Some(plan) = casino::ui::opening(screen) else { return };
+                let (money, chips) = casino::manager::opening_balances();
+                let money = store.get_i64("casino.money", money);
+                let chips = store.get_i64("casino.chips", chips);
+                let m = Manager::start(seed, money, chips, badge.clone());
+                for (kind, n) in plan {
+                    m.open(kind, n);
+                }
+                *casino = Some(m);
+            }
         }
-        *casino = Some(m);
     }
     let Some(m) = casino.as_ref() else { return };
 
@@ -318,6 +337,9 @@ fn casino_floor(casino: &mut Option<Manager>, badge: &Badge, store: &mut Store, 
     while let Some(id) = casino::ui::floor(m, screen) {
         casino::ui::watch(m, screen, id);
     }
+    // Written on the way out of the floor screen as well as on the way out
+    // of the program, so an hour of a night is not lost to a power cut.
+    let _ = m.saved().write(&casino::save::path());
     let (money, chips) = m.balances();
     store.set_i64("casino.money", money);
     store.set_i64("casino.chips", chips);
