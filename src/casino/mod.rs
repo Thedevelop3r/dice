@@ -38,6 +38,12 @@
 //!   them, and hands out read-only snapshots.
 //! - [`tournament`] — a fixed field playing down to one winner, on its own
 //!   clock, using the same maths the cash tables use.
+//! - [`reception`] — the front desk and the cage: who came through the
+//!   door, what crossed the counter, and in which direction. Fed by the
+//!   event bus, owning no money of its own.
+//! - [`dashboard`] — the operations centre's read models. Views over
+//!   everything above, built in one pass under the lock and drawn after it
+//!   is released. Derived from state, never a second copy of it.
 //! - [`ui`] — the screens. They draw snapshots. They never run anything.
 //!
 //! The rule that keeps it honest: **the UI is a viewer, not a driver.**
@@ -48,6 +54,7 @@ pub mod analytics;
 pub mod bank;
 pub mod clock;
 pub mod config;
+pub mod dashboard;
 pub mod demand;
 pub mod event;
 pub mod happening;
@@ -55,6 +62,7 @@ pub mod instance;
 pub mod interest;
 pub mod manager;
 pub mod patron;
+pub mod reception;
 pub mod roster;
 pub mod save;
 pub mod sim;

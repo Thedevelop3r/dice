@@ -96,6 +96,7 @@ fn main() {
                 Some(m) => MenuItem::new('a', "The Casino", format!("live — {} tables running themselves right now", m.table_count())),
                 None => MenuItem::new('a', "Start Casino", "open the floor: tables deal themselves, the books move"),
             },
+            MenuItem::new('d', "Dashboard", "the operations centre: the floor, the books, the cage and the tournaments"),
             MenuItem::new('s', "Store", "chips, dollars and lucky charms"),
             MenuItem::new('i', "Stats", "your history across every table"),
             MenuItem::new('h', "History", "past Ultra Casino Dice sessions"),
@@ -112,11 +113,12 @@ fn main() {
             Some('4') => arcade_room(&mut store, &mut rng, &mut screen),
             Some('5') => idle_room(&mut store, &mut rng, &mut screen),
             Some('a') => casino_floor(&mut casino, &badge, &mut store, &mut screen),
+            Some('d') => casino_dashboard(&mut casino, &badge, &mut store, &mut screen),
             Some('s') => shop::open(&mut store, &mut screen),
             Some('i') => show_stats(&mut store, &mut screen),
             Some('h') => show_history(&mut screen),
             Some('c') => show_house(&mut store, &mut screen),
-            Some('o') => settings(&mut store, &mut screen),
+            Some('o') => settings(&mut store, &mut screen, &casino),
             Some('r') => rules(&mut screen),
             Some('q') | None => break 'app,
             _ => {}
@@ -293,7 +295,16 @@ fn arcade_room(store: &mut Store, rng: &mut Rng, screen: &mut Screen) {
 /// function opens a view onto a simulation that is already running and
 /// keeps running after it returns. Leaving this screen does not close a
 /// single table.
-fn casino_floor(casino: &mut Option<Manager>, badge: &Badge, store: &mut Store, screen: &mut Screen) {
+/// Opens the casino if it is not already open, resuming a saved one where
+/// there is one to resume.
+///
+/// Split out of the floor screen so the dashboard can be walked into
+/// directly from the main menu without either entry point owning the
+/// opening sequence. Whichever door the user comes through, the casino is
+/// brought up exactly once and by exactly this code.
+///
+/// Returns whether there is a running casino to look at.
+fn open_casino(casino: &mut Option<Manager>, badge: &Badge, store: &mut Store, screen: &mut Screen) -> bool {
     if casino.is_none() {
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -316,7 +327,7 @@ fn casino_floor(casino: &mut Option<Manager>, badge: &Badge, store: &mut Store, 
                     // over the top of one somebody has hours in.
                     casino::ui::trouble(screen, &fault.describe());
                 }
-                let Some(plan) = casino::ui::opening(screen) else { return };
+                let Some(plan) = casino::ui::opening(screen) else { return false };
                 let (money, chips) = casino::manager::opening_balances();
                 let money = store.get_i64("casino.money", money);
                 let chips = store.get_i64("casino.chips", chips);
@@ -328,22 +339,49 @@ fn casino_floor(casino: &mut Option<Manager>, badge: &Badge, store: &mut Store, 
             }
         }
     }
-    let Some(m) = casino.as_ref() else { return };
+    casino.is_some()
+}
 
-    // The badge is refreshed from the manager on the way in and on every
-    // pass below; the simulation thread keeps moving the numbers under it.
-    // The simulation thread keeps the badge current by itself; all this
-    // loop does is show the floor and remember the balances on the way out.
-    while let Some(id) = casino::ui::floor(m, screen) {
-        casino::ui::watch(m, screen, id);
-    }
-    // Written on the way out of the floor screen as well as on the way out
-    // of the program, so an hour of a night is not lost to a power cut.
+/// Writes the casino down and remembers its balances.
+///
+/// Called on the way out of every casino screen as well as on the way out
+/// of the program, so an hour of a night is not lost to a power cut.
+fn keep_casino(m: &Manager, store: &mut Store) {
     let _ = m.saved().write(&casino::save::path());
     let (money, chips) = m.balances();
     store.set_i64("casino.money", money);
     store.set_i64("casino.chips", chips);
     let _ = store.save();
+}
+
+fn casino_floor(casino: &mut Option<Manager>, badge: &Badge, store: &mut Store, screen: &mut Screen) {
+    if !open_casino(casino, badge, store, screen) {
+        return;
+    }
+    let Some(m) = casino.as_ref() else { return };
+    // The simulation thread keeps the badge current by itself; all this
+    // loop does is show the floor and remember the balances on the way out.
+    while let Some(id) = casino::ui::floor(m, screen) {
+        casino::ui::watch(m, screen, id);
+    }
+    keep_casino(m, store);
+}
+
+/// The operations centre, from the main menu.
+///
+/// Opens the casino if it is not already open — walking straight into the
+/// dashboard is a perfectly reasonable way to start a night — and then
+/// hands over to the dashboard screen. Nothing here steps, pauses or
+/// disturbs the simulation on the way in or on the way out; the tables
+/// that were running when this was opened are the tables that are still
+/// running when it closes.
+fn casino_dashboard(casino: &mut Option<Manager>, badge: &Badge, store: &mut Store, screen: &mut Screen) {
+    if !open_casino(casino, badge, store, screen) {
+        return;
+    }
+    let Some(m) = casino.as_ref() else { return };
+    casino::ui::dashboard(m, screen);
+    keep_casino(m, store);
 }
 
 /// The idle screens: any single table left running itself, or the whole
@@ -578,7 +616,7 @@ fn show_house(store: &mut Store, screen: &mut Screen) {
     ui::pause(screen);
 }
 
-fn settings(store: &mut Store, screen: &mut Screen) {
+fn settings(store: &mut Store, screen: &mut Screen, casino: &Option<Manager>) {
     loop {
         let colors_on = store.get_i64("cfg.colors", 1) == 1;
         screen.set_colors(colors_on);
@@ -587,14 +625,37 @@ fn settings(store: &mut Store, screen: &mut Screen) {
         screen.blank();
         screen.line(&format!("  name    : {}", store.get_str("player.name", "Player")));
         screen.line(&format!("  colors  : {}", if colors_on { "on" } else { "off" }));
+        if let Some(m) = casino.as_ref() {
+            screen.line(&format!("  casino  : running on seed {}", m.seed()));
+        }
         screen.blank();
-        let items = vec![
+        let mut items = vec![
             MenuItem::new('n', "change name", ""),
             MenuItem::new('c', "toggle colors", ""),
-            MenuItem::new('x', "reset statistics", "wipes stats and bankroll"),
-            MenuItem::new('b', "back", ""),
         ];
+        // The casino's own settings only exist while there is a casino.
+        // Offering "reseed" with nothing running would be offering to
+        // reseed nothing.
+        items.push(match casino {
+            Some(_) => MenuItem::new('r', "casino settings", "speed, reseed the floor, start a tournament"),
+            None => MenuItem::new('r', "casino settings", "nothing is running — open the casino first"),
+        });
+        items.push(MenuItem::new('x', "reset statistics", "wipes stats and bankroll"));
+        items.push(MenuItem::new('b', "back", ""));
         match choose_from(screen, "SETTINGS", &items) {
+            Some('r') => match casino.as_ref() {
+                Some(m) => casino::ui::settings(m, screen),
+                None => {
+                    screen.begin();
+                    ui::header(screen, "CASINO SETTINGS");
+                    screen.blank();
+                    screen.line("  there is no casino running to reseed.");
+                    screen.blank();
+                    screen.line(&screen.theme.dim("  open it from the floor or the dashboard first."));
+                    screen.present();
+                    ui::pause(screen);
+                }
+            },
             Some('n') => {
                 screen.begin();
                 ui::header(screen, "OPTIONS");

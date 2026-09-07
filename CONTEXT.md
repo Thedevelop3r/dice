@@ -160,7 +160,8 @@ across two threads.
 
 ```
 src/
-  main.rs          721  dashboard, the four rooms, idle room, Stats, Casino, Rules, Options
+  main.rs          782  main menu, the four rooms, idle room, Stats, Casino, Rules,
+                        Options, the casino dashboard entry point
   economy.rs       265  Wallet (player) + House (casino ledger) + Item
   stats.rs         113  the key=value save file
   rng.rs            58  xoshiro256** + SplitMix64 seeding
@@ -192,8 +193,15 @@ src/
     patron.rs      751  archetypes, traits, presence, lifetime record
     roster.rs      505  everyone the casino knows, seated or not
     instance.rs    845  one running table, its limit, the Kind → game mapping
-    manager.rs    1935  simulation thread, lifecycle, bills, mood, save/resume
-    ui.rs         1064  floor, feed, spectator, night, customers, books, tourneys
+    manager.rs    2719  simulation thread, lifecycle, bills, mood, save/resume,
+                        the dashboard snapshot, reseed, operator tournaments
+    reception.rs   400  the front desk and the cage, fed by the event bus
+    dashboard.rs   449  the operations centre's read models (no state of its own)
+    ui.rs         1174  floor, feed, spectator, night, customers, books, tourneys,
+                        casino settings + reseed
+    ui/
+      dashboard.rs      1153  the four-section operations centre, responsive
+      tourney_ops.rs     485  starting a tournament, watching one, reading one
   games/
     mod.rs         109  Ctx, Difficulty, Player, pick_difficulty
     cards.rs       443  shared deck/shoe/hand rankings  ← every card table
@@ -667,6 +675,74 @@ One real finding from writing it: a table with nobody at it still deals —
 the high-limit room with no VIPs in it yet is exactly that — so a game can
 have rounds with no bets. Rounds without bets is a true state; a handle
 without bets is not, and that is what the step now asserts.
+
+---
+
+### The operations centre (session 8)
+
+`casino/dashboard.rs`, `casino/reception.rs`, `casino/ui/dashboard.rs`,
+`casino/ui/tourney_ops.rs` — one screen an operator stands in front of and
+sees the whole building. `[d]` from the main menu, four sections: the
+tables, the books, the events and tournaments, the front desk.
+
+The thing worth understanding about it is what it is *not*. It is not a
+second simulation, and it does not own a single figure. Every number on it
+is a copy of one the bank, the roster, the feed, the analytics or the
+tournament system already had. `Manager::dashboard()` builds the whole
+picture in one pass under the existing lock and releases it before a
+single line is drawn — four sections from one moment, rather than four
+calls and four different moments. Hammering it forty times in a row is a
+test in `manager.rs`, and it changes nothing: not the floor plan, not the
+seed, not a round.
+
+Two things are genuinely new state, and both earn it:
+
+- **`reception.rs`** is the day book the cage never had. It is fed from
+  the event bus once a tick — `catch_up(desk, feed)` — and never scans
+  anything. Its cursor is an `Option<u64>` rather than a `u64`, because
+  `Feed::since` means *after* the sequence given, and a bare zero cannot
+  tell "seen nothing" from "seen record zero"; the first event a casino
+  publishes would have been the one it lost. It owns no money: the counts
+  and the story are its own, the cash figures come off the bank. To make
+  a cash-out readable at the desk, `Event::Left` now carries `cashed` —
+  the dollars the cage actually paid — because only the bank knows the
+  sell rate and a reader must never guess at the house's spread.
+- **`Instance::last_at`** stamps when a table last settled, so "quiet for
+  a minute" is a fact rather than something inferred from `next_at`.
+
+**Reseeding is not resetting**, and the two are deliberately kept apart.
+`Manager::reseed` replaces `Floor::rng` and nothing else — the books, the
+people, the tables, the analytics and every tournament already played are
+untouched, and the simulation is not stopped for it: the swap takes the
+same lock a tick takes, so it happens strictly between two ticks. The seed
+is a property of a *running* floor, not of the saved casino, so it is not
+in the save format and a reopened casino draws a fresh one exactly as it
+always did. Destroying a world would be a different command with a
+different name.
+
+**Operator tournaments** (`Manager::start_tournament`) field themselves
+from the roster: eligible people first, minted into the roster proper only
+if the building genuinely cannot supply enough, and left there afterwards
+with their ids and their records. Entries go through `Bank::buy_in` and
+the rake through `Bank::settle("tourney", …)`, which is how the floor's
+own tournaments have always booked them. A patron buys what a patron would
+buy — the entry fee gets no say, because topping somebody up to the price
+of the ticket would be inventing money for them, so a field that cannot be
+afforded is refused and every chip taken is handed back.
+
+The layout is chosen from `Screen::size()` at every frame: two columns and
+four panels on a wide window, four stacked on a tall narrow one, and one
+at a time behind a `[1][2][3][4]` tab strip when there is no room for
+more. `ui::clip` is what makes that safe — it cuts a painted string to a
+visible width and closes any colour left open by the cut, so a truncated
+line cannot bleed across the screen. A test renders every section at eight
+widths and five heights and asserts nothing ever exceeds its box.
+
+Keys had to bend to the existing input system rather than the spec's:
+`poll_action` reads raw bytes, so an arrow key arrives as three of them
+and cannot be watched for. Navigation is `j`/`k` within a section and
+`h`/`l` (or Tab) between them, Enter opens, `q` goes back — the
+conventions the floor screen already used.
 
 ---
 

@@ -26,7 +26,9 @@ use super::happening::{Going, Happenings};
 use super::demand::{Demand, Standing};
 use super::instance::{Instance, Kind, Limit, RoundLog};
 use super::interest::{self, Interest};
+use super::dashboard::{FinancialView, GameView, GlobalView, GuestView, ReceptionView, Snapshot, TournamentView};
 use super::patron::{Patron, Presence};
+use super::reception::Reception;
 use super::roster::{self, Roster};
 use super::save::{Save, SavedTable};
 use super::sim::Sim;
@@ -56,6 +58,10 @@ struct Floor {
     /// climbing rather than being reused.
     opened: BTreeMap<&'static str, u32>,
     rng: Rng,
+    /// What the random source was last seeded with. Kept only so an
+    /// operator can be shown it and told what it changed to — nothing in
+    /// the simulation reads it back.
+    seed: u64,
     cfg: Config,
     clock: Clock,
     feed: Feed,
@@ -79,6 +85,9 @@ struct Floor {
     tourneys: Running,
     next_tourney: Every,
     tourneys_held: u32,
+    /// The front desk's day book. Fed from the event stream once a tick;
+    /// see [`super::reception`] for why it is not allowed to scan anything.
+    desk: Reception,
     started: Instant,
 }
 
@@ -122,13 +131,13 @@ impl Floor {
                 let (who, net) = (p.name.clone(), p.net());
                 let back_at = super::roster::time_away(rng, cfg, now);
                 let chips = p.end_visit(back_at);
-                bank.cash_out(chips);
+                let cashed = bank.cash_out(chips);
                 instances[i].stand(pid);
                 // A seat freed is also a moment to re-decide how busy this
                 // table should be, so a floor breathes over the night
                 // instead of every table sitting at a fixed size forever.
                 instances[i].reconsider_size(rng);
-                feed.push(now, Weight::Notable, Event::Left { patron: pid, who, table: instances[i].id, net, reason: why });
+                feed.push(now, Weight::Notable, Event::Left { patron: pid, who, table: instances[i].id, net, reason: why, cashed });
                 series.record(&Tally { departures: 1, ..Tally::default() });
             }
         }
@@ -506,6 +515,19 @@ impl Floor {
                 self.instances[i].next_at = now;
             }
         }
+        self.mind_the_desk();
+    }
+
+    /// Hands the front desk whatever the feed has published since it last
+    /// looked.
+    ///
+    /// This is the only place the reception ledger is written, and it costs
+    /// one tick's worth of events — not one night's. The desk keeps its own
+    /// cursor, so a slow tick catches up and a fast one does no work at
+    /// all.
+    fn mind_the_desk(&mut self) {
+        let Floor { desk, feed, .. } = self;
+        super::reception::catch_up(desk, feed);
     }
 }
 
@@ -623,6 +645,7 @@ impl Manager {
             next_id: 1,
             opened: BTreeMap::new(),
             rng: Rng::from_seed(seed),
+            seed,
             roster: Roster::new(),
             rent: Every::new(Config::default().expense_period, Duration::ZERO),
             door: Every::new(Config::default().arrivals_period, Duration::ZERO),
@@ -633,6 +656,7 @@ impl Manager {
             tourneys: Running::new(),
             next_tourney: Every::new(Config::default().tourney_every, Duration::ZERO),
             tourneys_held: 0,
+            desk: Reception::default(),
             cfg: Config::default(),
             clock: Clock::new(config::SPEED_UNIT),
             feed: Feed::new(Config::default().feed_capacity),
@@ -721,11 +745,11 @@ impl Manager {
                 let Some(p) = roster.get_mut(*pid) else { continue };
                 let (who, net) = (p.name.clone(), p.net());
                 let chips = p.end_visit(back_at);
-                bank.cash_out(chips);
+                let cashed = bank.cash_out(chips);
                 feed.push(
                     now,
-                    Weight::Routine,
-                    Event::Left { patron: *pid, who, table: inst.id, net, reason: Departure::TableClosed },
+                    Weight::Notable,
+                    Event::Left { patron: *pid, who, table: inst.id, net, reason: Departure::TableClosed, cashed },
                 );
             }
             f.feed.push(
@@ -943,6 +967,236 @@ impl Manager {
         f.instances.iter().find(|t| t.id == id).map(|t| view_of(t, &f.roster, &f.cfg, now, true))
     }
 
+    /// The whole casino as an operations centre sees it: the floor, the
+    /// books, what has happened, the tournaments and the front desk, all
+    /// from one moment.
+    ///
+    /// The shape of this call is the point. Everything is copied under the
+    /// lock in a single pass and the lock is dropped the instant it
+    /// returns — the drawing happens afterwards, on the caller's own time.
+    /// A dashboard that rendered while holding this would stall every table
+    /// in the building for as long as the terminal took to scroll.
+    ///
+    /// It is also strictly a *reader*. Nothing here opens, closes, pauses,
+    /// seeds or settles anything; opening the dashboard cannot be observed
+    /// from inside the simulation at all.
+    pub fn dashboard(&self) -> Snapshot {
+        let Ok(f) = self.floor.lock() else { return Snapshot::default() };
+        let now = f.clock.now();
+        let running = self.running.load(Ordering::Relaxed);
+        Snapshot {
+            global: GlobalView {
+                money: f.bank.money(),
+                chips: f.bank.chips(),
+                crowd: f.roster.present(),
+                known: f.roster.len(),
+                tables: f.instances.len(),
+                tourneys: f.tourneys.values().filter(|t| t.stage != Stage::Done).count(),
+                speed: f.cfg.speed,
+                uptime: Instant::now().duration_since(f.started),
+                sim_time: now,
+                running,
+                seed: f.seed,
+            },
+            games: f.instances.iter().map(|t| game_view(t, &f.roster, &f.cfg, now)).collect(),
+            financials: financial_view(&f),
+            events: f.feed.recent(FEED_LINES, Weight::Notable),
+            tournaments: f.tourneys.values().rev().map(|t| tournament_view(t, now)).collect(),
+            reception: reception_view(&f, now),
+            tiers: f.cfg.tiers.iter().map(|(name, _)| *name).collect(),
+        }
+    }
+
+    /// One tournament in full, by id — the field, the standings and the
+    /// payouts, straight off the tournament system.
+    pub fn tourney(&self, id: u32) -> Option<super::tournament::Tournament> {
+        let f = self.floor.lock().ok()?;
+        f.tourneys.get(&id).cloned()
+    }
+
+    /// One person the casino knows, by id.
+    ///
+    /// A copy of the roster's record, so a screen can show somebody's
+    /// history without holding the floor open while it draws it.
+    pub fn patron(&self, id: u64) -> Option<Patron> {
+        let f = self.floor.lock().ok()?;
+        f.roster.get(id).cloned()
+    }
+
+    /// The seed the floor's random source is running on.
+    pub fn seed(&self) -> u64 {
+        self.floor.lock().map(|f| f.seed).unwrap_or(0)
+    }
+
+    /// Replaces the floor's random source, and nothing else.
+    ///
+    /// This is deliberately the *smallest* thing "reseed" could mean.
+    /// Everything the casino has done stays done: the books, the people,
+    /// the tables on the floor, the tournaments that have been played and
+    /// the analytics they produced are all untouched. What changes is the
+    /// stream of numbers every future roll comes from.
+    ///
+    /// Reseeding is not resetting. Throwing the world away would be a
+    /// different command with a different name, and this one is not it —
+    /// see the module docs for why the two are kept apart.
+    ///
+    /// The simulation is not stopped for this. It cannot be observed
+    /// half-done, because the lock this takes is the same lock a tick
+    /// takes: the swap happens strictly between two ticks. Returns the seed
+    /// that was in force and the one now in force.
+    pub fn reseed(&self, seed: u64) -> (u64, u64) {
+        let Ok(mut f) = self.floor.lock() else { return (0, 0) };
+        let was = f.seed;
+        f.rng = Rng::from_seed(seed);
+        f.seed = seed;
+        let now = f.clock.now();
+        f.feed.push(
+            now,
+            Weight::Notable,
+            Event::Reseeded { was, now: seed },
+        );
+        (was, seed)
+    }
+
+    /// Opens a tournament on the operator's say-so, fields it from the
+    /// people the casino already knows, and starts it.
+    ///
+    /// Every step goes through the machinery that already exists. The
+    /// entrants are real roster patrons — found first, minted through
+    /// [`Roster::mint`] only if the building genuinely cannot supply
+    /// enough, and left in the roster afterwards with their tournament in
+    /// their history. Their buy-ins are taken with [`Bank::buy_in`] and the
+    /// house's cut is booked with [`Bank::settle`], exactly as the floor's
+    /// own tournaments do it. Nothing here writes a balance directly.
+    ///
+    /// Returns the tournament's id, or `None` if it could not be fielded.
+    /// Once it returns, the tournament is the simulation thread's: it plays
+    /// itself down whether or not anybody is looking at it.
+    pub fn start_tournament(&self, kind: Kind, want: usize, buy_in: i64, stack: i64) -> Option<u32> {
+        let Ok(mut f) = self.floor.lock() else { return None };
+        let now = f.clock.now();
+        // A tournament wants a field, and the field decides the shape of
+        // everything after it — so it is settled before anything is
+        // charged to anybody.
+        let want = want.max(f.cfg.tourney_min_field).min(MAX_FIELD);
+        // Clamped so the arithmetic downstream — the rake on every entry,
+        // and the pool they add up to — cannot overflow whatever a caller
+        // asks for. A tournament nobody can afford is refused below, on
+        // its merits; one that would not fit in the books is not a
+        // tournament at all.
+        let buy_in = buy_in.clamp(1, MAX_BUY_IN);
+        let stack = stack.max(f.cfg.tourney_ante + 1);
+
+        let id = f.next_id;
+        f.next_id += 1;
+        f.tourneys_held += 1;
+        let number = f.tourneys_held;
+        let mut cfg = f.cfg.clone();
+        // The buy-in and the stack are this tournament's, not the house's
+        // standing ones — but the rake, the prize ladder and the pace all
+        // stay configuration, because those are house policy.
+        cfg.tourney_buy_in = buy_in;
+        cfg.tourney_stack = stack;
+        let mut t = Tournament::new(id, number, kind, &cfg, now);
+
+        // Who is eligible: somebody the casino knows, in the building or
+        // able to be called in, and not already busy at a table or in
+        // another tournament.
+        let mut field: Vec<u64> = f
+            .roster
+            .iter()
+            .filter(|p| p.presence.is_free() || !p.presence.is_here())
+            .map(|p| p.id)
+            .collect();
+        // Deterministic given the same rolls: shuffled by the floor's own
+        // random source, never by iteration order.
+        for i in (1..field.len()).rev() {
+            let j = f.rng.below(i + 1);
+            field.swap(i, j);
+        }
+        field.truncate(want);
+
+        let mut entered = 0usize;
+        let mut guard = 0usize;
+        while entered < want {
+            let pid = match field.pop() {
+                Some(id) => id,
+                None => {
+                    // The building cannot supply enough people, so the
+                    // casino gets to know some more. They are minted into
+                    // the roster proper — a tournament must never be
+                    // fielded by disposable stand-ins that vanish when it
+                    // is over.
+                    guard += 1;
+                    if guard > want * 2 {
+                        break;
+                    }
+                    let Floor { roster, rng, .. } = &mut *f;
+                    roster.mint(rng)
+                }
+            };
+            let Floor { roster, rng, cfg: house, bank, .. } = &mut *f;
+            let Some(p) = roster.get_mut(pid) else { continue };
+            if matches!(p.presence, Presence::Seated { .. } | Presence::InTournament { .. }) {
+                continue;
+            }
+            // Somebody who has not been to the cage tonight is holding
+            // nothing, and entering a tournament *is* starting a visit —
+            // so they buy chips first, through the cage, exactly as they
+            // would sitting down at a table.
+            //
+            // What they buy is what *they* would buy: their archetype and
+            // the configured range decide it, and the entry fee gets no
+            // say. A casino that topped somebody up to the price of the
+            // ticket would be inventing money for them, and the whole
+            // point of a bankroll is that it can fall short.
+            if p.chips == 0 {
+                let dollars = p.buy_in(rng, house);
+                let chips = bank.buy_in(dollars);
+                p.begin_visit(chips);
+            }
+            if p.chips < buy_in {
+                // They cannot afford it. That is a real answer, and the
+                // next person is asked instead.
+                continue;
+            }
+            let (name, chips) = (p.name.clone(), p.chips);
+            if t.enter(pid, name, chips, &cfg).is_some() {
+                p.chips -= buy_in;
+                p.presence = Presence::InTournament { id };
+                // Turnover, and the house's win on it, booked the same way
+                // every other bet in this building is.
+                let rake = buy_in * cfg.tourney_rake / 100;
+                bank.settle("tourney", buy_in, buy_in - rake);
+                entered += 1;
+            }
+        }
+
+        if !t.begin(&cfg) {
+            // Not enough takers after all: everybody gets every chip back
+            // and the house un-takes its cut, exactly as an abandoned
+            // tournament does. Nothing may cost anybody anything.
+            let (entrants, back, rake) = t.abandon();
+            for e in entrants.iter() {
+                if let Some(p) = f.roster.get_mut(e.patron) {
+                    p.chips += back;
+                    p.presence = Presence::Looking;
+                }
+            }
+            if rake > 0 {
+                f.bank.settle("tourney", 0, rake);
+            }
+            return None;
+        }
+        f.feed.push(
+            now,
+            Weight::Major,
+            Event::Tourney { name: t.name.clone(), what: format!("is under way — {} runners", t.entered()) },
+        );
+        f.tourneys.insert(id, t);
+        Some(id)
+    }
+
     /// The table most worth watching right now, if there is one running.
     ///
     /// This is "follow the action" in one call. It ranks a copy of the
@@ -1055,6 +1309,169 @@ fn view_of(t: &Instance, roster: &Roster, cfg: &Config, now: Duration, deep: boo
         limit: t.limit,
         interest: interest::score(t, roster, cfg),
         cfg: cfg.clone(),
+    }
+}
+
+/// How many people the desk lists by name. A dashboard panel, not a
+/// census — the count above it is the whole truth about how many are in.
+const GUESTS_SHOWN: usize = 24;
+
+/// The most runners an operator may ask for, and the most an entry may
+/// cost. Both are ceilings on *arithmetic*, not house policy: they are the
+/// point past which a pool would no longer fit in the books.
+const MAX_FIELD: usize = 1_024;
+const MAX_BUY_IN: i64 = i64::MAX / (MAX_FIELD as i64 * 1_000);
+
+/// How many lines of the desk's day book the dashboard carries.
+const DESK_LINES: usize = 24;
+
+/// How many places of a tournament's standings a dashboard row carries.
+const BOARD_ROWS: usize = 12;
+
+/// One table, flattened for the dashboard's list.
+///
+/// Shallow on purpose: no seats, no history, no people. Fifty of these
+/// cost fifty rows; fifty *deep* views would cost the whole floor, every
+/// quarter of a second, to draw four lines each.
+fn game_view(t: &Instance, roster: &Roster, cfg: &Config, now: Duration) -> GameView {
+    let last = t.last_round();
+    let interest = interest::score(t, roster, cfg);
+    GameView {
+        id: t.id,
+        kind: t.kind,
+        name: t.name.clone(),
+        round: t.round,
+        seats: t.patrons.len(),
+        wanted: t.wanted(),
+        status: t.status(),
+        limit: t.limit,
+        pot: last.map(|r| r.pot).unwrap_or(0),
+        house: last.map(|r| r.house()).unwrap_or(0),
+        staked: t.staked,
+        take: t.house_take(),
+        idle_for: now.saturating_sub(t.last_at),
+        why: interest.why.label(),
+        interest: interest.score,
+    }
+}
+
+/// The books, summarised. Every figure is asked of the bank; not one of
+/// them is worked out here.
+fn financial_view(f: &Floor) -> FinancialView {
+    let games = f.games.by_handle();
+    let by_table = f.bank.by_table();
+    // "Best" and "worst" are the same list read from both ends, so the two
+    // can never disagree about what is in it.
+    let best = by_table.iter().max_by_key(|(_, n)| *n).map(|(k, n)| (*k, *n));
+    let worst = by_table.iter().min_by_key(|(_, n)| *n).map(|(k, n)| (*k, *n));
+    let (_, _, bought_in, cashed_out) = f.bank.totals();
+    FinancialView {
+        money: f.bank.money(),
+        chips: f.bank.chips(),
+        handle: f.bank.handle(),
+        payouts: f.bank.payouts(),
+        ggr: f.bank.ggr(),
+        hold: f.bank.hold(),
+        bets: f.bank.bets(),
+        rounds: f.bank.rounds(),
+        spent: f.bank.spent(),
+        ngr: f.bank.ngr(),
+        by_expense: f.bank.by_expense(),
+        bought_in,
+        cashed_out,
+        table_profit: f.bank.table_profit(),
+        cage_profit: f.bank.cage_profit(),
+        best_game: best,
+        worst_game: worst,
+        games,
+        shape: f.series.recent_handle(BOARD),
+    }
+}
+
+/// One tournament, flattened. The stack figures are derived from the field
+/// the tournament already holds; nothing is stored twice.
+fn tournament_view(t: &Tournament, now: Duration) -> TournamentView {
+    let stacks: Vec<i64> = t.field.iter().filter(|e| e.out_in.is_none()).map(|e| e.stack).collect();
+    let board = t.standings(BOARD_ROWS);
+    TournamentView {
+        id: t.id,
+        name: t.name.clone(),
+        kind: t.kind,
+        stage: t.stage,
+        round: t.round,
+        alive: t.alive(),
+        entered: t.entered(),
+        pool: t.pool,
+        rake: t.rake,
+        buy_in: t.buy_in,
+        elapsed: t.running_for(now),
+        leader: board.first().map(|e| (e.name.clone(), e.stack)),
+        board,
+        paid: t.paid.clone(),
+        biggest_stack: stacks.iter().copied().max().unwrap_or(0),
+        smallest_stack: stacks.iter().copied().min().unwrap_or(0),
+        average_stack: if stacks.is_empty() { 0 } else { stacks.iter().sum::<i64>() / stacks.len() as i64 },
+    }
+}
+
+/// The front desk. The counts and the day book come off the reception
+/// ledger, which was fed by events; the cash figures come off the bank,
+/// which is the only thing that moved any.
+fn reception_view(f: &Floor, _now: Duration) -> ReceptionView {
+    let (chips_out, chips_in) = f.desk.chips();
+    let (_, _, bought_in, cashed_out) = f.bank.totals();
+    let (buy, cash) = f.desk.biggest();
+    // The one pass over the roster the dashboard makes, and it is bounded
+    // by the configured population rather than by how long the night has
+    // been going. Everything else on this screen is a counter.
+    let mut guests: Vec<GuestView> = f
+        .roster
+        .iter()
+        .filter(|p| p.presence.is_here())
+        .map(|p| GuestView {
+            id: p.id,
+            name: p.name.clone(),
+            style: p.style(),
+            tier: p.tier(&f.cfg),
+            where_now: match p.presence {
+                Presence::Seated { table } => f
+                    .instances
+                    .iter()
+                    .find(|t| t.id == table)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| "at a table".into()),
+                Presence::InTournament { id } => {
+                    f.tourneys.get(&id).map(|t| t.name.clone()).unwrap_or_else(|| "in a tournament".into())
+                }
+                _ => "on the floor".into(),
+            },
+            chips: p.chips,
+            bought: p.bought,
+            net: p.net(),
+            visits: p.lifetime.visits,
+            rounds: p.rounds,
+            staked: p.staked,
+            lifetime_net: p.lifetime.net(),
+        })
+        .collect();
+    // Biggest stacks first: on a floor of hundreds, those are the people
+    // an operator actually wants named.
+    guests.sort_by(|a, b| b.chips.cmp(&a.chips).then(a.id.cmp(&b.id)));
+    let visitors = guests.len();
+    guests.truncate(GUESTS_SHOWN);
+    ReceptionView {
+        visitors,
+        entered: f.desk.arrivals(),
+        left: f.desk.departures(),
+        bought_in,
+        cashed_out,
+        chips_out,
+        chips_in,
+        chips_in_play: f.roster.chips_in_play(),
+        biggest_buy: buy.clone(),
+        biggest_cash: cash.clone(),
+        activity: f.desk.recent(DESK_LINES),
+        guests,
     }
 }
 
@@ -1931,5 +2348,372 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------- the dashboard
+    //
+    // The rule every one of these is really testing is the same one: the
+    // operations centre is a reader. It may show anything; it may change
+    // nothing.
+
+    #[test]
+    fn the_dashboard_shows_the_tables_that_are_actually_running() {
+        let m = Manager::start(101, 250_000, 5_000_000, Badge::new());
+        m.open(Kind::Slots, 2);
+        m.open(Kind::Roulette, 1);
+        assert!(wait_for(|| m.snapshot().rounds > 4, Duration::from_secs(8)), "the floor never got going");
+
+        let d = m.dashboard();
+        assert_eq!(d.games.len(), 3, "the dashboard lost a table");
+        assert_eq!(d.global.tables, 3);
+        // Every row is a table that exists, with the id it has always had.
+        let ids: Vec<u32> = d.games.iter().map(|g| g.id).collect();
+        let mut live = m.ids();
+        live.sort_unstable();
+        let mut shown = ids.clone();
+        shown.sort_unstable();
+        assert_eq!(shown, live, "the dashboard invented or dropped a table");
+        for g in d.games.iter() {
+            let real = m.table(g.id).expect("a table the dashboard listed");
+            assert_eq!(g.name, real.name);
+            assert_eq!(g.kind, real.kind);
+            assert!(g.round <= real.round, "the dashboard reported a round that had not happened");
+        }
+    }
+
+    #[test]
+    fn the_dashboard_figures_are_the_banks_figures() {
+        let m = Manager::start(102, 250_000, 5_000_000, Badge::new());
+        m.open(Kind::Blackjack, 2);
+        assert!(wait_for(|| m.snapshot().handle > 0, Duration::from_secs(8)), "nothing was staked");
+
+        // Taken close together, and compared on the figures that cannot
+        // drift between two snapshots of a running floor: the ones that
+        // only ever climb, and the identities that must hold in both.
+        let d = m.dashboard();
+        assert_eq!(d.financials.money, d.global.money, "two views of one balance disagreed");
+        assert_eq!(d.financials.chips, d.global.chips);
+        // The bank's own arithmetic, restated: gross win is what was
+        // staked less what was paid back.
+        assert_eq!(d.financials.ggr, d.financials.handle - d.financials.payouts);
+        assert_eq!(d.financials.net_cage_flow(), d.financials.bought_in - d.financials.cashed_out);
+
+        let books = m.snapshot();
+        assert!(d.financials.handle <= books.handle, "the dashboard ran ahead of the books");
+        assert!(books.money >= d.financials.money.min(books.money), "the money went backwards impossibly");
+    }
+
+    #[test]
+    fn the_dashboard_carries_the_same_events_the_feed_published() {
+        let m = Manager::start(103, 250_000, 5_000_000, Badge::new());
+        m.open(Kind::Slots, 2);
+        assert!(wait_for(|| !m.dashboard().events.is_empty(), Duration::from_secs(8)), "no events reached the dashboard");
+        let d = m.dashboard();
+        // Nothing below `Notable` may appear: the filtering is the
+        // simulation's, and the dashboard does not get its own opinion.
+        assert!(d.events.iter().all(|r| r.weight >= Weight::Notable), "routine traffic reached the dashboard");
+        // In the order they were published, oldest first.
+        assert!(d.events.windows(2).all(|w| w[0].seq < w[1].seq), "the feed came through out of order");
+    }
+
+    #[test]
+    fn looking_at_the_dashboard_changes_nothing_at_all() {
+        let m = Manager::start(104, 250_000, 5_000_000, Badge::new());
+        m.open(Kind::Slots, 2);
+        m.open(Kind::Keno, 1);
+        assert!(wait_for(|| m.snapshot().rounds > 5, Duration::from_secs(8)), "the floor never got going");
+
+        let before = m.snapshot();
+        let ids_before = m.ids();
+        let seed_before = m.seed();
+        // Hammer the dashboard the way a screen open for a while would.
+        for _ in 0..40 {
+            let _ = m.dashboard();
+        }
+        let after = m.snapshot();
+        assert_eq!(m.ids(), ids_before, "the floor plan changed under a reader");
+        assert_eq!(m.seed(), seed_before, "reading reseeded the floor");
+        assert_eq!(after.known, after.known.max(before.known), "people stopped existing");
+        assert!(after.rounds >= before.rounds, "the floor went backwards");
+        assert!(after.handle >= before.handle, "the books went backwards");
+    }
+
+    #[test]
+    fn a_table_opened_from_the_dashboard_is_the_one_that_was_already_running() {
+        let m = Manager::start(105, 250_000, 5_000_000, Badge::new());
+        m.open(Kind::Slots, 3);
+        assert!(wait_for(|| m.dashboard().games.iter().all(|g| g.round >= 2), Duration::from_secs(10)), "not every table got going");
+
+        let picked = m.dashboard().games[1].clone();
+        // What "opening" a game from the dashboard does: ask for that id.
+        let inspected = m.table(picked.id).expect("the selected table");
+        assert_eq!(inspected.id, picked.id, "a different table was opened");
+        assert!(inspected.round >= picked.round, "the table was restarted rather than inspected");
+
+        // And it keeps running while it is being looked at.
+        let then = inspected.round;
+        assert!(
+            wait_for(|| m.table(picked.id).map(|t| t.round > then).unwrap_or(false), Duration::from_secs(8)),
+            "the inspected table stopped dealing"
+        );
+        assert_eq!(m.table_count(), 3, "inspecting a table changed the floor");
+    }
+
+    #[test]
+    fn the_floor_keeps_playing_while_the_dashboard_is_open() {
+        let m = Manager::start(106, 250_000, 5_000_000, Badge::new());
+        m.open(Kind::Slots, 2);
+        assert!(wait_for(|| m.dashboard().global.tables == 2, Duration::from_secs(4)));
+        let before: u64 = m.dashboard().games.iter().map(|g| g.round).sum();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let _ = m.dashboard();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let after: u64 = m.dashboard().games.iter().map(|g| g.round).sum();
+        assert!(after > before, "the floor stood still while the dashboard was open");
+    }
+
+    // -------------------------------------------------------- the cage
+
+    #[test]
+    fn buy_ins_and_cash_outs_both_reach_the_desk() {
+        let m = Manager::start(107, 250_000, 50_000_000, Badge::new());
+        let mut cfg = m.config();
+        // A fast night with a lot of coming and going, so both directions
+        // of the counter are exercised inside a test's patience.
+        cfg.speed = 10_000;
+        m.configure(cfg);
+        m.open(Kind::Slots, 4);
+
+        assert!(
+            wait_for(|| m.dashboard().reception.entered > 0, Duration::from_secs(12)),
+            "nobody was recorded coming through the door"
+        );
+        assert!(
+            wait_for(|| m.dashboard().reception.left > 0, Duration::from_secs(20)),
+            "nobody was recorded leaving"
+        );
+
+        let r = m.dashboard().reception;
+        assert!(!r.activity.is_empty(), "the day book stayed empty");
+        assert!(r.chips_out > 0, "no chips were issued at the counter");
+        assert!(r.bought_in > 0, "no cash was taken at the counter");
+        // The desk's money figures are the bank's, so they match the books
+        // exactly rather than approximately.
+        let books = m.snapshot();
+        let (_, _, bought, cashed) = books.totals;
+        let again = m.dashboard().reception;
+        assert!(again.bought_in >= bought, "the desk lagged the bank on buy-ins");
+        assert!(again.cashed_out >= cashed, "the desk lagged the bank on cash-outs");
+    }
+
+    #[test]
+    fn the_desks_day_book_never_grows_without_bound() {
+        let m = Manager::start(108, 250_000, 50_000_000, Badge::new());
+        let mut cfg = m.config();
+        cfg.speed = 10_000;
+        m.configure(cfg);
+        m.open(Kind::Slots, 4);
+        assert!(wait_for(|| m.dashboard().reception.entered > 0, Duration::from_secs(20)), "the door stayed shut");
+        // Let the night run on well past the size of the ring, so this is
+        // a real test of the bound rather than of an empty book.
+        std::thread::sleep(Duration::from_secs(5));
+        let r = m.dashboard().reception;
+        assert!(r.entered > 0);
+        assert!(
+            r.activity.len() <= super::super::reception::KEPT,
+            "the day book held {} lines, more than the {} it is allowed",
+            r.activity.len(),
+            super::super::reception::KEPT
+        );
+    }
+
+    // -------------------------------------------------------- reseeding
+
+    #[test]
+    fn reseeding_changes_the_seed_and_nothing_else() {
+        let m = Manager::start(109, 250_000, 5_000_000, Badge::new());
+        m.open(Kind::Slots, 2);
+        m.open(Kind::Roulette, 1);
+        assert!(wait_for(|| m.snapshot().rounds > 10, Duration::from_secs(10)), "the floor never got going");
+
+        let before = m.snapshot();
+        let people_before = before.known;
+        let ids_before = m.ids();
+        let handle_before = before.handle;
+        let money_before = before.money;
+        let rounds_before = before.rounds;
+
+        let (was, now) = m.reseed(4_242);
+        assert_eq!(was, 109, "the old seed was not the one the casino opened on");
+        assert_eq!(now, 4_242);
+        assert_eq!(m.seed(), 4_242, "the new seed did not stick");
+
+        let after = m.snapshot();
+        // The world is untouched. Every one of these is a thing a careless
+        // "reseed" would have destroyed.
+        assert_eq!(m.ids(), ids_before, "the tables were rebuilt");
+        assert!(after.known >= people_before, "people the casino knew were forgotten");
+        assert!(after.handle >= handle_before, "the books were wound back");
+        assert!(after.rounds >= rounds_before, "the rounds already played were lost");
+        assert!(after.money != 0 || money_before == 0, "the cage was emptied");
+    }
+
+    #[test]
+    fn the_casino_carries_on_running_through_a_reseed() {
+        let m = Manager::start(110, 250_000, 5_000_000, Badge::new());
+        m.open(Kind::Slots, 2);
+        assert!(wait_for(|| m.snapshot().rounds > 5, Duration::from_secs(8)), "the floor never got going");
+        let before = m.snapshot().rounds;
+        m.reseed(9_001);
+        assert!(m.is_running(), "the simulation thread stopped for a reseed");
+        assert!(
+            wait_for(|| m.snapshot().rounds > before + 5, Duration::from_secs(8)),
+            "the floor stopped dealing after a reseed"
+        );
+    }
+
+    #[test]
+    fn a_reseeded_floor_rolls_differently_from_here() {
+        // Two casinos opened identically diverge once one of them is
+        // reseeded — which is the only observable thing a reseed does.
+        let a = Manager::start(777, 250_000, 5_000_000, Badge::new());
+        let b = Manager::start(777, 250_000, 5_000_000, Badge::new());
+        for m in [&a, &b] {
+            let mut cfg = m.config();
+            cfg.speed = 10_000;
+            m.configure(cfg);
+            m.open(Kind::Slots, 1);
+        }
+        b.reseed(778);
+        assert!(
+            wait_for(|| a.snapshot().rounds > 20 && b.snapshot().rounds > 20, Duration::from_secs(20)),
+            "neither floor got going"
+        );
+        // Not a claim about which is bigger — only that the same opening
+        // seed no longer produces the same night.
+        assert_ne!(a.seed(), b.seed());
+    }
+
+    // ------------------------------------------------ operator tournaments
+
+    #[test]
+    fn an_operator_can_start_a_tournament_and_it_fields_real_people() {
+        let m = Manager::start(111, 500_000, 500_000_000, Badge::new());
+        m.open(Kind::Blackjack, 2);
+        let cfg = m.config();
+        let id = m
+            .start_tournament(Kind::Blackjack, 16, cfg.tourney_buy_in, cfg.tourney_stack)
+            .expect("the tournament should have been fielded");
+
+        let t = m.tourney(id).expect("the tournament exists");
+        assert!(t.entered() >= cfg.tourney_min_field, "the field was too small to play");
+        assert_ne!(t.stage, Stage::Registering, "it never started");
+
+        // Every runner is somebody the casino knows, with an id of their
+        // own that nothing else in the building shares.
+        let mut ids: Vec<u64> = t.field.iter().map(|e| e.patron).collect();
+        let entered = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), entered, "the same person entered twice");
+        for e in t.field.iter() {
+            let p = m.patron(e.patron).expect("a runner who is not in the roster");
+            assert_eq!(p.name, e.name, "the tournament and the roster disagree about who this is");
+        }
+    }
+
+    #[test]
+    fn an_operator_tournament_plays_itself_down_without_being_watched() {
+        let m = Manager::start(112, 500_000, 500_000_000, Badge::new());
+        m.open(Kind::Slots, 1);
+        let mut cfg = m.config();
+        cfg.speed = 10_000;
+        m.configure(cfg.clone());
+        let id = m.start_tournament(Kind::Slots, 8, cfg.tourney_buy_in, cfg.tourney_stack).expect("fielded");
+
+        // Nothing below asks it to do anything — it is on the simulation
+        // thread now.
+        assert!(
+            wait_for(|| m.tourney(id).map(|t| t.stage == Stage::Done).unwrap_or(true), Duration::from_secs(40)),
+            "the tournament never played down to a winner"
+        );
+        let Some(t) = m.tourney(id) else { return };
+        assert!(!t.paid.is_empty(), "nobody was paid");
+        assert_eq!(t.paid.iter().map(|p| p.prize).sum::<i64>(), t.pool, "the pool was not paid out in full");
+        let winner = &t.paid[0];
+        assert_eq!(winner.place, 1);
+        assert!(m.patron(winner.patron).is_some(), "the winner was a stand-in, not a person");
+    }
+
+    #[test]
+    fn the_house_takes_its_configured_cut_of_an_operator_tournament_and_no_more() {
+        let m = Manager::start(113, 500_000, 500_000_000, Badge::new());
+        m.open(Kind::Slots, 1);
+        let cfg = m.config();
+        let buy_in = cfg.tourney_buy_in;
+        let id = m.start_tournament(Kind::Slots, 12, buy_in, cfg.tourney_stack).expect("fielded");
+        let t = m.tourney(id).expect("the tournament exists");
+
+        let expected_rake = buy_in * cfg.tourney_rake / 100 * t.entered() as i64;
+        assert_eq!(t.rake, expected_rake, "the house took something other than its configured cut");
+        assert_eq!(t.pool, (buy_in - buy_in * cfg.tourney_rake / 100) * t.entered() as i64);
+        // Every entry went through the books as turnover, exactly as a bet
+        // at a table does.
+        let books = m.snapshot();
+        assert!(books.handle >= buy_in * t.entered() as i64, "the entries never reached the books");
+        assert!(
+            books.by_table.iter().any(|(k, _)| *k == "tourney"),
+            "the tournament did not appear in the per-game ledger"
+        );
+    }
+
+    #[test]
+    fn a_tournament_that_cannot_be_fielded_costs_nobody_anything() {
+        let m = Manager::start(114, 250_000, 5_000_000, Badge::new());
+        m.open(Kind::Slots, 1);
+        let before = m.snapshot();
+        // An entry fee nobody in the building could ever cover — a patron
+        // buys in for what a patron buys in for, and it is nowhere near
+        // this.
+        let refused = m.start_tournament(Kind::Slots, 8, 500_000_000, 10_000);
+        assert!(refused.is_none(), "a tournament nobody could enter was somehow started");
+        let after = m.snapshot();
+        // Nobody was charged the entry: whatever moved at the cage moved
+        // because somebody bought chips for a visit, which is a thing that
+        // happens all night regardless.
+        assert!(
+            after.handle - before.handle < 500_000_000,
+            "an entry fee was taken for a tournament that never ran"
+        );
+        assert!(m.tourney(0).is_none(), "a phantom tournament was left on the floor");
+    }
+
+    #[test]
+    fn an_operator_tournament_announces_itself_on_the_feed() {
+        let m = Manager::start(115, 500_000, 500_000_000, Badge::new());
+        m.open(Kind::Slots, 1);
+        let cursor = m.feed_cursor();
+        let cfg = m.config();
+        m.start_tournament(Kind::Slots, 8, cfg.tourney_buy_in, cfg.tourney_stack).expect("fielded");
+        let (fresh, _) = m.feed_since(cursor, Weight::Notable);
+        assert!(
+            fresh.iter().any(|r| matches!(&r.event, Event::Tourney { .. })),
+            "starting a tournament said nothing on the event bus"
+        );
+    }
+
+    #[test]
+    fn a_reseed_is_announced_the_way_everything_else_is() {
+        let m = Manager::start(116, 250_000, 5_000_000, Badge::new());
+        m.open(Kind::Slots, 1);
+        let cursor = m.feed_cursor();
+        m.reseed(31_337);
+        let (fresh, _) = m.feed_since(cursor, Weight::Notable);
+        assert!(
+            fresh.iter().any(|r| matches!(&r.event, Event::Reseeded { now, .. } if *now == 31_337)),
+            "the reseed was not published"
+        );
     }
 }
