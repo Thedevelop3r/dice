@@ -10,6 +10,7 @@
 
 use super::{table, Ctx};
 use crate::economy::Wallet;
+use crate::rng::Rng;
 use crate::ui::{self, widgets};
 
 const KEY: &str = "bigsix";
@@ -294,6 +295,31 @@ pub fn idle(ctx: &mut Ctx) {
     }
 }
 
+/// One spin with a bet on `bet`, no rendering. The wheel's own draw is a
+/// uniform pick over the rim, which is exactly what `play` does.
+pub fn simulate_at(rng: &mut Rng, which: usize) -> (i64, i64) {
+    let bet = bet(which);
+    let wheel = rim();
+    let landed = wheel[rng.below(wheel.len())];
+    (100, payout(bet, landed, 100))
+}
+
+#[cfg(test)]
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    simulate_at(rng, 0)
+}
+
+/// The segments the audit harness walks, by index — `Seg` stays private.
+pub const BETS: usize = 7;
+
+fn bet(i: usize) -> Seg {
+    [Seg::One, Seg::Two, Seg::Five, Seg::Ten, Seg::Twenty, Seg::Joker, Seg::Logo][i % BETS]
+}
+
+pub fn bet_name(i: usize) -> &'static str {
+    bet(i).name()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +387,20 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), faces.len(), "two segments would be indistinguishable on the rim");
+    }
+
+    #[test]
+    fn every_segment_prices_exactly() {
+        // Fifty-four segments, so no simulation is needed to know what the
+        // wheel returns on any bet.
+        let wheel = rim();
+        for (seg, _) in Seg::GROUPS {
+            let back: i64 = wheel.iter().map(|landed| payout(seg, *landed, 100)).sum();
+            let rtp = back as f64 / (wheel.len() as f64 * 100.0);
+            assert!(rtp < 1.0, "{} returns {rtp:.4}", seg.name());
+            // Big Six is famously the meanest wheel on any floor; this is
+            // the real thing, not a softened version, so the floor is low.
+            assert!(rtp > 0.70, "{} returns {rtp:.4}", seg.name());
+        }
     }
 }

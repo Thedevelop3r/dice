@@ -10,6 +10,7 @@
 use super::cards::{self, Card, Shoe, ThreeRank};
 use super::{table, Ctx};
 use crate::economy::Wallet;
+use crate::rng::Rng;
 use crate::ui::{self, card_art, widgets};
 
 const KEY: &str = "threecard";
@@ -251,6 +252,19 @@ pub fn idle(ctx: &mut Ctx) {
             return;
         }
     }
+}
+
+/// One hand played the textbook line — play anything queen-six-four or
+/// better, fold the rest.
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    let mut shoe = Shoe::new(rng, 1);
+    let player: Vec<Card> = shoe.deal(rng, 3);
+    let dealer: Vec<Card> = shoe.deal(rng, 3);
+    let score = cards::evaluate3(&player);
+    let plays = score.rank > ThreeRank::HighCard || score.kickers.first().is_some_and(|r| *r >= 12);
+    let out = outcome(&player, &dealer, !plays);
+    let ante = 100;
+    (total_staked(out, ante), payout(out, ante_bonus(&player).0, ante))
 }
 
 #[cfg(test)]

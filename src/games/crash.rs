@@ -9,6 +9,7 @@
 
 use super::{table, Ctx};
 use crate::economy::Wallet;
+use crate::rng::Rng;
 use crate::ui::{self, widgets, Poll};
 
 const KEY: &str = "crash";
@@ -25,8 +26,8 @@ const GROWTH_DEN: i64 = 50;
 const CASH_KEY: char = 'c';
 
 /// Draws where this round stops, in hundredths. Never below 1.00x.
-fn crash_point(ctx: &mut Ctx) -> i64 {
-    let r = ctx.rng.below(GRAIN as usize) as i64 + 1;
+fn crash_point(rng: &mut Rng) -> i64 {
+    let r = rng.below(GRAIN as usize) as i64 + 1;
     (HOUSE_SHARE * GRAIN / r).max(100)
 }
 
@@ -117,7 +118,7 @@ pub fn play(ctx: &mut Ctx) {
             continue;
         }
 
-        let stop = crash_point(ctx);
+        let stop = crash_point(ctx.rng);
         let mut mult = 100i64;
         let mut cashed: Option<i64> = None;
         let mut left = false;
@@ -178,7 +179,7 @@ pub fn idle(ctx: &mut Ctx) {
     loop {
         let punter = table::BOT_NAMES[ctx.rng.below(table::BOT_NAMES.len())];
         let stake = 10 + 5 * ctx.rng.below(5) as i64;
-        let stop = crash_point(ctx);
+        let stop = crash_point(ctx.rng);
         let nerve = 130 + 40 * ctx.rng.below(20) as i64;
         let mut mult = 100i64;
         let mut cashed = None;
@@ -216,20 +217,29 @@ pub fn idle(ctx: &mut Ctx) {
     }
 }
 
+/// One round cashed out at a fixed multiplier, no rendering. The cash-out
+/// point is the whole strategy here, so the harness fixes it.
+pub fn simulate_at(rng: &mut Rng, cash_at: i64) -> (i64, i64) {
+    if crash_point(rng) >= cash_at { (100, 100 * cash_at / 100) } else { (100, 0) }
+}
+
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    simulate_at(rng, 200)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ctx_with(seed: u64) -> (crate::rng::Rng, crate::stats::Store, crate::ui::Screen) {
-        (crate::rng::Rng::from_seed(seed), crate::stats::Store::blank(), crate::ui::Screen::headless())
+    fn probe(seed: u64) -> Rng {
+        Rng::from_seed(seed)
     }
 
     #[test]
     fn a_round_never_stops_below_evens() {
-        let (mut rng, mut store, mut screen) = ctx_with(2);
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+        let mut rng = probe(2);
         for _ in 0..5_000 {
-            assert!(crash_point(&mut ctx) >= 100);
+            assert!(crash_point(&mut rng) >= 100);
         }
     }
 
@@ -237,13 +247,12 @@ mod tests {
     fn the_curve_follows_the_advertised_survival_odds() {
         // P(crash >= x) should be about 0.99/x. Two sample points either
         // side of the common cash-out are enough to catch a broken draw.
-        let (mut rng, mut store, mut screen) = ctx_with(99);
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+        let mut rng = probe(99);
         let n = 40_000;
         let mut past_2x = 0;
         let mut past_10x = 0;
         for _ in 0..n {
-            let c = crash_point(&mut ctx);
+            let c = crash_point(&mut rng);
             if c >= 200 {
                 past_2x += 1;
             }
@@ -296,12 +305,11 @@ mod tests {
     fn the_house_keeps_its_share_over_a_long_run() {
         // Cashing out at a fixed 2x every round must return a little under
         // the stake — that gap is the edge, and it must actually be there.
-        let (mut rng, mut store, mut screen) = ctx_with(7);
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+        let mut rng = probe(7);
         let n = 40_000;
         let mut returned = 0i64;
         for _ in 0..n {
-            if crash_point(&mut ctx) >= 200 {
+            if crash_point(&mut rng) >= 200 {
                 returned += 200;
             }
         }

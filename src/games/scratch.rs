@@ -8,6 +8,7 @@
 
 use super::{table, Ctx};
 use crate::economy::Wallet;
+use crate::rng::Rng;
 use crate::ui::{self, widgets};
 
 const KEY: &str = "scratch";
@@ -39,8 +40,8 @@ fn faces() -> Vec<&'static str> {
 }
 
 /// Draws a card from the print run: which prize tier it is.
-fn press_card(ctx: &mut Ctx) -> usize {
-    let roll = ctx.rng.below(RUN as usize) as i64;
+fn press_card(rng: &mut Rng) -> usize {
+    let roll = rng.below(RUN as usize) as i64;
     let mut seen = 0;
     for (i, (_, _, weight)) in PRIZES.iter().enumerate() {
         seen += weight;
@@ -54,7 +55,7 @@ fn press_card(ctx: &mut Ctx) -> usize {
 /// Lays out the nine panels so they show exactly the prize the card was
 /// pressed with: three of the winning symbol for a winner, and no symbol
 /// three times over for a loser.
-fn lay_panels(ctx: &mut Ctx, tier: usize) -> Vec<&'static str> {
+fn lay_panels(rng: &mut Rng, tier: usize) -> Vec<&'static str> {
     let pool = faces();
     let mut panels: Vec<&'static str> = Vec::with_capacity(PANELS);
     if tier > 0 {
@@ -65,7 +66,7 @@ fn lay_panels(ctx: &mut Ctx, tier: usize) -> Vec<&'static str> {
         let others: Vec<&'static str> = pool.iter().copied().filter(|s| *s != winner).collect();
         let mut counts = vec![0usize; others.len()];
         while panels.len() < PANELS {
-            let i = ctx.rng.below(others.len());
+            let i = rng.below(others.len());
             if counts[i] < 2 {
                 counts[i] += 1;
                 panels.push(others[i]);
@@ -76,7 +77,7 @@ fn lay_panels(ctx: &mut Ctx, tier: usize) -> Vec<&'static str> {
         // over nine panels at two apiece leaves plenty of room.
         let mut counts = vec![0usize; pool.len()];
         while panels.len() < PANELS {
-            let i = ctx.rng.below(pool.len());
+            let i = rng.below(pool.len());
             if counts[i] < 2 {
                 counts[i] += 1;
                 panels.push(pool[i]);
@@ -84,7 +85,7 @@ fn lay_panels(ctx: &mut Ctx, tier: usize) -> Vec<&'static str> {
         }
     }
     for i in (1..panels.len()).rev() {
-        let j = ctx.rng.below(i + 1);
+        let j = rng.below(i + 1);
         panels.swap(i, j);
     }
     panels
@@ -177,8 +178,8 @@ pub fn play(ctx: &mut Ctx) {
             continue;
         }
 
-        let tier = press_card(ctx);
-        let panels = lay_panels(ctx, tier);
+        let tier = press_card(ctx.rng);
+        let panels = lay_panels(ctx.rng, tier);
         for revealed in 1..=PANELS {
             draw_card(ctx, &panels, revealed, stake, None, &ctx.theme().dim("scratching..."));
             ctx.screen.present();
@@ -209,8 +210,8 @@ pub fn idle(ctx: &mut Ctx) {
     let stake = 10;
     loop {
         let punter = table::BOT_NAMES[ctx.rng.below(table::BOT_NAMES.len())];
-        let tier = press_card(ctx);
-        let panels = lay_panels(ctx, tier);
+        let tier = press_card(ctx.rng);
+        let panels = lay_panels(ctx.rng, tier);
         let theme = ctx.theme();
         let headline = theme.dim(&format!("{punter} buys a card"));
         for revealed in 1..=PANELS {
@@ -237,12 +238,20 @@ pub fn idle(ctx: &mut Ctx) {
     }
 }
 
+/// One card off the press, read the way a player reads it — off the
+/// panels, not off the tier it was pressed with.
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    let tier = press_card(rng);
+    let panels = lay_panels(rng, tier);
+    (100, 100 * card_value(&panels).0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn probe() -> (crate::rng::Rng, crate::stats::Store, crate::ui::Screen) {
-        (crate::rng::Rng::from_seed(31), crate::stats::Store::blank(), crate::ui::Screen::headless())
+    fn probe() -> Rng {
+        Rng::from_seed(31)
     }
 
     #[test]
@@ -270,11 +279,10 @@ mod tests {
 
     #[test]
     fn a_winning_card_shows_exactly_the_prize_it_was_pressed_with() {
-        let (mut rng, mut store, mut screen) = probe();
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+        let mut rng = probe();
         for tier in 1..PRIZES.len() {
             for _ in 0..200 {
-                let panels = lay_panels(&mut ctx, tier);
+                let panels = lay_panels(&mut rng, tier);
                 assert_eq!(panels.len(), PANELS);
                 let (mult, symbol) = card_value(&panels);
                 assert_eq!(mult, PRIZES[tier].1, "tier {tier} laid out as {mult}x");
@@ -285,10 +293,9 @@ mod tests {
 
     #[test]
     fn a_losing_card_never_shows_three_of_anything() {
-        let (mut rng, mut store, mut screen) = probe();
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+        let mut rng = probe();
         for _ in 0..2_000 {
-            let panels = lay_panels(&mut ctx, 0);
+            let panels = lay_panels(&mut rng, 0);
             assert_eq!(panels.len(), PANELS);
             assert_eq!(card_value(&panels), (0, ""), "a losing card paid: {panels:?}");
         }
@@ -297,11 +304,10 @@ mod tests {
     #[test]
     fn a_winning_card_carries_no_second_winner() {
         // Two three-of-a-kinds on one card would make the payout ambiguous.
-        let (mut rng, mut store, mut screen) = probe();
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+        let mut rng = probe();
         for tier in 1..PRIZES.len() {
             for _ in 0..200 {
-                let panels = lay_panels(&mut ctx, tier);
+                let panels = lay_panels(&mut rng, tier);
                 let triples = faces().iter().filter(|s| panels.iter().filter(|p| *p == *s).count() >= 3).count();
                 assert_eq!(triples, 1, "tier {tier} produced {triples} winning symbols");
             }
@@ -310,12 +316,11 @@ mod tests {
 
     #[test]
     fn the_press_draws_every_tier_in_roughly_its_share() {
-        let (mut rng, mut store, mut screen) = probe();
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
+        let mut rng = probe();
         let n = 200_000;
         let mut counts = vec![0i64; PRIZES.len()];
         for _ in 0..n {
-            counts[press_card(&mut ctx)] += 1;
+            counts[press_card(&mut rng)] += 1;
         }
         // The losing card is the bulk of the run and the easiest to check.
         let losing = counts[0] as f64 / n as f64;

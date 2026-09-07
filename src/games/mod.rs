@@ -1,3 +1,5 @@
+#[cfg(test)]
+pub mod audit;
 pub mod baccarat;
 pub mod bigsix;
 pub mod bingo;

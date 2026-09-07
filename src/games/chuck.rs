@@ -2,6 +2,7 @@
 
 use super::{table, Ctx};
 use crate::economy::{House, Wallet};
+use crate::rng::Rng;
 use crate::ui::{self, dice_art, widgets};
 
 const BAILOUT: i64 = 50;
@@ -213,6 +214,57 @@ pub fn idle(ctx: &mut Ctx) {
         ctx.screen.present();
         if table::idle_hold(2_200) {
             return;
+        }
+    }
+}
+
+/// Every bet the board offers, for the audit harness.
+/// The bets the audit harness walks, addressed by index so this module's
+/// private `Bet` never has to leave it.
+pub const BETS: usize = 4;
+
+fn bet(i: usize) -> Bet {
+    [Bet::High, Bet::Low, Bet::Triple, Bet::Number(6)][i % BETS]
+}
+
+pub fn bet_name(i: usize) -> String {
+    bet(i).label()
+}
+
+/// One roll against a given bet, no rendering.
+pub fn simulate_at(rng: &mut Rng, which: usize) -> (i64, i64) {
+    let bet = bet(which);
+    let roll: Vec<u32> = (0..3).map(|_| rng.roll(6)).collect();
+    let stake = 100;
+    // Chuck-a-Luck states a *net* multiplier, so the gross back is the
+    // stake plus it — and a losing bet returns nothing rather than less.
+    (stake, (stake + stake * bet.payout(&roll)).max(0))
+}
+
+#[cfg(test)]
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    simulate_at(rng, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_bet_on_the_board_keeps_a_house_edge() {
+        // Three dice is 216 outcomes, so every bet can be priced exactly.
+        for bet in [Bet::High, Bet::Low, Bet::Triple, Bet::Number(1), Bet::Number(3), Bet::Number(6)] {
+            let mut net = 0i64;
+            for a in 1..=6u32 {
+                for b in 1..=6u32 {
+                    for c in 1..=6u32 {
+                        net += bet.payout(&[a, b, c]);
+                    }
+                }
+            }
+            let rtp = 1.0 + net as f64 / 216.0;
+            assert!(rtp < 1.0, "{} returns {rtp:.4} — that bet is a giveaway", bet.label());
+            assert!(rtp > 0.70, "{} returns {rtp:.4} — that bet is daylight robbery", bet.label());
         }
     }
 }

@@ -7,6 +7,7 @@
 //! whole presentation layer; game logic below never touches the terminal
 //! directly.
 
+mod casino;
 mod dice;
 mod economy;
 mod games;
@@ -16,6 +17,7 @@ mod shop;
 mod stats;
 mod ui;
 
+use casino::Manager;
 use games::{
     baccarat, bigsix, bingo, blackjack, chuck, crash, floor, hilo, horses, keno, lab, luckbet, mines, pig, plinko, roulette, scratch, slots, threecard,
     tournament, ultra, vidpoker, war, yahtzee, Ctx, Player,
@@ -24,7 +26,7 @@ use rng::Rng;
 use stats::Store;
 use ui::menu::{choose_from, MenuItem};
 use ui::widgets;
-use ui::{Screen, Theme};
+use ui::{Badge, Screen, Theme};
 
 fn main() {
     let mut store = Store::load();
@@ -34,6 +36,16 @@ fn main() {
     };
     let colors = store.get_i64("cfg.colors", 1) == 1;
     let mut screen = Screen::open(colors);
+
+    // Attached before the first frame, so the moment a casino is opened its
+    // balances appear on every screen in the app without another line of
+    // wiring anywhere.
+    let badge = Badge::new();
+    screen.attach_badge(badge.clone());
+    // The running casino, if the user has opened one. It outlives every
+    // screen below: nothing here starts, stops or steps it except the
+    // Casino entry itself.
+    let mut casino: Option<Manager> = None;
 
     if store.get_str("player.name", "").is_empty() {
         screen.begin();
@@ -80,6 +92,10 @@ fn main() {
             MenuItem::new('3', "The Wheels", "Roulette and the Big Six money wheel"),
             MenuItem::new('4', "The Arcade", "slots, keno, bingo, plinko, mines, crash, scratch cards, the races"),
             MenuItem::new('5', "Idle Screens", "every table running itself — or the whole floor in turn"),
+            match &casino {
+                Some(m) => MenuItem::new('a', "The Casino", format!("live — {} tables running themselves right now", m.table_count())),
+                None => MenuItem::new('a', "Start Casino", "open the floor: tables deal themselves, the books move"),
+            },
             MenuItem::new('s', "Store", "chips, dollars and lucky charms"),
             MenuItem::new('i', "Stats", "your history across every table"),
             MenuItem::new('h', "History", "past Ultra Casino Dice sessions"),
@@ -95,6 +111,7 @@ fn main() {
             Some('3') => wheel_room(&mut store, &mut rng, &mut screen),
             Some('4') => arcade_room(&mut store, &mut rng, &mut screen),
             Some('5') => idle_room(&mut store, &mut rng, &mut screen),
+            Some('a') => casino_floor(&mut casino, &badge, &mut store, &mut screen),
             Some('s') => shop::open(&mut store, &mut screen),
             Some('i') => show_stats(&mut store, &mut screen),
             Some('h') => show_history(&mut screen),
@@ -106,6 +123,13 @@ fn main() {
         }
     }
 
+    if let Some(mut m) = casino.take() {
+        let _ = m.saved().write(&casino::save::path());
+        let (money, chips) = m.stop();
+        store.set_i64("casino.money", money);
+        store.set_i64("casino.chips", chips);
+        badge.clear();
+    }
     let _ = store.save();
     drop(screen);
     println!("\n  thanks for playing — the house always keeps the lights on.\n");
@@ -261,6 +285,65 @@ fn arcade_room(store: &mut Store, rng: &mut Rng, screen: &mut Screen) {
             _ => return,
         }
     }
+}
+
+/// The casino: start the floor, then watch any of it.
+///
+/// The manager lives in `main`, not here, which is the whole point — this
+/// function opens a view onto a simulation that is already running and
+/// keeps running after it returns. Leaving this screen does not close a
+/// single table.
+fn casino_floor(casino: &mut Option<Manager>, badge: &Badge, store: &mut Store, screen: &mut Screen) {
+    if casino.is_none() {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x5EED);
+
+        // A casino that has run before is reopened rather than rebuilt:
+        // the books, the regulars and the floor plan all carry on. Only if
+        // there is nothing saved — or what is saved cannot be read — does
+        // the opening screen ask what sort of floor to lay out.
+        match casino::save::Save::load(&casino::save::path()) {
+            Ok(save) if !save.tables.is_empty() => {
+                *casino = Some(Manager::resume(seed, &save, badge.clone()));
+            }
+            other => {
+                if let Err(fault) = other
+                    && fault != casino::save::Fault::Missing
+                {
+                    // Say so rather than silently starting a new casino
+                    // over the top of one somebody has hours in.
+                    casino::ui::trouble(screen, &fault.describe());
+                }
+                let Some(plan) = casino::ui::opening(screen) else { return };
+                let (money, chips) = casino::manager::opening_balances();
+                let money = store.get_i64("casino.money", money);
+                let chips = store.get_i64("casino.chips", chips);
+                let m = Manager::start(seed, money, chips, badge.clone());
+                for (kind, n) in plan {
+                    m.open(kind, n);
+                }
+                *casino = Some(m);
+            }
+        }
+    }
+    let Some(m) = casino.as_ref() else { return };
+
+    // The badge is refreshed from the manager on the way in and on every
+    // pass below; the simulation thread keeps moving the numbers under it.
+    // The simulation thread keeps the badge current by itself; all this
+    // loop does is show the floor and remember the balances on the way out.
+    while let Some(id) = casino::ui::floor(m, screen) {
+        casino::ui::watch(m, screen, id);
+    }
+    // Written on the way out of the floor screen as well as on the way out
+    // of the program, so an hour of a night is not lost to a power cut.
+    let _ = m.saved().write(&casino::save::path());
+    let (money, chips) = m.balances();
+    store.set_i64("casino.money", money);
+    store.set_i64("casino.chips", chips);
+    let _ = store.save();
 }
 
 /// The idle screens: any single table left running itself, or the whole

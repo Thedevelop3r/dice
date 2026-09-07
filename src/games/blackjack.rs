@@ -7,7 +7,31 @@
 use super::cards::{self, Card, Shoe};
 use super::{table, Ctx};
 use crate::economy::{House, Wallet};
+use crate::rng::Rng;
 use crate::ui::{self, card_art, widgets};
+
+/// What a finished hand returns, gross, and what to call it. Lifted out
+/// of `play` so the audit harness settles hands through the same code the
+/// table does rather than a restatement of it.
+fn settle_hand(player: u32, dealer: u32, player_bj: bool, dealer_bj: bool, bet: i64) -> (i64, &'static str) {
+    if player > 21 {
+        (0, "you bust — dealer wins")
+    } else if player_bj && dealer_bj {
+        (bet, "both blackjack — push")
+    } else if player_bj {
+        (bet + bet * 3 / 2, "BLACKJACK! pays 3:2")
+    } else if dealer_bj {
+        (0, "dealer has blackjack")
+    } else if dealer > 21 {
+        (bet * 2, "dealer busts — you win")
+    } else if player > dealer {
+        (bet * 2, "you win")
+    } else if player == dealer {
+        (bet, "push")
+    } else {
+        (0, "dealer wins")
+    }
+}
 
 /// Best total <=21 (aces flex between 11 and 1), and whether it's soft.
 fn hand_total(cards: &[Card]) -> (u32, bool) {
@@ -123,23 +147,7 @@ pub fn play(ctx: &mut Ctx) {
         let (dealer_final, _) = hand_total(&dealer);
         let theme = ctx.theme();
 
-        let (delta, outcome) = if player_final > 21 {
-            (0, "you bust — dealer wins")
-        } else if player_has_bj && dealer_has_bj {
-            (bet, "both blackjack — push")
-        } else if player_has_bj {
-            (bet + bet * 3 / 2, "BLACKJACK! pays 3:2")
-        } else if dealer_has_bj {
-            (0, "dealer has blackjack")
-        } else if dealer_final > 21 {
-            (bet * 2, "dealer busts — you win")
-        } else if player_final > dealer_final {
-            (bet * 2, "you win")
-        } else if player_final == dealer_final {
-            (bet, "push")
-        } else {
-            (0, "dealer wins")
-        };
+        let (delta, outcome) = settle_hand(player_final, dealer_final, player_has_bj, dealer_has_bj, bet);
 
         if delta > 0 {
             Wallet::new(ctx.store).add_chips(delta);
@@ -303,6 +311,30 @@ pub fn idle(ctx: &mut Ctx) {
             return;
         }
     }
+}
+
+/// One hand played off the book — hit below seventeen, stand on it, no
+/// doubling. That is short of full basic strategy, so the return this
+/// produces is a floor rather than the table's headline figure.
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    let mut shoe = Shoe::new(rng, 6);
+    let bet = 100;
+    let mut player = vec![shoe.draw(rng), shoe.draw(rng)];
+    let mut dealer = vec![shoe.draw(rng), shoe.draw(rng)];
+    let player_bj = hand_total(&player).0 == 21;
+    let dealer_bj = hand_total(&dealer).0 == 21;
+    if !(player_bj || dealer_bj) {
+        while hand_total(&player).0 < 17 {
+            player.push(shoe.draw(rng));
+        }
+        if hand_total(&player).0 <= 21 {
+            while hand_total(&dealer).0 < 17 {
+                dealer.push(shoe.draw(rng));
+            }
+        }
+    }
+    let (back, _) = settle_hand(hand_total(&player).0, hand_total(&dealer).0, player_bj, dealer_bj, bet);
+    (bet, back)
 }
 
 #[cfg(test)]

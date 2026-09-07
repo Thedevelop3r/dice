@@ -11,6 +11,7 @@
 use super::cards::{self, Card, Shoe};
 use super::{table, Ctx};
 use crate::economy::Wallet;
+use crate::rng::Rng;
 use crate::ui::{self, card_art, widgets};
 
 const KEY: &str = "hilo";
@@ -232,6 +233,34 @@ pub fn idle(ctx: &mut Ctx) {
             return;
         }
     }
+}
+
+/// One run, always calling the side with more ranks behind it and cashing
+/// out at `target` hundredths. Hi-Lo has no fixed return of its own — it
+/// depends entirely on when you stop — so the harness fixes both.
+pub fn simulate_at(rng: &mut Rng, target: i64) -> (i64, i64) {
+    let mut shoe = Shoe::new(rng, 1);
+    let mut current = shoe.draw(rng);
+    let mut pot: i64 = 100;
+    loop {
+        let rank = current.poker_rank();
+        let higher = (14 - rank as i64) >= (rank as i64 - 2);
+        let Some(mult) = call_mult(rank, higher) else { return (100, pot) };
+        let next = shoe.draw(rng);
+        let correct = if higher { next.poker_rank() > rank } else { next.poker_rank() < rank };
+        current = next;
+        if !correct {
+            return (100, 0);
+        }
+        pot = pot * mult / 100;
+        if pot >= target {
+            return (100, pot);
+        }
+    }
+}
+
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    simulate_at(rng, 200)
 }
 
 #[cfg(test)]

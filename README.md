@@ -1,27 +1,14 @@
-# Dice Arena  -  Built with Claude AI
+# Dice Arena
 
 A casino console in Rust — **zero external crates**, including its own PRNG
 and its own raw-terminal input (direct `termios(3)` FFI, no `crossterm`).
-Twenty-four tables across four rooms, every one of them animated, and every
-one of them able to run itself with nobody watching.
+Twenty-four tables across four rooms, every one of them animated, every one
+able to run itself with nobody watching — and a whole casino that keeps
+running on its own thread while you play something else.
 
-*Install Deps*
-```
-cargo install --path .
-
-```
-*Build project*
-```
-cargo build --release
-
-```
-*Run Binary build*
 ```
 cargo run --release
-
 ```
-
-![Home Screen](screenshots/home.png)
 
 ## Controls
 
@@ -93,7 +80,7 @@ All six deal from one shared deck, shoe and set of hand rankings
 | | |
 |---|---|
 | **Slots** | Three weighted reels stopping left to right on one payline. The reels are real strips — each symbol appears as many times as its weight — so the odds are visible in the code rather than hidden in a constant. Three of a kind pays 8x to 120x; loose sevens pay on their own. |
-| **Keno** | Cover 1–10 spots on an eighty-number board; twenty balls come out one at a time. Cover one and a single hit pays 3x; cover ten and you need five before anything pays — but all ten pays 10,000x. |
+| **Keno** | Cover 1–10 spots on an eighty-number board; twenty balls come out one at a time. Cover one and a single hit pays 3.7x; cover ten and you need five before anything pays — but all ten pays 250,000x. Every board size returns the same 90–93%, checked against the exact hypergeometric odds. |
 | **Bingo** | A 75-ball card with a free centre. Forty balls are called and the payout is on *how fast* your first line lands: 30x by ball 15, down to your stake back by ball 40. Flat-rate bingo would hand the building over — a line inside forty balls turns up nearly half the time. |
 | **Plinko** | Drop a ball through twelve rows of pegs into thirteen slots. Low, medium and high risk change how sharply the prizes climb toward the edges — up to 220x — but all three return the same share of your stake. |
 | **Mines** | Choose how many mines hide under twenty-five tiles, then turn them over one at a time. Each safe tile raises the multiplier by the true odds of having got that far. Cash out whenever; find a mine and the round is gone. |
@@ -118,7 +105,7 @@ money wheel decelerates into its pointer, a plinko ball accelerates as it
 falls, keno balls speed up as the board fills, and a crash curve tightens
 exactly as the decision gets harder.
 
-Nothing is deco:rative. Where an outcome is drawn before the animation runs —
+Nothing is decorative. Where an outcome is drawn before the animation runs —
 the wheel's segment, the race winner — the animation is worked backwards
 from that result so what you watch is what you get.
 
@@ -131,6 +118,73 @@ the renderers measure the window and take the biggest that fits, so
 Chuck-a-Luck's three dice fill the screen while Ultra Casino Dice's twelve
 fall back gracefully on the very same terminal. A big card fills its face
 with its suit drawn as block art.
+
+## The casino
+
+`[A] Start Casino` opens a floor that runs itself. Tables deal, patrons buy
+in and cash out, and the books move — on a real background thread, entirely
+independently of whatever screen you happen to be looking at.
+
+- **Pick a floor** — a quiet night, a busy floor, one of everything, or all
+  fifty-one tables at once. Open more at any time.
+- **The overview** lists every running table with its seats, round, status,
+  take and last result, with what is going on in the building tonight above
+  it and a strip of recent goings-on below. Move with `J`/`K`, watch one
+  with `W`, pause with `P`, close with `X`, change speed with `S` (0.25x up
+  to 10x).
+- **Watching a table** shows who is sitting there, what each of them just
+  bet, their stack, how they have run tonight and across every visit they
+  have ever made. `N`/`P` step to the next table — the ones you leave keep
+  playing.
+- **`V` — spectate.** The floor picks what you look at, holds on it for a
+  spell, and moves to whatever is most worth watching, telling you why.
+- **`E` — the feed.** Everything worth reading, with `B` to narrow it to
+  the big ones.
+- **`T` — the night.** How it has been going over the last minute, ten
+  minutes, hour, or all of it, with a bar per half-minute and a table of
+  which games are carrying the room.
+- **`C` — the customers.** Biggest spenders, who is up on the house, and
+  the regulars. Rarely the same people.
+- **`M` — the books.** Handle, payouts, the realised hold, the cage, what
+  the building costs to run, the bottom line, and every movement of money
+  or chips by kind.
+- **`R` — tournaments.** One starts up every so often: a field playing
+  itself down to a winner.
+- **The money and chips in the top-right** are the casino's own, live. They
+  stay on screen everywhere in the app, including in the middle of a hand
+  you are playing yourself.
+
+Patrons are people the building knows. Each has an archetype — conservative,
+gambler, strategist, chaser, whale, beginner, hunch player — which sets the
+bands four traits are rolled within: nerve, appetite, discipline and read.
+Those decide how much they stake, how far up a table's bet ladder they
+reach, which table they choose, and when they walk away.
+
+They also **persist**. Somebody who gets up is not deleted; they go home,
+and later they come back, to a floor that remembers every visit they have
+made. The population is bounded, so past a point a new arrival is a familiar
+face rather than a stranger — which is why the regulars list exists and why
+a name on it means something.
+
+What no archetype and no trait does is bend an outcome. Every background
+round is settled by the same audited maths as the table you would play by
+hand, so a patron's `luck` is *measured* rather than rolled, and the "lucky
+player" archetype is a staking behaviour rather than a thumb on the scale.
+The same goes for what the room is in the mood for and for the things that
+happen to it over a night — a coach party, a quiet spell, a game everybody
+suddenly wants a seat at, a short-staffed shift. Every one of them moves a
+rate or a cost. Not one of them touches a payout.
+
+Money and chips are separate quantities, and the books say so: the handle
+and the gaming win are counted in chips, the bottom line in cash. Tables
+have limits, the top tier gets a higher one and a room of its own, the
+building charges its own running costs, and it all carries on from where it
+was the next time you open the doors.
+
+Money and chips are separate quantities. Chips move bet by bet at the
+tables; money moves only at the cage, where the house sells chips at 10 to
+the dollar and buys them back at 12 — so it takes a cut on every visit
+before anyone places a bet.
 
 ## Idle screens
 
@@ -189,6 +243,20 @@ that touch nothing in the games that came before them.
   uses to time-slice tables that don't know they're being cycled.
 - `src/games/floor.rs` — which tables exist, and the screensaver that walks
   them.
+- `src/casino/` — the background simulation, in fourteen pieces:
+  `config.rs` (every tunable, so no threshold is written down where it is
+  used), `clock.rs` (simulated time, so 0.25x means fewer rounds rather than
+  the same rounds drawn slower), `event.rs` (the bus; publishers push,
+  screens pull, and the per-round traffic is counted but never kept),
+  `bank.rs` (the one set of books, with a typed movement for every way money
+  or chips can move), `patron.rs` and `roster.rs` (the people, and the fact
+  that they outlive the tables they sit at), `instance.rs` (one running
+  table), `demand.rs` (what the room is in the mood for, and how full it has
+  been), `happening.rs` (what is going on tonight), `interest.rs` (how worth
+  watching a table is), `analytics.rs` (the night in bounded time buckets,
+  never recomputed), `tournament.rs`, `save.rs` (versioned, migrated,
+  written atomically), `manager.rs` (the simulation thread), and `ui.rs`
+  (screens that draw snapshots and never run anything).
 - `src/economy.rs` — `Wallet` (the player's chips, dollars and inventory)
   and `House`, the casino's mirror-image ledger, recorded explicitly at each
   game's settlement point rather than hooked generically into `Wallet`
@@ -220,22 +288,47 @@ that touch nothing in the games that came before them.
 cargo test
 ```
 
-167 tests, covering dice-notation parsing, roll uniformity, seeded
+380 tests, covering dice-notation parsing, roll uniformity, seeded
 reproducibility, every Yahtzee scoring category, Luck Bet hit/sweep
 resolution, Roulette's payout table, Blackjack's hand totals, Ultra Casino
 Dice's pot math, the house ledger's zero-sum invariant, and the render
 geometry (every face and card is a perfect rectangle at every size, and the
 big ones really are 3× the small ones).
 
-Every new table's payout maths is pinned down against the odds it claims,
-not just against itself:
+The simulation has its own share of those: that chips are only ever moved
+and never made, that a patron's record survives them getting up, that
+scoring how watchable a table is cannot touch the table, that a save which
+fails to write leaves the previous one exactly where it was, and — in
+`casino/walk.rs` — one long test that opens a casino, runs a night through
+it, and checks all twenty-four things end to end, from the doors opening to
+reopening it from disk afterwards.
 
-- **Plinko** — all three risk profiles return 95–100% of stake, weighted by
-  the real binomial odds of each slot.
-- **Scratch Cards** — the print run adds up to exactly 98% return.
-- **Horse Racing** — every runner on the card returns the same share.
-- **Big Six** — every segment pays strictly less than its true odds.
-- **Crash** — the survival curve matches `0.99 / x` at two sample points.
-- **Hi-Lo** — every call is priced below fair odds, and mirrored calls match.
-- **Mines** — the price never exceeds the fair reciprocal of the odds.
-- **Bingo** — the speed paytable is checked against thousands of real cards.
+### The house auditor
+
+Every table's payout maths is pinned against the odds it claims, not just
+against itself. `src/games/audit.rs` plays every table hundreds of thousands
+of times with no rendering, through the same settlement code the table uses,
+and holds each to a declared band:
+
+```
+cargo test --release audit -- --nocapture
+```
+
+The rule about what belongs there is **simulate only what cannot be
+computed**. A table with a small outcome space or a closed-form
+distribution is priced exactly in its own file, which is strictly better:
+
+- **Slots** — all 9,261 lines added up exactly.
+- **Chuck-a-Luck** — all 216 rolls, every bet on the board.
+- **Roulette** — all 37 pockets; every bet must carry the identical 36/37.
+- **Big Six** — all 54 segments.
+- **Keno** — the exact hypergeometric odds for every board size.
+- **Plinko** — the real binomial odds of each slot.
+- **Scratch Cards** — the print run, which sums to exactly 98%.
+- **Horse Racing** — every runner returns the same share, by construction.
+
+The rest — blackjack, baccarat, war, three card poker, hi-lo, video poker,
+bingo, mines, crash — genuinely need playing out, and that is what the
+harness does. Where a return depends on how the table is played, the
+strategy is fixed in the harness and named alongside the band, because a
+return with no strategy attached means nothing.

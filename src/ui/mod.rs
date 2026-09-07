@@ -79,7 +79,96 @@ pub fn fit_scale(per_row: usize, rows: usize, reserved: usize, width_of: impl Fn
 }
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+
+/// The casino's live money and chips, shown in the top-right of every
+/// screen once the floor is open.
+///
+/// It is a shared, lock-free cell rather than a string the app remembers to
+/// refresh: the simulation thread writes into it whenever the books move,
+/// and `Screen::present` reads it on the way out. That is what makes the
+/// figure current on *every* frame the app draws — including deep inside a
+/// hand of blackjack, where nothing else would think to update it.
+#[derive(Clone, Default)]
+pub struct Badge {
+    money: Arc<AtomicI64>,
+    chips: Arc<AtomicI64>,
+    live: Arc<AtomicBool>,
+}
+
+impl Badge {
+    pub fn new() -> Badge {
+        Badge::default()
+    }
+
+    /// Called by the simulation thread. Never blocks a frame.
+    pub fn set(&self, money: i64, chips: i64) {
+        self.money.store(money, Ordering::Relaxed);
+        self.chips.store(chips, Ordering::Relaxed);
+        self.live.store(true, Ordering::Relaxed);
+    }
+
+    /// Hides the badge — the floor is closed.
+    pub fn clear(&self) {
+        self.live.store(false, Ordering::Relaxed);
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.live.load(Ordering::Relaxed)
+    }
+
+    pub fn read(&self) -> (i64, i64) {
+        (self.money.load(Ordering::Relaxed), self.chips.load(Ordering::Relaxed))
+    }
+}
+
+/// `1234567` as `1,234,567`.
+pub fn thousands(n: i64) -> String {
+    let neg = n < 0;
+    let digits = n.abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if neg { format!("-{out}") } else { out }
+}
+
+/// How many columns a string actually occupies, ignoring colour escapes.
+pub fn visible_len(s: &str) -> usize {
+    let mut n = 0;
+    let mut in_escape = false;
+    for c in s.chars() {
+        if in_escape {
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if c == '\u{1b}' {
+            in_escape = true;
+        } else {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Pads a possibly-coloured string to `width` visible columns, text first.
+/// `format!("{:<9}")` counts escape bytes as characters, so any column
+/// holding painted text has to be padded through here instead.
+pub fn pad_end(s: &str, width: usize) -> String {
+    let vis = visible_len(s);
+    format!("{s}{}", " ".repeat(width.saturating_sub(vis)))
+}
+
+/// The same, padding first — for right-aligned columns of figures.
+pub fn pad_start(s: &str, width: usize) -> String {
+    let vis = visible_len(s);
+    format!("{}{s}", " ".repeat(width.saturating_sub(vis)))
+}
 
 /// Owns the terminal session: alternate screen + raw input mode, both torn
 /// down automatically on drop (including on panic-unwind), so the user's
@@ -88,6 +177,9 @@ pub struct Screen {
     pub theme: Theme,
     _raw: Option<input::RawGuard>,
     buf: String,
+    /// The casino economy readout, stamped into the top-right corner of
+    /// every presented frame. `None` until a casino is opened.
+    badge: Option<Badge>,
 }
 
 impl Screen {
@@ -95,7 +187,7 @@ impl Screen {
         let mut out = std::io::stdout();
         print!("\x1b[?1049h\x1b[?25l"); // alternate screen + hide cursor
         let _ = out.flush();
-        Screen { theme: Theme::new(colors), _raw: input::RawGuard::enable(), buf: String::new() }
+        Screen { theme: Theme::new(colors), _raw: input::RawGuard::enable(), buf: String::new(), badge: None }
     }
 
     /// A `Screen` that has claimed no terminal at all — no alternate
@@ -104,7 +196,28 @@ impl Screen {
     /// they never touch the real stdout the test harness is capturing.
     #[cfg(test)]
     pub fn headless() -> Screen {
-        Screen { theme: Theme::new(false), _raw: None, buf: String::new() }
+        Screen { theme: Theme::new(false), _raw: None, buf: String::new(), badge: None }
+    }
+
+    /// Hands the screen the casino's live balances. From here on every
+    /// frame carries them, whatever screen drew it.
+    pub fn attach_badge(&mut self, badge: Badge) {
+        self.badge = Some(badge);
+    }
+
+    /// The badge as it will be drawn, or `None` when no casino is open.
+    fn badge_line(&self) -> Option<String> {
+        let b = self.badge.as_ref()?;
+        if !b.is_live() {
+            return None;
+        }
+        let (money, chips) = b.read();
+        let theme = self.theme;
+        Some(format!(
+            "{}  {}",
+            theme.paint(theme::GREEN, &format!("Money: ${}", thousands(money))),
+            theme.paint(theme::GOLD, &format!("Chips: {}", thousands(chips)))
+        ))
     }
 
     pub fn colors(&self) -> bool {
@@ -141,10 +254,22 @@ impl Screen {
         self.buf.push('\n');
     }
 
-    /// Flushes the buffered frame to the terminal in one write.
+    /// Flushes the buffered frame to the terminal in one write, then
+    /// stamps the casino badge into the top-right corner.
+    ///
+    /// Stamping it here — with an absolute cursor move, after the frame —
+    /// rather than asking every screen to draw it is what keeps the badge
+    /// genuinely always-on without touching a single other screen.
     pub fn present(&mut self) {
         let mut out = std::io::stdout();
         let _ = out.write_all(self.buf.as_bytes());
+        if let Some(line) = self.badge_line() {
+            let (cols, _) = term_size();
+            let col = (cols as usize).saturating_sub(visible_len(&line) + 2).max(1);
+            // Save the cursor, jump to the first row, draw, jump back — so
+            // whatever the frame was doing is left undisturbed.
+            let _ = out.write_all(format!("\x1b[s\x1b[1;{col}H{line}\x1b[u").as_bytes());
+        }
         let _ = out.flush();
     }
 

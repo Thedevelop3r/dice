@@ -9,6 +9,7 @@
 
 use super::{table, Ctx};
 use crate::economy::Wallet;
+use crate::rng::Rng;
 use crate::ui::{self, widgets};
 
 const KEY: &str = "mines";
@@ -46,11 +47,11 @@ fn tile_key(i: usize) -> char {
     (FIRST_TILE + i as u8) as char
 }
 
-fn lay_mines(ctx: &mut Ctx, mines: usize) -> Vec<bool> {
+fn lay_mines(rng: &mut Rng, mines: usize) -> Vec<bool> {
     let mut field = vec![false; GRID];
     let mut placed = 0;
     while placed < mines {
-        let i = ctx.rng.below(GRID);
+        let i = rng.below(GRID);
         if !field[i] {
             field[i] = true;
             placed += 1;
@@ -150,7 +151,7 @@ pub fn play(ctx: &mut Ctx) {
             continue;
         }
 
-        let field = lay_mines(ctx, mines);
+        let field = lay_mines(ctx.rng, mines);
         let mut opened = vec![false; GRID];
         let mut picks = 0usize;
         let mut hit = false;
@@ -220,7 +221,7 @@ pub fn idle(ctx: &mut Ctx) {
         let punter = table::BOT_NAMES[ctx.rng.below(table::BOT_NAMES.len())];
         let mines = 2 + ctx.rng.below(5);
         let stake = 10 + 5 * ctx.rng.below(5) as i64;
-        let field = lay_mines(ctx, mines);
+        let field = lay_mines(ctx.rng, mines);
         let mut opened = vec![false; GRID];
         let mut picks = 0usize;
         let mut hit = false;
@@ -261,6 +262,28 @@ pub fn idle(ctx: &mut Ctx) {
             return;
         }
     }
+}
+
+/// One round at `mines` mines, walking away after `target` safe tiles —
+/// the strategy has to be fixed for the return to mean anything, and this
+/// is the one a cautious player would use.
+pub fn simulate_at(rng: &mut Rng, mines: usize, target: usize) -> (i64, i64) {
+    let field = lay_mines(rng, mines);
+    let mut open = [false; GRID];
+    for picks in 0..target {
+        let closed: Vec<usize> = (0..GRID).filter(|i| !open[*i]).collect();
+        let i = closed[rng.below(closed.len())];
+        if field[i] {
+            let _ = picks;
+            return (100, 0);
+        }
+        open[i] = true;
+    }
+    (100, 100 * multiplier(mines, target) / 100)
+}
+
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    simulate_at(rng, 3, 5)
 }
 
 #[cfg(test)]
@@ -336,12 +359,9 @@ mod tests {
 
     #[test]
     fn the_field_holds_exactly_the_mines_asked_for() {
-        let mut store = crate::stats::Store::blank();
         let mut rng = crate::rng::Rng::from_seed(21);
-        let mut screen = crate::ui::Screen::headless();
-        let mut ctx = Ctx { rng: &mut rng, store: &mut store, screen: &mut screen };
         for mines in [1usize, 3, 12, 24] {
-            let field = lay_mines(&mut ctx, mines);
+            let field = lay_mines(&mut rng, mines);
             assert_eq!(field.len(), GRID);
             assert_eq!(field.iter().filter(|m| **m).count(), mines, "{mines} mines asked for");
         }

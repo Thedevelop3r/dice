@@ -3,6 +3,7 @@
 
 use super::{table, Ctx};
 use crate::economy::{House, Wallet};
+use crate::rng::Rng;
 use crate::ui::{self, dice_art, widgets};
 
 const RED_NUMBERS: [u32; 18] = [1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36];
@@ -266,6 +267,33 @@ pub fn idle(ctx: &mut Ctx) {
     }
 }
 
+/// A representative spread of the felt, for the audit harness.
+/// The bets the audit harness walks, addressed by index so this module's
+/// private `Bet` never has to leave it.
+pub const BETS: usize = 4;
+
+fn bet(i: usize) -> Bet {
+    [Bet::Red, Bet::Odd, Bet::Dozen(2), Bet::Straight(17)][i % BETS]
+}
+
+pub fn bet_name(i: usize) -> String {
+    bet(i).label()
+}
+
+/// One spin against a given bet, no rendering. A single-zero wheel is a
+/// uniform draw over 0..=36, which is what `spin` lands on.
+pub fn simulate_at(rng: &mut Rng, which: usize) -> (i64, i64) {
+    let bet = bet(which);
+    let n = rng.below(37) as u32;
+    let stake = 100;
+    (stake, (stake + stake * bet.payout(n)).max(0))
+}
+
+#[cfg(test)]
+pub fn simulate(rng: &mut Rng) -> (i64, i64) {
+    simulate_at(rng, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +326,16 @@ mod tests {
         assert_eq!(Bet::Dozen(1).payout(13), -1);
         assert_eq!(Bet::Dozen(2).payout(13), 2);
         assert_eq!(Bet::Dozen(3).payout(36), 2);
+    }
+
+    #[test]
+    fn every_bet_on_the_felt_carries_the_same_edge() {
+        // A single-zero wheel is 37 pockets, so every bet prices exactly —
+        // and on a fair wheel they must all carry the identical 1/37 edge.
+        for bet in [Bet::Red, Bet::Black, Bet::Odd, Bet::Even, Bet::High, Bet::Low, Bet::Dozen(1), Bet::Dozen(2), Bet::Dozen(3), Bet::Straight(0), Bet::Straight(17)] {
+            let net: i64 = (0..=36u32).map(|n| bet.payout(n)).sum();
+            let rtp = 1.0 + net as f64 / 37.0;
+            assert!((rtp - 36.0 / 37.0).abs() < 1e-9, "{} returns {rtp:.6}, not 36/37", bet.label());
+        }
     }
 }
