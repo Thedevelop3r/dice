@@ -10,6 +10,9 @@
 //!   hard-coded at the point that uses it.
 //! - [`clock`] — simulated time. Everything paced reads it, so one speed
 //!   setting moves the whole casino together.
+//! - [`demand`] — what the floor is in the mood for, and how full its
+//!   tables have actually been. Nudges where people sit, never what they
+//!   win.
 //! - [`event`] — the bus. The simulation announces; screens read. There is
 //!   no path by which a reader's code runs on the simulation thread.
 //! - [`sim`] — the bundle of floor-owned services a table borrows for the
@@ -33,6 +36,7 @@
 pub mod bank;
 pub mod clock;
 pub mod config;
+pub mod demand;
 pub mod event;
 pub mod instance;
 pub mod manager;

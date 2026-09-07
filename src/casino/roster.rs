@@ -106,16 +106,21 @@ impl Roster {
         id
     }
 
-    /// Produces somebody to fill a seat: a familiar face if the population
-    /// is already at its cap, otherwise a new one.
+    /// Somebody already in the building and not yet playing, if there is
+    /// anybody. Does **not** invent one: a seat is only filled if a person
+    /// is actually standing there, which is what makes occupancy a real
+    /// measurement rather than a tautology.
+    pub fn waiting(&mut self, rng: &mut Rng) -> Option<u64> {
+        self.pick_waiting(rng)
+    }
+
+    /// Somebody walks in through the front door: a familiar face if the
+    /// population is already at its cap, otherwise a new one.
     ///
     /// This is the method that makes the floor feel like a place rather
-    /// than a queue. It returns whoever it found in [`Presence::Looking`],
-    /// so the caller can buy their chips and sit them down.
-    pub fn someone(&mut self, rng: &mut Rng, cfg: &Config, now: Duration) -> Option<u64> {
-        if let Some(id) = self.pick_waiting(rng) {
-            return Some(id);
-        }
+    /// than a queue. The person arrives in [`Presence::Looking`]; finding
+    /// them a table is the floor's job, and may not succeed.
+    pub fn admit(&mut self, rng: &mut Rng, cfg: &Config, now: Duration) -> Option<u64> {
         if self.people.len() < cfg.roster_size {
             let id = self.mint(rng);
             return Some(id);
@@ -276,7 +281,7 @@ mod tests {
 
         // Seat everyone, then send them all home.
         for i in 0..40 {
-            let Some(id) = r.someone(&mut rng, &cfg, now) else { panic!("nobody available") };
+            let Some(id) = r.admit(&mut rng, &cfg, now) else { panic!("nobody available") };
             r.get_mut(id).unwrap().begin_visit(100);
             r.seat(id, i as u32 % 3);
             // ...and immediately get them up again, so the next call has to
@@ -291,16 +296,21 @@ mod tests {
     }
 
     #[test]
-    fn a_returner_is_preferred_to_a_stranger_once_somebody_is_waiting() {
+    fn a_seat_is_only_ever_filled_by_somebody_who_is_actually_here() {
+        // The property that makes occupancy a measurement rather than a
+        // tautology: asking for a seat-filler must never conjure one.
         let mut rng = probe();
-        let cfg = Config::default();
         let mut r = Roster::new();
+        assert_eq!(r.waiting(&mut rng), None, "somebody was invented out of an empty room");
+        assert_eq!(r.minted(), 0);
+
         let known = r.mint(&mut rng);
-        assert_eq!(r.looking(), vec![known]);
-        // Somebody is already stood in the room, so nobody new is invented.
-        let picked = r.someone(&mut rng, &cfg, Duration::ZERO).expect("someone");
-        assert_eq!(picked, known);
-        assert_eq!(r.minted(), 1);
+        assert_eq!(r.waiting(&mut rng), Some(known));
+        assert_eq!(r.minted(), 1, "the person already stood there should have been used");
+
+        // Somebody who is seated is not available to fill another seat.
+        r.seat(known, 3);
+        assert_eq!(r.waiting(&mut rng), None);
     }
 
     #[test]

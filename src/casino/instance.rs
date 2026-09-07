@@ -225,6 +225,59 @@ impl RoundLog {
 
 /// How many finished rounds a table remembers. Enough to fill the view,
 /// bounded so a table left running all night cannot grow without limit.
+/// What a table lets people bet, and therefore who is allowed to sit at it.
+///
+/// A high-limit table is the whole reason a tier is worth earning: it is
+/// the one concrete privilege the house hands out, and it is the reason a
+/// whale's stack has anywhere to go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Limit {
+    /// Open to anybody, at the house's ordinary ceiling.
+    House,
+    /// Reserved for the top tier, at the high ceiling.
+    High,
+}
+
+impl Limit {
+    pub fn label(self) -> &'static str {
+        match self {
+            Limit::House => "house",
+            Limit::High => "high limit",
+        }
+    }
+
+    /// The bet ceiling this table imposes, whoever is sitting at it.
+    pub fn ceiling(self, cfg: &super::config::Config) -> i64 {
+        match self {
+            Limit::House => cfg.max_bet,
+            Limit::High => cfg.vip_max_bet,
+        }
+    }
+
+    /// Whether somebody of this tier is welcome here.
+    pub fn admits(self, tier: usize, cfg: &super::config::Config) -> bool {
+        match self {
+            Limit::House => true,
+            Limit::High => cfg.is_vip(tier),
+        }
+    }
+}
+
+/// Scales a table's unit-stake payout to what the patron actually put down.
+///
+/// Rounded to the nearest chip, not truncated. Truncating looks harmless
+/// and is not: it shaves a fraction off *every* winning settlement and
+/// never off a losing one, so it quietly adds to the house edge on top of
+/// the one `games::audit` measured — most at the small stakes where a whole
+/// chip is a large share of the bet. Rounding is symmetric, so the audited
+/// price is the price the patron actually gets.
+fn scale_payout(unit_staked: i64, unit_returned: i64, stake: i64) -> i64 {
+    if unit_staked <= 0 {
+        return 0;
+    }
+    (unit_returned * stake + unit_staked / 2) / unit_staked
+}
+
 const HISTORY: usize = 12;
 
 #[derive(Debug, Clone)]
@@ -252,17 +305,24 @@ pub struct Instance {
     pub seen: u32,
     /// How many seats the table currently wants filled.
     wanted: usize,
+    /// What this table lets people bet, and who it lets sit down.
+    pub limit: Limit,
 }
 
 impl Instance {
-    pub fn new(id: u32, kind: Kind, number: u32, sim: &mut Sim) -> Instance {
+    /// Opens a table with a stated limit. A high-limit table names itself
+    /// as one, because the whole point is that people can see it.
+    pub fn open_with(id: u32, kind: Kind, number: u32, limit: Limit, sim: &mut Sim) -> Instance {
         let (lo, hi) = kind.seats();
         let seats = lo + sim.rng.below(hi - lo + 1);
         let now = sim.now;
         let mut inst = Instance {
             id,
             kind,
-            name: format!("{} #{number}", kind.label()),
+            name: match limit {
+                Limit::House => format!("{} #{number}", kind.label()),
+                Limit::High => format!("{} #{number} ★", kind.label()),
+            },
             patrons: Vec::new(),
             round: 0,
             paused: false,
@@ -275,6 +335,7 @@ impl Instance {
             opened: now,
             seen: 0,
             wanted: seats,
+            limit,
         };
         // Seats are filled by the floor, not by the table: who sits where
         // is a decision about people, and people are the floor's business.
@@ -328,18 +389,18 @@ impl Instance {
             // The table's limit is a configured ceiling, raised for the top
             // tier — which is what a tier is actually *for*. Lifetime
             // turnover, not the stack in front of them, decides the tier.
-            let ceiling = cfg.bet_ceiling(p.tier(cfg));
+            // Two ceilings apply and the lower one wins: what the table
+            // allows, and what the patron's own standing allows.
+            let ceiling = self.limit.ceiling(cfg).min(cfg.bet_ceiling(p.tier(cfg)));
             let stake = p.stake(rng, cfg.min_bet).min(ceiling.max(cfg.min_bet));
             if stake <= 0 {
                 continue;
             }
             let variant = p.pick_bet(rng, variants);
             let (unit_staked, unit_returned) = self.kind.resolve(rng, variant);
-            // The table's maths is written against a unit stake; scale it to
-            // what this patron actually put down.
-            let returned = if unit_staked > 0 { unit_returned * stake / unit_staked } else { 0 };
+            let returned = scale_payout(unit_staked, unit_returned, stake);
             p.settle(stake, returned);
-            bank.settle(self.kind.key(), stake - returned);
+            bank.settle(self.kind.key(), stake, returned);
             pot += stake;
             paid += returned;
             let bet = self.kind.variant_name(variant);
@@ -468,7 +529,7 @@ mod tests {
 
         /// Opens a table and seats it, as the floor would.
         fn open(&mut self, id: u32, kind: Kind) -> Instance {
-            let mut inst = Instance::new(id, kind, 1, &mut self.sim());
+            let mut inst = Instance::open_with(id, kind, 1, Limit::House, &mut self.sim());
             self.fill(&mut inst);
             inst
         }
@@ -587,7 +648,7 @@ mod tests {
     #[test]
     fn a_table_announces_itself() {
         let mut b = Bench::new(10_000_000);
-        let _ = Instance::new(7, Kind::Blackjack, 3, &mut b.sim());
+        let _ = Instance::open_with(7, Kind::Blackjack, 3, Limit::House, &mut b.sim());
         let feed = b.feed.recent(64, Weight::Notable);
         assert!(
             matches!(feed.first().map(|r| &r.event), Some(Event::TableOpened { table: 7, .. })),
@@ -652,6 +713,114 @@ mod tests {
         assert!(b.feed.seen(Weight::Routine) >= 500);
         for r in b.feed.recent(4_096, Weight::Notable) {
             assert!(!matches!(r.event, Event::Round { .. }), "per-round traffic reached the feed");
+        }
+    }
+
+    #[test]
+    fn scaling_a_payout_rounds_rather_than_shaving() {
+        // A table's maths is written at a unit stake and scaled to what the
+        // patron actually bet. Truncating that scaling would shave a
+        // fraction off every winning settlement and none off a losing one —
+        // a house edge nobody audited and nobody wrote down.
+        //
+        // Exact where it divides evenly:
+        assert_eq!(scale_payout(100, 200, 37), 74);
+        assert_eq!(scale_payout(1, 2, 500), 1_000);
+        assert_eq!(scale_payout(100, 0, 37), 0, "a losing bet returns nothing at any stake");
+
+        // Nearest, not down, where it does not. Baccarat's banker bet pays
+        // 1.95 on a unit of 100, so a stake of 7 is worth 13.65 chips.
+        assert_eq!(scale_payout(100, 195, 7), 14);
+        assert_eq!(scale_payout(100, 195, 3), 6, "5.85 rounds to 6, not down to 5");
+        assert_eq!(scale_payout(100, 101, 5), 5, "5.05 rounds to 5");
+
+        // And over a spread of stakes the rounding is symmetric: the total
+        // paid tracks the exact figure instead of sitting under it.
+        let (unit_staked, unit_returned) = (100i64, 96i64);
+        let mut paid = 0i64;
+        let mut exact = 0i64;
+        for stake in 5..500 {
+            paid += scale_payout(unit_staked, unit_returned, stake);
+            exact += unit_returned * stake;
+        }
+        let drift = paid * unit_staked - exact;
+        assert!(drift.abs() * 1_000 < exact, "the scaling drifts by {drift} against an exact {exact}");
+        assert!(drift >= 0 || drift.abs() < exact / 1_000, "the drift is one-sided, which is a hidden edge");
+    }
+
+    #[test]
+    fn a_background_table_holds_what_a_casino_table_holds() {
+        // Not a check on any one game's price — `games::audit` does that
+        // properly, over hundreds of thousands of rounds. This is the
+        // cruder property that matters here: a table run by the simulation,
+        // with people choosing their own bets, ends up holding a few
+        // percent of the handle rather than half of it or none of it.
+        let mut b = Bench::new(1_000_000_000);
+        b.cfg.max_bet = 1_000_000;
+        b.cfg.vip_max_bet = 1_000_000;
+        let mut inst = b.open(1, Kind::Baccarat);
+        for _ in 0..20_000 {
+            // Keep the seats solvent, so this is about pricing rather than
+            // about people busting out and being replaced.
+            for id in inst.patrons.clone() {
+                if let Some(p) = b.roster.get_mut(id) {
+                    p.chips = 10_000;
+                    p.bought = 10_000;
+                }
+            }
+            inst.play_round(&mut b.sim());
+        }
+        let hold = (inst.staked - inst.returned) * 10_000 / inst.staked;
+        assert!(inst.staked > 100_000, "not enough turnover to say anything: {}", inst.staked);
+        assert!((0..1_000).contains(&hold), "a realised hold of {hold} hundredths of a percent is not a casino");
+    }
+
+    #[test]
+    fn a_high_limit_table_says_so_and_lets_people_bet_like_it() {
+        let cfg = Config::default();
+        assert_eq!(Limit::House.ceiling(&cfg), cfg.max_bet);
+        assert_eq!(Limit::High.ceiling(&cfg), cfg.vip_max_bet);
+        assert!(Limit::High.ceiling(&cfg) > Limit::House.ceiling(&cfg));
+
+        // ...and it only seats the top tier, which is the one concrete
+        // thing a tier actually buys.
+        for tier in 0..cfg.vip_tier {
+            assert!(Limit::House.admits(tier, &cfg), "the house table turned somebody away");
+            assert!(!Limit::High.admits(tier, &cfg), "tier {tier} got into the high-limit room");
+        }
+        for tier in cfg.vip_tier..=cfg.top_tier() {
+            assert!(Limit::High.admits(tier, &cfg), "tier {tier} was turned away from its own room");
+        }
+
+        let mut b = Bench::new(10_000_000);
+        let inst = Instance::open_with(1, Kind::Baccarat, 2, Limit::High, &mut b.sim());
+        assert!(inst.name.contains('★'), "a high-limit table should be visible as one: {}", inst.name);
+        assert_eq!(inst.limit, Limit::High);
+    }
+
+    #[test]
+    fn a_table_holds_whichever_limit_is_lower_its_own_or_the_patrons() {
+        // A guest sitting at a high-limit table — which the floor would not
+        // normally allow — still only gets the guest ceiling, and a whale
+        // at an ordinary table only gets the house one. The lower of the
+        // two always wins, so neither can be used to smuggle the other up.
+        let mut b = Bench::new(1_000_000_000);
+        b.cfg.max_bet = 50;
+        b.cfg.vip_max_bet = 100_000;
+        let mut inst = Instance::open_with(1, Kind::Roulette, 1, Limit::High, &mut b.sim());
+        b.fill(&mut inst);
+        for id in inst.patrons.clone() {
+            let p = b.roster.get_mut(id).unwrap();
+            p.chips = 10_000_000;
+            p.nerve = 100;
+            // A guest: no lifetime turnover at all.
+            p.lifetime.staked = 0;
+        }
+        for _ in 0..30 {
+            inst.play_round(&mut b.sim());
+            for seat in inst.last_round().unwrap().seats.iter() {
+                assert!(seat.staked <= 50, "{} bet {} at a guest's ceiling of 50", seat.name, seat.staked);
+            }
         }
     }
 

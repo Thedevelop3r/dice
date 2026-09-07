@@ -32,15 +32,15 @@ The two constraints that define the whole codebase:
 
 | | |
 |---|---|
-| Source | 16,975 lines across 53 files |
-| Tests | 268, all passing |
+| Source | 18,388 lines across 54 files |
+| Tests | 299, all passing |
 | Starting balances | 10,000 chips / $9,000 — the user's own tuning in `economy.rs` |
 | Clippy | clean, zero warnings |
 | Dependencies | none |
 | Tables | 24 (8 dice, 6 card, 2 wheel, 8 arcade) |
 | Idle screens | 17 tables + a floor-wide cycler |
 | Background casino | a real simulation thread; 51 tables at 0.2% CPU |
-| Autonomous roadmap | Phases 0, 1, 2, 3, 4, 7 (config), 20 (clock) done — see `ROADMAP.md` |
+| Autonomous roadmap | Phases 0-8 and 20 done — see `ROADMAP.md` |
 
 ---
 
@@ -177,16 +177,17 @@ src/
     widgets.rs     143  number_picker, text_input, footer, banner, bar
   casino/                  ← the background simulation (session 6-7)
     mod.rs          40  what the nine pieces are and why they are separate
-    config.rs      256  every tunable: limits, tiers, thresholds, speed, costs
+    config.rs      325  every tunable: limits, tiers, thresholds, speed, costs
+    demand.rs      371  what the room is in the mood for + occupancy
     clock.rs       248  simulated time, permille speed, the `Every` period
-    event.rs       393  the event bus: Event, Weight, Record, Feed
+    event.rs       413  the event bus: Event, Weight, Record, Feed
     sim.rs          45  the borrow bundle a table gets for one call
-    bank.rs        205  the economy manager: money, chips, the cage spread
+    bank.rs        471  the economy manager: movements, GGR/NGR, expenses
     patron.rs      751  archetypes, traits, presence, lifetime record
-    roster.rs      382  everyone the casino knows, seated or not
-    instance.rs    676  one running table + the Kind → real-game mapping
-    manager.rs     881  the simulation thread, the lifecycle pass, snapshots
-    ui.rs          498  opening screen, floor overview + feed, live table view
+    roster.rs      392  everyone the casino knows, seated or not
+    instance.rs    845  one running table, its limit, the Kind → game mapping
+    manager.rs    1218  the simulation thread, lifecycle, bills, mood, snapshots
+    ui.rs          665  opening, floor + feed, live table, the house books
   games/
     mod.rs         109  Ctx, Difficulty, Player, pick_difficulty
     cards.rs       443  shared deck/shoe/hand rankings  ← every card table
@@ -406,6 +407,86 @@ Things that will bite if you forget them:
 - `TableView` and `FloorView` now carry a `Config` clone, so the drawing
   code names a tier through `cfg.tier_name(...)` instead of writing any
   threshold down. `FloorView` also carries `crowd`, `known` and `by_tier`.
+
+### The formal books and the house's costs (session 7, Phases 6-7)
+
+`Bank` grew a **transaction model** and an **expense side**, without being
+rewritten: everything that was there still means what it meant.
+
+- `Movement` names every way money or chips can move (`BuyIn`, `CashOut`,
+  `Wager`, `Payout`, `Expense`) and each is *accumulated*, never logged — a
+  busy floor makes millions an hour. `Movement::in_dollars()` is how the two
+  currencies stay apart.
+- `Bank::settle` now takes `(table, staked, returned)` rather than a net
+  delta, which is what gives the books a **handle** (turnover) to measure
+  against. `ggr()` is the gaming win in chips, `hold()` is it as a share of
+  the handle in hundredths of a percent, `ngr()` is the bottom line **in
+  cash**: `cage_profit() - spent()`.
+- **Why NGR is cash and not chips:** chips only ever leave the building
+  through the cage, so cage flow already *is* the gaming win converted at
+  the house's own spread. Adding a chip figure to it would count the same
+  money twice. If you ever feel the urge to write `ngr = ggr + cage`, this
+  is the paragraph that says don't.
+- `Expense` is `Overhead` (the building) and `Staffing` (per open table).
+  `Bank::pay` takes it out of the **cage** and never out of the tray, and
+  lets the cage go negative — a casino losing money should look like one.
+- `Floor::pay_the_bills(now)` runs off `clock::Every`, in a `while` loop so
+  a fast clock or a busy spell pays every period it owes rather than
+  skipping them. `set_speed` calls `rent.resync` so winding the clock
+  forward does not present a backlog of unpaid rent.
+- New screen: **`m` from the floor** opens THE HOUSE BOOKS — handle, payouts,
+  gross win, realised hold, the cage, costs by kind, the bottom line, and
+  the movement ledger.
+
+**A real bug the books surfaced.** Scaling a table's unit-stake payout to
+the patron's actual stake used to truncate: `unit_returned * stake /
+unit_staked`. That shaves a fraction off every *winning* settlement and none
+off a losing one — a house edge nobody audited and nobody wrote down, worst
+at the small stakes where a whole chip is a large share of the bet. It is
+now `instance::scale_payout`, which rounds to nearest, with its own tests.
+The realised floor-wide hold went from a nonsense figure to about 2%.
+
+### Demand, occupancy and the velvet rope (session 7, Phases 8 and 5)
+
+`casino/demand.rs` holds two separate things, and keeping them apart is the
+point:
+
+- **Appeal** — how much the room fancies a kind of game right now, permille
+  against a neutral `1_000`. It drifts on its own clock as a random walk
+  pulled back toward neutral, bounded by `cfg.appeal_floor/ceiling`, and it
+  multiplies a person's own `taste` when they choose a table.
+- **Utilization** — how full each kind's tables have actually been, sampled
+  periodically and accumulated.
+
+**Appeal decides where somebody sits and nothing else.** A hot table is a
+busy table, not a generous one. There is a test in `demand.rs` whose only
+job is to fail if anybody wires appeal into a payout.
+
+**The thing that made occupancy real.** The first version measured 100%
+forever, because the lifecycle refilled a seat the instant it emptied — the
+supply of people was whatever the seats demanded, so utilization was a
+tautology. Now people arrive at a *rate* (`cfg.arrivals_period` /
+`arrivals_per_period`), and only somebody already `Looking` can be seated:
+`Roster::admit` is the front door, `Roster::waiting` fills a seat and
+**never invents anybody**. Anyone left standing about gives up and goes home
+with probability `cfg.gives_up` per pass, so a room with too few tables does
+not silently fill with people who never play. A real floor now reads ~95%,
+and a floor with more seats than customers reads well under it — which is
+what makes over-opening cost you staffing money for nothing.
+
+A subtlety worth keeping: a table re-rolls how many seats it *wants* as
+people come and go, so a sample can catch it seating more than it is asking
+for. `record_sample` counts `wanted.max(seated)` as offered — otherwise a
+busy floor reads as over 100% full, which is not a thing occupancy can be.
+
+**Phase 5 finished.** `instance::Limit` is `House` or `High`. A high-limit
+table wears a `★` in its name, imposes `cfg.vip_max_bet`, and only seats
+people the house counts as VIPs. Two ceilings apply to every bet and **the
+lower one wins** — the table's and the patron's own — so neither can smuggle
+the other up. Who counts as a VIP is `cfg.vip_tier` (default `2`, "high
+roller") rather than the top tier, because pinning it to the top would leave
+the high-limit tables empty all night. `Manager::open_at(kind, n, limit)`,
+and the open-a-table screen asks which.
 
 ---
 

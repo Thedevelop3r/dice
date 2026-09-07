@@ -10,8 +10,9 @@
 //! one, so a table redraws as it plays rather than only when prodded.
 
 use super::config;
+use super::demand;
 use super::event::Weight;
-use super::instance::Kind;
+use super::instance::{Kind, Limit};
 
 /// A named opening plan: what to call it, how it reads, and the tables it
 /// puts on the floor.
@@ -119,7 +120,7 @@ pub fn floor(manager: &Manager, screen: &mut Screen) -> Option<u32> {
         }
         screen.present();
 
-        match poll(REFRESH, &['w', 'o', 'p', 'x', 's', 'j', 'k', 'n', 'b']) {
+        match poll(REFRESH, &['w', 'o', 'p', 'x', 's', 'j', 'k', 'n', 'b', 'm']) {
             Poll::Leave => return None,
             Poll::Pressed('w') => {
                 if let Some(t) = view.tables.get(cursor) {
@@ -143,9 +144,10 @@ pub fn floor(manager: &Manager, screen: &mut Screen) -> Option<u32> {
                 }
             }
             Poll::Pressed('s') => manager.cycle_speed(),
+            Poll::Pressed('m') => books(manager, screen),
             Poll::Pressed('o') => {
-                if let Some((kind, n)) = open_more(screen) {
-                    manager.open(kind, n);
+                if let Some((kind, n, limit)) = open_more(screen) {
+                    manager.open_at(kind, n, limit);
                 }
             }
             _ => {}
@@ -219,7 +221,10 @@ fn draw_floor(screen: &mut Screen, view: &FloorView, cursor: usize) {
         screen.line(&theme.dim(&format!("  earning: {}", best.join(" · "))));
     }
     screen.blank();
-    screen.line(&theme.dim(&format!("  {:<22} {:>5} {:>7}  {:<9} {:>10}  {}", "TABLE", "SEATS", "ROUND", "STATUS", "TAKE", "LAST ROUND")));
+    screen.line(&theme.dim(&format!(
+        "  {:<24} {:>5} {:>7}  {:<9} {:>10}  {}",
+        "TABLE", "SEATS", "ROUND", "STATUS", "TAKE", "LAST ROUND"
+    )));
 
     // Only as many rows as the window has, scrolled to keep the cursor in
     // view — a floor of two hundred tables must still be navigable.
@@ -236,7 +241,13 @@ fn draw_floor(screen: &mut Screen, view: &FloorView, cursor: usize) {
             Some(r) => format!("pot {} · house {}", thousands(r.pot), signed(&theme, r.house())),
             None => theme.dim("dealing in...").to_string(),
         };
-        let name = if i == cursor { theme.paint(ui::theme::GOLD, &pad_end(&t.name, 22)) } else { pad_end(&t.name, 22) };
+        // A high-limit table already wears a star in its name; picking it
+        // out in gold as well is how it reads at a glance on a full floor.
+        let name = if i == cursor || t.limit == Limit::High {
+            theme.paint(ui::theme::GOLD, &pad_end(&t.name, 24))
+        } else {
+            pad_end(&t.name, 24)
+        };
         screen.line(&format!(
             "{marker}{name} {:>5} {:>7}  {}  {}  {last}",
             t.seats,
@@ -252,7 +263,17 @@ fn draw_floor(screen: &mut Screen, view: &FloorView, cursor: usize) {
     screen.blank();
     screen.line(&widgets::footer(
         &theme,
-        &[('j', "next"), ('k', "prev"), ('w', "watch"), ('o', "open"), ('p', "pause"), ('x', "close"), ('s', "speed"), ('q', "back")],
+        &[
+            ('j', "next"),
+            ('k', "prev"),
+            ('w', "watch"),
+            ('o', "open"),
+            ('p', "pause"),
+            ('x', "close"),
+            ('m', "books"),
+            ('s', "speed"),
+            ('q', "back"),
+        ],
     ));
 }
 
@@ -299,8 +320,126 @@ fn draw_feed(screen: &mut Screen, view: &FloorView, rows: usize) {
     }
 }
 
+/// The house's own books, live.
+///
+/// Two currencies, kept apart the whole way down, because they are two
+/// different things: **chips** are the float the tables move about, and
+/// **cash** is what the house actually ends the night with. The gaming win
+/// is a chip figure; the bottom line is a cash one. Adding them together
+/// would count the same money twice, since chips only ever leave the
+/// building through the cage.
+fn books(manager: &Manager, screen: &mut Screen) {
+    loop {
+        let view = manager.snapshot();
+        let theme = screen.theme;
+        screen.begin();
+        ui::header(screen, "THE HOUSE BOOKS");
+        screen.blank();
+
+        screen.line(&theme.dim("  AT THE TABLES — in chips"));
+        screen.line(&format!(
+            "  handle {} · paid out {} · gross win {}",
+            theme.accent(&thousands(view.handle)),
+            theme.dim(&thousands(view.payouts)),
+            signed(&theme, view.ggr)
+        ));
+        screen.line(&format!(
+            "  hold {} of everything staked, across {} bets",
+            theme.paint(ui::theme::GOLD, &percent(view.hold)),
+            theme.dim(&thousands(view.bets as i64))
+        ));
+        screen.blank();
+
+        let (_, _, bought, cashed) = view.totals;
+        screen.line(&theme.dim("  AT THE CAGE — in cash"));
+        screen.line(&format!(
+            "  sold ${} of chips · bought back ${} · kept {}",
+            thousands(bought),
+            thousands(cashed),
+            signed(&theme, view.cage_profit)
+        ));
+        screen.blank();
+
+        screen.line(&theme.dim("  WHAT THE BUILDING COSTS — in cash"));
+        if view.by_expense.is_empty() {
+            screen.line(&theme.dim("  nothing billed yet — the first period has not come round"));
+        } else {
+            for (kind, spent) in view.by_expense.iter() {
+                screen.line(&format!("  {} {}", pad_end(&theme.dim(kind), 14), pad_start(&thousands(*spent), 12)));
+            }
+        }
+        screen.line(&format!(
+            "  {} spent in all · every {} of casino time: ${} on the building, ${} a table",
+            theme.dim(&format!("${}", thousands(view.spent))),
+            theme.dim(&duration(view.cfg.expense_period)),
+            view.cfg.overhead_per_period,
+            view.cfg.table_cost_per_period
+        ));
+        screen.blank();
+
+        screen.line(&format!(
+            "  {} — the cash the cage kept, less what the doors cost to keep open",
+            match view.ngr >= 0 {
+                true => theme.win(&format!("NET +${}", thousands(view.ngr))),
+                false => theme.lose(&format!("NET -${}", thousands(-view.ngr))),
+            }
+        ));
+        screen.blank();
+
+        screen.line(&theme.dim(&format!(
+            "  WHAT THE ROOM IS PLAYING — floor occupancy {}",
+            percent(view.occupancy * 10)
+        )));
+        if view.demand.is_empty() {
+            screen.line(&theme.dim("  nothing open, so the room has no opinion yet"));
+        } else {
+            screen.line(&theme.dim(&format!("  {:<14} {:>8} {:>10} {:>8}  {}", "GAME", "TABLES", "FULL", "MOOD", "")));
+            for (game, st) in view.demand.iter().take(8) {
+                let mood = if st.appeal >= demand::NEUTRAL {
+                    theme.paint(ui::theme::GOLD, &format!("+{}%", (st.appeal - demand::NEUTRAL) / 10))
+                } else {
+                    theme.dim(&format!("{}%", (st.appeal - demand::NEUTRAL) / 10))
+                };
+                screen.line(&format!(
+                    "  {} {} {} {}",
+                    pad_end(game, 14),
+                    pad_start(&st.tables.to_string(), 8),
+                    pad_start(&percent(st.utilization() * 10), 10),
+                    pad_start(&mood, 8)
+                ));
+            }
+        }
+        screen.blank();
+
+        screen.line(&theme.dim(&format!("  {:<12} {:>12} {:>16}  {}", "MOVEMENT", "COUNT", "VOLUME", "IN")));
+        for (m, count, volume) in view.movements.iter() {
+            screen.line(&format!(
+                "  {} {} {}  {}",
+                pad_end(m.label(), 12),
+                pad_start(&thousands(*count as i64), 12),
+                pad_start(&thousands(*volume), 16),
+                theme.dim(if m.in_dollars() { "cash" } else { "chips" })
+            ));
+        }
+
+        screen.blank();
+        screen.line(&widgets::footer(&theme, &[('q', "back to the floor")]));
+        screen.present();
+        if let Poll::Leave = poll(REFRESH, &[]) {
+            return;
+        }
+    }
+}
+
+/// Hundredths of a percent, as a percentage: `415` reads `4.15%`.
+fn percent(hundredths: i64) -> String {
+    let sign = if hundredths < 0 { "-" } else { "" };
+    let v = hundredths.abs();
+    format!("{sign}{}.{:02}%", v / 100, v % 100)
+}
+
 /// Adds tables to a running floor without disturbing anything already on it.
-fn open_more(screen: &mut Screen) -> Option<(Kind, usize)> {
+fn open_more(screen: &mut Screen) -> Option<(Kind, usize, Limit)> {
     let theme = screen.theme;
     screen.begin();
     ui::header(screen, "OPEN A TABLE");
@@ -323,6 +462,7 @@ fn open_more(screen: &mut Screen) -> Option<(Kind, usize)> {
         ));
     }
     screen.blank();
+    screen.line(&theme.dim("  a high-limit table seats only the house's best customers"));
     screen.line(&widgets::footer(&theme, &[('1', "…"), ('h', "pick a table"), ('q', "back")]));
     screen.present();
 
@@ -343,7 +483,29 @@ fn open_more(screen: &mut Screen) -> Option<(Kind, usize)> {
         s.blank();
         s.line(&widgets::footer(&theme, &[('↑', "more"), ('↓', "fewer"), ('m', "25"), ('\u{23ce}', "open"), ('\u{238b}', "cancel")]));
     })?;
-    Some((kind, n as usize))
+
+    // House or high limit. Asked after the count so the common case is
+    // still two keys and Enter.
+    let theme = screen.theme;
+    screen.begin();
+    ui::header(screen, "OPEN A TABLE");
+    screen.blank();
+    screen.line(&format!("  {} × {}", theme.accent(kind.label()), theme.paint(ui::theme::GOLD, &n.to_string())));
+    screen.blank();
+    screen.line(&format!("   {}  {}", theme.paint(ui::theme::GOLD, "[H]"), theme.accent("house limit — open to anybody")));
+    screen.line(&format!(
+        "   {}  {}",
+        theme.paint(ui::theme::GOLD, "[V]"),
+        theme.accent("high limit ★ — the top tier only, and they can bet like it")
+    ));
+    screen.blank();
+    screen.line(&widgets::footer(&theme, &[('h', "house"), ('v', "high limit"), ('q', "cancel")]));
+    screen.present();
+    let limit = match ui::choose_key(&['h', 'v', 'q'], 'q')? {
+        'v' => Limit::High,
+        _ => Limit::House,
+    };
+    Some((kind, n as usize, limit))
 }
 
 /// Watches one running table, live. `←`/`→` move to the neighbouring table
@@ -389,6 +551,11 @@ fn draw_table(screen: &mut Screen, t: &TableView, position: usize, total: usize)
         theme.dim(t.status),
         theme.dim(&duration(t.open_for)),
         t.seen
+    ));
+    screen.line(&format!(
+        "  {} table · bets up to {}",
+        theme.dim(t.limit.label()),
+        theme.dim(&thousands(t.limit.ceiling(&t.cfg)))
     ));
     screen.line(&format!(
         "  {} staked here · the house is {}",

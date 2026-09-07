@@ -17,11 +17,12 @@
 //! across a render or a keypress, so the UI can never stall the floor and
 //! the floor can never stall the UI.
 
-use super::bank::{Bank, OPENING_CHIPS, OPENING_MONEY};
-use super::clock::Clock;
+use super::bank::{Bank, Expense, Movement, OPENING_CHIPS, OPENING_MONEY};
+use super::clock::{Clock, Every};
 use super::config::{self, Config};
 use super::event::{Departure, Event, Feed, Record, Weight};
-use super::instance::{Instance, Kind, RoundLog};
+use super::demand::{Demand, Standing};
+use super::instance::{Instance, Kind, Limit, RoundLog};
 use super::patron::Patron;
 use super::roster::{self, Roster};
 use super::sim::Sim;
@@ -52,6 +53,12 @@ struct Floor {
     /// Everyone the casino knows. Owned here, so a patron outlives the
     /// table they happen to be sitting at.
     roster: Roster,
+    /// When the next bill falls due, in simulated time.
+    rent: Every,
+    /// When the next people walk in.
+    door: Every,
+    /// What the room is in the mood for, and how full it has been.
+    demand: Demand,
     started: Instant,
 }
 
@@ -105,7 +112,29 @@ impl Floor {
             }
         }
 
-        // 3. Empty seats are offered to whoever is here. A person picks the
+        // 3. People walk in through the front door, at a rate of their own
+        //    that has nothing to do with how many seats are free. This is
+        //    what makes an empty seat possible at all, and therefore what
+        //    makes occupancy worth measuring and an over-staffed floor
+        //    worth avoiding.
+        let mut admitted = 0;
+        while self.door.due(now) {
+            if admitted > self.cfg.arrivals_per_period * 8 {
+                // A long stall must not empty the street into the room in
+                // a single tick.
+                self.door.resync(now);
+                break;
+            }
+            for _ in 0..self.cfg.arrivals_per_period {
+                let Floor { roster, rng, cfg, .. } = self;
+                if roster.admit(rng, cfg, now).is_none() {
+                    break;
+                }
+                admitted += 1;
+            }
+        }
+
+        // 4. Empty seats are offered to whoever is here. A person picks the
         //    table among those with room that most suits them — the "choose
         //    a game" step — rather than being posted to the first vacancy.
         loop {
@@ -114,8 +143,8 @@ impl Floor {
             if hungry.is_empty() {
                 break;
             }
-            let Floor { roster, rng, cfg, bank, feed, instances, .. } = self;
-            let Some(pid) = roster.someone(rng, cfg, now) else { break };
+            let Floor { roster, rng, cfg, bank, feed, instances, demand, .. } = self;
+            let Some(pid) = roster.waiting(rng) else { break };
             let Some(p) = roster.get_mut(pid) else { break };
 
             // Where would they like to sit? Taste scores every table with
@@ -123,13 +152,27 @@ impl Floor {
             // not all pile onto the same table.
             let mut best = hungry[0];
             let mut best_score = i64::MIN;
+            let tier = p.tier(cfg);
             for i in hungry.iter().copied() {
                 let kind = instances[i].kind;
-                let score = p.taste(kind.variants(), kind.pace().as_millis() as u64) + rng.below(25) as i64;
+                if !instances[i].limit.admits(tier, cfg) {
+                    // A high-limit table is not for everybody; that is the
+                    // point of it.
+                    continue;
+                }
+                // Their own taste, nudged by what the room is in the mood
+                // for. Appeal moves where somebody sits and nothing else.
+                let taste = p.taste(kind.variants(), kind.pace().as_millis() as u64);
+                let score = taste * demand.appeal(kind.key()) / super::demand::NEUTRAL + rng.below(25) as i64;
                 if score > best_score {
                     best_score = score;
                     best = i;
                 }
+            }
+            if best_score == i64::MIN {
+                // Nowhere on the floor will have them — a room of nothing
+                // but high-limit tables and a guest at the door. They wait.
+                break;
             }
 
             let dollars = p.buy_in(rng, cfg);
@@ -146,6 +189,62 @@ impl Floor {
                 Event::Arrived { patron: pid, who, table: table_id, table_name, chips },
             );
         }
+
+        // 5. Anybody still standing about with nowhere to sit may give up
+        //    and go home. Without this, a room with too few tables slowly
+        //    fills with people who never play and never leave.
+        let Floor { roster, rng, cfg, .. } = self;
+        for pid in roster.looking() {
+            if rng.below(100) < cfg.gives_up {
+                let back_at = super::roster::time_away(rng, cfg, now);
+                if let Some(p) = roster.get_mut(pid) {
+                    p.end_visit(back_at);
+                }
+            }
+        }
+    }
+
+    /// Charges the building's running costs, if a period has come round.
+    ///
+    /// Periodic, never per frame — that is the whole reason `Every` exists.
+    /// A `while` loop rather than an `if` so a fast clock, or a spell where
+    /// the process was busy, pays every period it owes instead of quietly
+    /// skipping the ones it missed.
+    fn pay_the_bills(&mut self, now: Duration) {
+        let tables = self.instances.len() as i64;
+        while self.rent.due(now) {
+            let overhead = self.cfg.overhead_per_period;
+            let staffing = tables * self.cfg.table_cost_per_period;
+            self.bank.pay(Expense::Overhead, overhead);
+            self.bank.pay(Expense::Staffing, staffing);
+            let total = overhead + staffing;
+            if total > 0 {
+                self.feed.push(now, Weight::Notable, Event::Costs { overhead, staffing, tables: tables as usize });
+            }
+        }
+    }
+
+    /// Samples how full the floor is, and lets the room's taste in games
+    /// move on. Both are periodic; neither happens per frame.
+    fn read_the_room(&mut self, now: Duration) {
+        if self.demand.sample_due(now) {
+            let seen: Vec<(&'static str, usize, usize)> =
+                self.instances.iter().map(|t| (t.kind.key(), t.patrons.len(), t.wanted())).collect();
+            self.demand.record_sample(&seen);
+        }
+        let kinds: Vec<&'static str> = {
+            let mut k: Vec<&'static str> = self.instances.iter().map(|t| t.kind.key()).collect();
+            k.sort_unstable();
+            k.dedup();
+            k
+        };
+        if kinds.is_empty() {
+            return;
+        }
+        let Floor { demand, rng, cfg, feed, .. } = self;
+        for (key, appeal) in demand.drift(rng, cfg, now, &kinds) {
+            feed.push(now, Weight::Routine, Event::Mood { game: key, appeal });
+        }
     }
 
     /// Advances every table that has a round due, in simulated time.
@@ -153,6 +252,8 @@ impl Floor {
         self.clock.advance(wall);
         let now = self.clock.now();
         self.lifecycle(now);
+        self.pay_the_bills(now);
+        self.read_the_room(now);
         let ceiling = self.cfg.max_catch_up.max(1);
         for i in 0..self.instances.len() {
             if self.instances[i].paused {
@@ -203,6 +304,8 @@ pub struct TableView {
     /// Simulated time this table has been open.
     pub open_for: Duration,
     pub seen: u32,
+    /// What this table lets people bet, and who it seats.
+    pub limit: Limit,
     /// The tunables in force, so the drawing code can name a tier or a
     /// threshold without writing the number down itself.
     pub cfg: Config,
@@ -237,6 +340,22 @@ pub struct FloorView {
     pub known: usize,
     /// The population by tier, lowest first.
     pub by_tier: Vec<usize>,
+    /// The formal books: everything staked, everything paid back, the
+    /// realised hold in hundredths of a percent, what the building cost,
+    /// and the cash that actually stayed in the cage.
+    pub handle: i64,
+    pub payouts: i64,
+    pub ggr: i64,
+    pub hold: i64,
+    pub spent: i64,
+    pub ngr: i64,
+    pub by_expense: Vec<(&'static str, i64)>,
+    /// What the room is in the mood for, keenest first, with how full each
+    /// kind's tables have been.
+    pub demand: Vec<(&'static str, Standing)>,
+    /// The whole floor's occupancy, in permille of seats offered.
+    pub occupancy: i64,
+    pub movements: Vec<(Movement, u64, i64)>,
     pub cfg: Config,
     /// Whether the simulation thread is still turning.
     pub running: bool,
@@ -266,6 +385,9 @@ impl Manager {
             opened: BTreeMap::new(),
             rng: Rng::from_seed(seed),
             roster: Roster::new(),
+            rent: Every::new(Config::default().expense_period, Duration::ZERO),
+            door: Every::new(Config::default().arrivals_period, Duration::ZERO),
+            demand: Demand::new(&Config::default(), Duration::ZERO),
             cfg: Config::default(),
             clock: Clock::new(config::SPEED_UNIT),
             feed: Feed::new(Config::default().feed_capacity),
@@ -317,8 +439,14 @@ impl Manager {
         (f.bank.money(), f.bank.chips())
     }
 
-    /// Opens `n` new tables of a kind. They begin running immediately.
+    /// Opens `n` new tables of a kind, at the house's ordinary limit.
     pub fn open(&self, kind: Kind, n: usize) {
+        self.open_at(kind, n, Limit::House);
+    }
+
+    /// Opens `n` new tables at a stated limit. A high-limit table only
+    /// seats the top tier, which is the one concrete thing a tier buys.
+    pub fn open_at(&self, kind: Kind, n: usize, limit: Limit) {
         let Ok(mut f) = self.floor.lock() else { return };
         for _ in 0..n {
             let id = f.next_id;
@@ -329,7 +457,7 @@ impl Manager {
                 *c
             };
             let mut sim = f.sim();
-            let inst = Instance::new(id, kind, number, &mut sim);
+            let inst = Instance::open_with(id, kind, number, limit, &mut sim);
             f.instances.push(inst);
         }
     }
@@ -360,6 +488,11 @@ impl Manager {
                 Weight::Notable,
                 Event::TableClosed { table: inst.id, name: inst.name, take: inst.staked - inst.returned },
             );
+            if !f.instances.iter().any(|t| t.kind == inst.kind) {
+                // The floor stops having an opinion about a game it no
+                // longer offers; if it reopens, it starts neutral.
+                f.demand.forget(inst.kind.key());
+            }
         }
     }
 
@@ -395,6 +528,10 @@ impl Manager {
     fn set_speed_locked(&self, f: &mut Floor, speed: u32) {
         f.cfg.speed = speed;
         f.clock.set_speed(Instant::now(), speed);
+        // A faster clock does not mean a backlog of unpaid rent: the next
+        // bill is simply due a period from here at the new rate.
+        f.rent.resync(f.clock.now());
+        f.door.resync(f.clock.now());
     }
 
     /// A copy of the current tunables. The UI reads thresholds from here
@@ -410,6 +547,9 @@ impl Manager {
     pub fn configure(&self, cfg: Config) {
         let Ok(mut f) = self.floor.lock() else { return };
         f.clock.set_speed(Instant::now(), cfg.speed);
+        let now = f.clock.now();
+        f.rent = Every::new(cfg.expense_period, now);
+        f.door = Every::new(cfg.arrivals_period, now);
         f.cfg = cfg;
     }
 
@@ -466,6 +606,16 @@ impl Manager {
                 crowd: 0,
                 known: 0,
                 by_tier: Vec::new(),
+                handle: 0,
+                payouts: 0,
+                ggr: 0,
+                hold: 0,
+                spent: 0,
+                ngr: 0,
+                by_expense: Vec::new(),
+                demand: Vec::new(),
+                occupancy: 0,
+                movements: Vec::new(),
                 cfg: Config::default(),
                 running: false,
             };
@@ -488,6 +638,16 @@ impl Manager {
             crowd: f.roster.present(),
             known: f.roster.len(),
             by_tier: f.roster.by_tier(&f.cfg),
+            handle: f.bank.handle(),
+            payouts: f.bank.payouts(),
+            ggr: f.bank.ggr(),
+            hold: f.bank.hold(),
+            spent: f.bank.spent(),
+            ngr: f.bank.ngr(),
+            by_expense: f.bank.by_expense(),
+            demand: f.demand.ranked(),
+            occupancy: f.demand.overall_utilization(),
+            movements: f.bank.movements(),
             cfg: f.cfg.clone(),
             running: self.is_running(),
         }
@@ -528,6 +688,7 @@ fn view_of(t: &Instance, roster: &Roster, cfg: &Config, now: Duration, deep: boo
         patrons: if deep { people } else { Vec::new() },
         open_for: now.saturating_sub(t.opened),
         seen: t.seen,
+        limit: t.limit,
         cfg: cfg.clone(),
     }
 }
@@ -778,6 +939,182 @@ mod tests {
         assert!(wait_for(|| m.snapshot().known > 6, Duration::from_secs(15)), "not enough people came in");
         let view = m.snapshot();
         assert_eq!(view.by_tier.iter().sum::<usize>(), view.known, "somebody is in two tiers or none");
+    }
+
+    #[test]
+    fn the_building_charges_its_costs_periodically_and_not_per_frame() {
+        // Phase 7's actual requirement. At a fast clock the periods come
+        // round often; what must never happen is a charge per tick.
+        let m = Manager::start(30, 1_000_000, 20_000_000, Badge::new());
+        let mut cfg = m.config();
+        cfg.expense_period = Duration::from_secs(10);
+        cfg.overhead_per_period = 100;
+        cfg.table_cost_per_period = 10;
+        cfg.speed = 10_000; // ten seconds of casino time per second of ours
+        m.configure(cfg);
+        m.open(Kind::Slots, 2);
+
+        assert!(wait_for(|| m.snapshot().spent > 0, Duration::from_secs(8)), "the bills never came");
+        let after_first = m.snapshot();
+        // Two tables at 10 apiece plus 100 of overhead is 120 a period, so
+        // whatever has been spent must be a whole number of periods.
+        assert_eq!(after_first.spent % 120, 0, "spent {} is not a whole number of periods", after_first.spent);
+
+        // A tick is 40ms; a period is a second of wall time at this speed.
+        // If costs were charged per tick, this would be twenty-five times
+        // bigger than it can legitimately be.
+        std::thread::sleep(Duration::from_millis(1_200));
+        let later = m.snapshot();
+        let periods = (later.spent - after_first.spent) / 120;
+        assert!(periods <= 4, "{periods} periods were charged in 1.2 seconds — this is being billed per frame");
+        assert!(later.spent > after_first.spent, "the clock ran on and nothing was billed");
+
+        let by = later.by_expense;
+        assert!(by.iter().any(|(k, _)| *k == "overhead"));
+        assert!(by.iter().any(|(k, _)| *k == "staffing"));
+    }
+
+    #[test]
+    fn the_bills_come_out_of_the_cage_and_the_tray_never_pays_them() {
+        let m = Manager::start(31, 1_000_000, 20_000_000, Badge::new());
+        let mut cfg = m.config();
+        cfg.expense_period = Duration::from_secs(5);
+        cfg.overhead_per_period = 5_000;
+        cfg.table_cost_per_period = 0;
+        cfg.speed = 10_000;
+        m.configure(cfg);
+        // No tables at all, so nothing but the bills can move the books.
+        let (money_before, chips_before) = m.balances();
+        assert!(wait_for(|| m.snapshot().spent >= 5_000, Duration::from_secs(8)), "the bills never came");
+        let (money, chips) = m.balances();
+        assert!(money < money_before, "the cage never paid");
+        assert_eq!(chips, chips_before, "the patrons' float paid the rent");
+        assert_eq!(m.snapshot().ngr, -m.snapshot().spent, "with no trade, the bottom line is just the costs");
+    }
+
+    #[test]
+    fn the_books_add_up_the_way_the_books_screen_says_they_do() {
+        let m = Manager::start(32, 1_000_000, 50_000_000, Badge::new());
+        m.set_speed(10_000);
+        m.open(Kind::Slots, 4);
+        assert!(wait_for(|| m.snapshot().rounds > 200, Duration::from_secs(15)), "the floor never got going");
+        let v = m.snapshot();
+        assert_eq!(v.ggr, v.handle - v.payouts, "the gross win is the handle less the payouts");
+        assert_eq!(v.ggr, v.table_profit, "and it is the same figure the floor screen shows");
+        assert_eq!(v.ngr, v.cage_profit - v.spent, "the bottom line is cage less costs");
+        assert!(v.handle > v.ggr, "a handle smaller than the win means money is being invented");
+        // The hold is the win as a share of the handle, and nothing else.
+        // Deliberately not asserted to be near the theoretical edge: over a
+        // few hundred spins a machine with a long-tailed paytable is miles
+        // from it either way, and `games::audit` is where the edge itself
+        // is pinned, over hundreds of thousands of rounds.
+        assert_eq!(v.hold, v.ggr * 10_000 / v.handle);
+        assert!(v.handle > 0);
+        let wagers = v.movements.iter().find(|(k, _, _)| *k == Movement::Wager).unwrap().2;
+        assert_eq!(wagers, v.handle, "the movement ledger and the handle disagree");
+    }
+
+    #[test]
+    fn the_room_notices_how_full_it_is() {
+        let m = Manager::start(40, 1_000_000, 20_000_000, Badge::new());
+        let mut cfg = m.config();
+        cfg.demand_sample = Duration::from_secs(2);
+        cfg.demand_period = Duration::from_secs(6);
+        cfg.speed = 10_000;
+        m.configure(cfg);
+        m.open(Kind::Slots, 3);
+        m.open(Kind::Roulette, 2);
+        assert!(wait_for(|| !m.snapshot().demand.is_empty(), Duration::from_secs(8)), "the room never took a reading");
+        let v = m.snapshot();
+        let keys: Vec<&str> = v.demand.iter().map(|(k, _)| *k).collect();
+        assert!(keys.contains(&"slots") && keys.contains(&"roulette"), "kinds missing from the reading: {keys:?}");
+        for (k, st) in v.demand.iter() {
+            assert!(st.offered > 0, "{k} offered no seats");
+            assert!((0..=1_000).contains(&st.utilization()), "{k} is {} permille full", st.utilization());
+        }
+        assert!(v.occupancy > 0, "a floor with people at it read as empty");
+        assert!(v.occupancy <= 1_000, "a floor cannot be {} permille full", v.occupancy);
+    }
+
+    #[test]
+    fn a_floor_with_more_seats_than_customers_sits_half_empty() {
+        // The whole point of an arrival *rate*. If seats were refilled the
+        // instant they emptied, occupancy would read 100% for ever, demand
+        // would have nothing to measure, and opening tables you cannot fill
+        // would cost you nothing but staffing.
+        let m = Manager::start(44, 2_000_000, 100_000_000, Badge::new());
+        let mut cfg = m.config();
+        cfg.demand_sample = Duration::from_secs(2);
+        cfg.arrivals_period = Duration::from_secs(60);
+        cfg.arrivals_per_period = 1; // a trickle, against a great many seats
+        cfg.speed = 10_000;
+        m.configure(cfg);
+        m.open(Kind::Blackjack, 12); // up to seven seats apiece
+        assert!(wait_for(|| !m.snapshot().demand.is_empty(), Duration::from_secs(8)), "the room never took a reading");
+        std::thread::sleep(Duration::from_millis(800));
+        let v = m.snapshot();
+        assert!(v.occupancy < 800, "a starved floor read as {} permille full", v.occupancy);
+        // ...and the staffing bill is charged on the tables, not on the
+        // people at them, which is what makes an empty table cost money.
+        assert!(v.tables.len() == 12);
+    }
+
+    #[test]
+    fn the_rooms_taste_moves_but_never_runs_away_with_the_floor() {
+        let m = Manager::start(41, 1_000_000, 20_000_000, Badge::new());
+        let mut cfg = m.config();
+        cfg.demand_period = Duration::from_secs(2);
+        cfg.demand_sample = Duration::from_secs(1);
+        cfg.speed = 10_000;
+        let (floor_bound, ceiling_bound) = (cfg.appeal_floor, cfg.appeal_ceiling);
+        m.configure(cfg);
+        m.open(Kind::Slots, 2);
+        m.open(Kind::Keno, 1);
+        assert!(wait_for(|| !m.snapshot().demand.is_empty(), Duration::from_secs(8)), "the room never took a reading");
+        std::thread::sleep(Duration::from_millis(1_500));
+        for (k, st) in m.snapshot().demand {
+            assert!(st.appeal >= floor_bound && st.appeal <= ceiling_bound, "{k} drifted to {}", st.appeal);
+        }
+    }
+
+    #[test]
+    fn a_high_limit_table_only_seats_the_house_s_best_customers() {
+        // Rule 5 is not at stake here; Phase 5 is. The privilege has to be
+        // real, or a tier is just a word on a screen.
+        let m = Manager::start(42, 1_000_000, 20_000_000, Badge::new());
+        m.set_speed(10_000);
+        m.open_at(Kind::Baccarat, 1, Limit::High);
+        std::thread::sleep(Duration::from_millis(600));
+        let id = m.ids()[0];
+        let t = m.table(id).expect("the table is open");
+        assert_eq!(t.limit, Limit::High);
+        assert!(t.name.contains('★'));
+        let cfg = m.config();
+        // On a floor that has just opened, nobody has the turnover to be a
+        // VIP yet — so the room is empty, and that is the feature working
+        // rather than failing. What must never happen is a guest in it.
+        for p in t.patrons.iter() {
+            assert!(
+                cfg.is_vip(p.tier(&cfg)),
+                "{} is a {} and got a seat in the high-limit room",
+                p.name,
+                cfg.tier_name(p.tier(&cfg))
+            );
+        }
+        assert!(t.patrons.is_empty(), "somebody qualified as a VIP within a second of the doors opening");
+    }
+
+    #[test]
+    fn a_floor_of_nothing_but_high_limit_tables_simply_stays_empty() {
+        // The seating loop must not spin forever looking for somebody it
+        // will never find. If this hangs, it is broken.
+        let m = Manager::start(43, 1_000_000, 20_000_000, Badge::new());
+        m.set_speed(10_000);
+        m.open_at(Kind::Slots, 3, Limit::High);
+        std::thread::sleep(Duration::from_millis(800));
+        let v = m.snapshot();
+        assert_eq!(v.tables.len(), 3, "the tables should still be open");
+        assert!(v.running, "the simulation thread stopped");
     }
 
     #[test]

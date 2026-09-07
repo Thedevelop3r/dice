@@ -58,6 +58,14 @@ pub struct Config {
     pub vip_max_bet: i64,
     /// Turnover thresholds for each tier, lowest first.
     pub tiers: [(&'static str, i64); 4],
+    /// The tier at which the house starts treating somebody as a VIP: the
+    /// high bet ceiling, and a seat in the high-limit room.
+    ///
+    /// Configurable rather than pinned to the top tier, because where the
+    /// velvet rope goes is exactly the sort of decision a house changes its
+    /// mind about, and pinning it to the top would leave the high-limit
+    /// tables empty for most of a night.
+    pub vip_tier: usize,
 
     // ---- the population (Phases 2-4) ---------------------------------
     /// How many named people the world holds. Once it is full, a seat is
@@ -67,12 +75,36 @@ pub struct Config {
     pub roster_size: usize,
     /// How long somebody stays away between visits, in simulated time.
     pub away_for: (Duration, Duration),
+    /// How often people walk in, and how many at a time.
+    ///
+    /// This is what makes occupancy mean anything. If seats were simply
+    /// filled the instant they emptied, every table would read as full for
+    /// ever and there would be nothing for demand to measure — and no cost
+    /// to opening more tables than the room can fill.
+    pub arrivals_period: Duration,
+    pub arrivals_per_period: usize,
+    /// The chance in a hundred, per lifecycle pass, that somebody standing
+    /// around with nowhere to sit gives up and goes home. Without this a
+    /// room with too few tables silently fills with people who never play.
+    pub gives_up: usize,
 
     // ---- what a patron walks in with ---------------------------------
     /// A buy-in is drawn uniformly from this range, in dollars.
     pub buy_in: (i64, i64),
     /// A top-tier patron buys in for this multiple of an ordinary one.
     pub vip_buy_in_multiple: i64,
+
+    // ---- what the floor is in the mood for (Phase 8) ------------------
+    /// How often the room's taste in games shifts.
+    pub demand_period: Duration,
+    /// How often table occupancy is sampled for the utilization figures.
+    pub demand_sample: Duration,
+    /// The largest single step the mood takes in one shift, in permille.
+    pub appeal_step: i64,
+    /// How far out of favour, and into favour, a game can get. Bounded so
+    /// no single kind can end up owning the whole floor.
+    pub appeal_floor: i64,
+    pub appeal_ceiling: i64,
 
     // ---- event thresholds (Phases 9, 10) -----------------------------
     /// A single settlement returning at least this many chips is notable.
@@ -106,6 +138,8 @@ impl Default for Config {
             max_bet: 2_500,
             vip_max_bet: 50_000,
             tiers: DEFAULT_TIERS,
+            vip_tier: 2, // "high roller"
+
 
             // Small enough that a night produces regulars — somebody you
             // watched bust out turning up again two tables over is the
@@ -113,9 +147,18 @@ impl Default for Config {
             // hides it behind an endless supply of strangers.
             roster_size: 120,
             away_for: (Duration::from_secs(60), Duration::from_secs(600)),
+            arrivals_period: Duration::from_secs(4),
+            arrivals_per_period: 3,
+            gives_up: 6,
 
             buy_in: (20, 200),
             vip_buy_in_multiple: 12,
+
+            demand_period: Duration::from_secs(180),
+            demand_sample: Duration::from_secs(20),
+            appeal_step: 60,
+            appeal_floor: 550,
+            appeal_ceiling: 1_600,
 
             big_win: 1_500,
             huge_win: 15_000,
@@ -146,15 +189,19 @@ impl Config {
         self.tiers.get(tier).map(|t| t.0).unwrap_or("guest")
     }
 
-    /// The top tier's index — what "VIP" means, without the number being
-    /// written down anywhere else.
+    /// The top tier's index.
     pub fn top_tier(&self) -> usize {
         self.tiers.len() - 1
     }
 
+    /// Is somebody of this tier a VIP, as far as the house is concerned?
+    pub fn is_vip(&self, tier: usize) -> bool {
+        tier >= self.vip_tier.min(self.top_tier())
+    }
+
     /// The bet ceiling for a patron of this tier.
     pub fn bet_ceiling(&self, tier: usize) -> i64 {
-        if tier >= self.top_tier() { self.vip_max_bet } else { self.max_bet }
+        if self.is_vip(tier) { self.vip_max_bet } else { self.max_bet }
     }
 
     /// The next rung up the speed ladder, wrapping at the top.
@@ -206,13 +253,30 @@ mod tests {
     }
 
     #[test]
-    fn the_top_tier_gets_the_high_limit_and_nobody_else_does() {
+    fn the_high_limit_belongs_to_the_vip_tier_and_nobody_below_it() {
         let cfg = Config::default();
-        assert_eq!(cfg.bet_ceiling(cfg.top_tier()), cfg.vip_max_bet);
-        for t in 0..cfg.top_tier() {
+        assert!(cfg.vip_tier > 0, "everybody being a VIP makes the tier meaningless");
+        assert!(cfg.vip_tier <= cfg.top_tier());
+        for t in 0..cfg.vip_tier {
+            assert!(!cfg.is_vip(t), "tier {t} should not be a VIP");
             assert_eq!(cfg.bet_ceiling(t), cfg.max_bet);
         }
+        for t in cfg.vip_tier..=cfg.top_tier() {
+            assert!(cfg.is_vip(t));
+            assert_eq!(cfg.bet_ceiling(t), cfg.vip_max_bet);
+        }
         assert!(cfg.vip_max_bet > cfg.max_bet);
+    }
+
+    #[test]
+    fn moving_the_velvet_rope_moves_who_gets_the_high_limit() {
+        // The whole reason this is configuration and not a constant.
+        let cfg = Config { vip_tier: 1, ..Config::default() };
+        assert!(cfg.is_vip(1), "a regular should be a VIP once the rope moves");
+        assert!(!cfg.is_vip(0));
+        let strict = Config { vip_tier: 99, ..Config::default() };
+        assert!(strict.is_vip(strict.top_tier()), "the rope can never move past the top tier");
+        assert!(!strict.is_vip(strict.top_tier() - 1));
     }
 
     #[test]
@@ -250,6 +314,11 @@ mod tests {
         assert!(cfg.roster_size > 0, "a casino with nobody in it is not a casino");
         assert!(cfg.away_for.0 < cfg.away_for.1, "the range somebody stays away must be a range");
         assert!(cfg.away_for.0 > Duration::ZERO, "nobody turns straight round at the door");
+        assert!(cfg.arrivals_per_period > 0 && cfg.arrivals_period > Duration::ZERO, "nobody would ever come in");
+        assert!(cfg.gives_up > 0 && cfg.gives_up < 100, "people must eventually give up, but not instantly");
+        assert!(cfg.appeal_floor < 1_000 && cfg.appeal_ceiling > 1_000, "neutral must sit inside the band");
+        assert!(cfg.appeal_step > 0 && cfg.appeal_step < cfg.appeal_ceiling - cfg.appeal_floor);
+        assert!(cfg.demand_sample < cfg.demand_period, "occupancy should be sampled more often than the mood moves");
         assert!(cfg.feed_capacity > 0);
         assert!(cfg.expense_period > Duration::ZERO, "costs must be periodic, never per frame");
     }

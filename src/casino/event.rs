@@ -75,6 +75,14 @@ pub enum Event {
 
     /// A patron crossed into a higher tier.
     Tier { patron: u64, who: String, tier: usize, name: &'static str },
+
+    /// The room's taste in a game moved. Routine — this is background
+    /// weather, not news.
+    Mood { game: &'static str, appeal: i64 },
+
+    /// The building's running costs came due. Periodic, so it belongs on
+    /// the feed — unlike a wager, there are only a handful an hour.
+    Costs { overhead: i64, staffing: i64, tables: usize },
 }
 
 /// Why a patron got up. Kept as data rather than a string because Phase 13
@@ -146,6 +154,16 @@ impl Event {
                 format!("round {number}: {pot} staked, {paid} paid")
             }
             Event::Tier { who, name, .. } => format!("{who} is now a {name}"),
+            Event::Mood { game, appeal } => {
+                if *appeal >= super::demand::NEUTRAL {
+                    format!("{game} is drawing a crowd")
+                } else {
+                    format!("{game} has gone quiet")
+                }
+            }
+            Event::Costs { overhead, staffing, tables } => {
+                format!("Costs: ${overhead} on the building, ${staffing} on staff for {tables} tables")
+            }
         }
     }
 }
@@ -385,6 +403,8 @@ mod tests {
             },
             Event::Round { table: 1, number: 3, pot: 9, paid: 8 },
             Event::Tier { patron: 1, who: "A".into(), tier: 2, name: "high roller" },
+            Event::Costs { overhead: 400, staffing: 90, tables: 2 },
+            Event::Mood { game: "slots", appeal: 1_200 },
         ];
         for e in all {
             assert!(!e.describe().is_empty());
