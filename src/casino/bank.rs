@@ -283,6 +283,58 @@ impl Bank {
         self.bought_in - self.cashed_out
     }
 
+    /// Rebuilds a bank from a saved one, so the books carry on rather than
+    /// starting again. Deliberately takes every figure explicitly: a field
+    /// added later that this forgets is a figure silently reset to zero on
+    /// every reopening, which is the sort of bug nobody notices for weeks.
+    pub fn restore(s: &super::save::SavedBank, per_table: &[(String, i64)], per_expense: &[(String, i64)]) -> Bank {
+        let mut b = Bank::new(s.money, s.chips);
+        b.collected = s.collected;
+        b.paid = s.paid;
+        b.bought_in = s.bought_in;
+        b.cashed_out = s.cashed_out;
+        b.handle = s.handle;
+        b.payouts = s.payouts;
+        b.rounds = s.rounds;
+        b.bets = s.bets;
+        b.spent = s.spent;
+        for (key, amount) in per_table {
+            // The keys are `&'static str` everywhere else, and a table that
+            // is no longer in the program is a book nobody can add to — so
+            // only keys the build still knows about are carried forward.
+            if let Some(k) = super::instance::Kind::from_key(key) {
+                *b.per_table.entry(k.key()).or_insert(0) += amount;
+            } else if *key == "tourney" {
+                *b.per_table.entry("tourney").or_insert(0) += amount;
+            }
+        }
+        for (key, amount) in per_expense {
+            for e in [super::bank::Expense::Overhead, super::bank::Expense::Staffing] {
+                if e.label() == key {
+                    *b.per_expense.entry(e.label()).or_insert(0) += amount;
+                }
+            }
+        }
+        b
+    }
+
+    /// The books, ready to be written down.
+    pub fn saved(&self) -> super::save::SavedBank {
+        super::save::SavedBank {
+            money: self.money,
+            chips: self.chips,
+            collected: self.collected,
+            paid: self.paid,
+            bought_in: self.bought_in,
+            cashed_out: self.cashed_out,
+            handle: self.handle,
+            payouts: self.payouts,
+            rounds: self.rounds,
+            bets: self.bets,
+            spent: self.spent,
+        }
+    }
+
     pub fn totals(&self) -> (i64, i64, i64, i64) {
         (self.collected, self.paid, self.bought_in, self.cashed_out)
     }
@@ -459,6 +511,48 @@ mod tests {
         assert_eq!(b.money(), 500);
         assert_eq!(b.spent(), 0);
         assert!(b.by_expense().is_empty());
+    }
+
+    #[test]
+    fn a_bank_written_down_and_read_back_is_the_same_bank() {
+        let mut b = Bank::new(10_000, 500_000);
+        b.buy_in(400);
+        b.settle("slots", 900, 700);
+        b.settle("roulette", 500, 800);
+        b.cash_out(1_200);
+        b.pay(Expense::Overhead, 250);
+        b.count_round();
+
+        let saved = b.saved();
+        let table_books: Vec<(String, i64)> = b.by_table().iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        let expense_books: Vec<(String, i64)> = b.by_expense().iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        let back = Bank::restore(&saved, &table_books, &expense_books);
+
+        assert_eq!(back.money(), b.money());
+        assert_eq!(back.chips(), b.chips());
+        assert_eq!(back.handle(), b.handle());
+        assert_eq!(back.payouts(), b.payouts());
+        assert_eq!(back.ggr(), b.ggr());
+        assert_eq!(back.hold(), b.hold(), "the realised hold changed across a reopening");
+        assert_eq!(back.cage_profit(), b.cage_profit());
+        assert_eq!(back.ngr(), b.ngr());
+        assert_eq!(back.rounds(), b.rounds());
+        assert_eq!(back.bets(), b.bets());
+        assert_eq!(back.spent(), b.spent());
+        assert_eq!(back.by_table(), b.by_table(), "a table's book was lost");
+        assert_eq!(back.by_expense(), b.by_expense());
+    }
+
+    #[test]
+    fn a_book_for_a_game_the_build_no_longer_has_is_dropped_rather_than_kept() {
+        // Keys are `&'static str` throughout; a saved book for a table that
+        // has since been removed has nowhere to live, and carrying it as a
+        // leaked string would be worse than losing it.
+        let saved = Bank::new(0, 0).saved();
+        let b = Bank::restore(&saved, &[("quoits".into(), 500), ("slots".into(), 250)], &[]);
+        let books = b.by_table();
+        assert!(books.iter().any(|(k, v)| *k == "slots" && *v == 250));
+        assert!(!books.iter().any(|(k, _)| *k == "quoits"), "a book survived its game");
     }
 
     #[test]

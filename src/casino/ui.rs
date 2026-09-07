@@ -11,6 +11,7 @@
 
 use super::config;
 use super::analytics;
+use crate::casino;
 use super::demand;
 use super::event::Weight;
 use super::instance::{Kind, Limit};
@@ -568,6 +569,26 @@ fn leaderboards(manager: &Manager, screen: &mut Screen) {
             return;
         }
     }
+}
+
+/// Something went wrong with the saved casino, said plainly.
+///
+/// Shown instead of silently laying out a new floor over the top of one
+/// somebody may have hours in — if a save cannot be read, that is worth
+/// stopping for.
+pub fn trouble(screen: &mut Screen, what: &str) {
+    let theme = screen.theme;
+    screen.begin();
+    ui::header(screen, "THE SAVED CASINO");
+    screen.blank();
+    screen.line(&format!("  {}", theme.lose(what)));
+    screen.blank();
+    screen.line(&theme.dim("  the old file has been left exactly where it is, in case it can be repaired"));
+    screen.line(&theme.dim(&format!("  it is at {}", casino::save::path().display())));
+    screen.blank();
+    screen.line(&widgets::footer(&theme, &[('\u{23ce}', "open a new casino")]));
+    screen.present();
+    let _ = ui::input::read_key();
 }
 
 /// The tournaments, live.

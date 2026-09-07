@@ -137,6 +137,11 @@ impl Archetype {
         }
     }
 
+    /// The inverse of `label`, for reading a saved roster back.
+    pub fn from_label(label: &str) -> Option<Archetype> {
+        Archetype::ALL.iter().copied().find(|a| a.label() == label)
+    }
+
     /// Rolls one, respecting how common each kind is.
     pub fn roll(rng: &mut Rng) -> Archetype {
         let total: usize = Archetype::ALL.iter().map(|a| a.weight()).sum();
@@ -532,6 +537,14 @@ mod tests {
         let whales = counts[Archetype::ALL.iter().position(|a| *a == Archetype::Whale).unwrap()];
         let gamblers = counts[Archetype::ALL.iter().position(|a| *a == Archetype::Gambler).unwrap()];
         assert!(whales * 4 < gamblers, "whales are meant to be rare: {whales} of 4000");
+    }
+
+    #[test]
+    fn an_archetype_can_be_read_back_from_what_it_writes() {
+        for a in Archetype::ALL {
+            assert_eq!(Archetype::from_label(a.label()), Some(a), "{} does not survive a round trip", a.label());
+        }
+        assert_eq!(Archetype::from_label("card counter"), None);
     }
 
     #[test]

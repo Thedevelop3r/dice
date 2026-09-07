@@ -32,15 +32,15 @@ The two constraints that define the whole codebase:
 
 | | |
 |---|---|
-| Source | 21,267 lines across 58 files |
-| Tests | 355, all passing |
+| Source | 22,712 lines across 60 files |
+| Tests | 380, all passing |
 | Starting balances | 10,000 chips / $9,000 — the user's own tuning in `economy.rs` |
 | Clippy | clean, zero warnings |
 | Dependencies | none |
 | Tables | 24 (8 dice, 6 card, 2 wheel, 8 arcade) |
 | Idle screens | 17 tables + a floor-wide cycler |
 | Background casino | a real simulation thread; 51 tables at 0.2% CPU |
-| Autonomous roadmap | Phases 0-17 and 20 done — see `ROADMAP.md` |
+| Autonomous roadmap | **all 24 phases done** — see `ROADMAP.md` |
 
 ---
 
@@ -160,7 +160,7 @@ across two threads.
 
 ```
 src/
-  main.rs          609  dashboard, the four rooms, idle room, Stats, Casino, Rules, Options
+  main.rs          721  dashboard, the four rooms, idle room, Stats, Casino, Rules, Options
   economy.rs       265  Wallet (player) + House (casino ledger) + Item
   stats.rs         113  the key=value save file
   rng.rs            58  xoshiro256** + SplitMix64 seeding
@@ -181,17 +181,19 @@ src/
     demand.rs      371  what the room is in the mood for + occupancy
     analytics.rs   435  the night in bucketed time ranges + per-game figures
     happening.rs   420  things that happen to the room: rates and costs only
+    save.rs        646  the casino written down: versioned, atomic, migrated
+    walk.rs        312  the whole thing end to end, in twenty-four steps
     tournament.rs  600  a fixed field playing down to one winner
     interest.rs    339  how worth watching a table is, and why
     clock.rs       248  simulated time, permille speed, the `Every` period
     event.rs       460  the event bus: Event, Weight, Record, Feed
     sim.rs          45  the borrow bundle a table gets for one call
-    bank.rs        471  the economy manager: movements, GGR/NGR, expenses
+    bank.rs        565  the economy manager: movements, GGR/NGR, expenses
     patron.rs      751  archetypes, traits, presence, lifetime record
-    roster.rs      402  everyone the casino knows, seated or not
+    roster.rs      505  everyone the casino knows, seated or not
     instance.rs    845  one running table, its limit, the Kind → game mapping
-    manager.rs    1762  simulation thread, lifecycle, bills, mood, tourneys
-    ui.rs         1043  floor, feed, spectator, night, customers, books, tourneys
+    manager.rs    1935  simulation thread, lifecycle, bills, mood, save/resume
+    ui.rs         1064  floor, feed, spectator, night, customers, books, tourneys
   games/
     mod.rs         109  Ctx, Difficulty, Player, pick_difficulty
     cards.rs       443  shared deck/shoe/hand rankings  ← every card table
@@ -598,6 +600,73 @@ Entering a tournament counts as starting a visit, so somebody who has just
 walked in buys chips at the cage first, exactly as they would sitting down.
 Entrants are `Presence::InTournament`, which is why the seating loop leaves
 them alone.
+
+### The casino, written down (session 7, Phases 18-19)
+
+`casino/save.rs`, `~/.local/share/dice_arena/casino.save`. Closing the
+program no longer throws the world away.
+
+**What is saved:** the books in full, every person and everything the house
+knows about them, which tables were open and at what limit, how many of each
+have ever been opened (so numbering carries on), the room's taste in games,
+and the simulated clock.
+
+**What is deliberately not saved**, and why it matters:
+
+- **Who was sitting where.** People come back and choose again. Freezing a
+  half-played round to disk would mean a save format that has to understand
+  every game in the building — exactly the coupling this module spent seven
+  phases avoiding.
+- **A tournament in progress.** Same reason, more so. A finished one has
+  already paid out and the money is in the roster.
+- **The bucketed recent history.** The totals survive; the shape of the last
+  hour does not. Reopening is a new night.
+- **The tunables.** `Config` is not persisted; a reopened casino runs on
+  this build's defaults. Worth revisiting if a settings screen ever lands.
+
+**How it is written** — the three steps, in order: write to `<name>.tmp`;
+read that file back and check it parses to the same casino; then `rename`
+it into place. A save that fails any step leaves the previous one exactly
+where it was. There is a test that stands a directory in the temporary
+file's way and asserts the good save survives.
+
+**Versioning.** `VERSION = 2`. A newer file is *refused*, not guessed at. An
+older one is migrated on the way in — v1 did not record the handle, so the
+migration derives what it honestly can from what v1 did keep and leaves the
+rest at zero rather than inventing a figure that would then look real.
+
+Gotchas worth keeping:
+
+- `Manager::saved()` truncates the clock to whole milliseconds, because
+  that is the precision the file has. Without it the save fails its own
+  round-trip validation — which is the validation doing its job.
+- Everybody is restored **outside the building**, holding nothing. A
+  restored casino looks like the start of a night, not a freeze-frame.
+- `Bank::restore` takes every field explicitly. A field added later that it
+  forgets is a figure silently reset to zero on every reopening.
+- Saved book keys for games this build no longer has are dropped, because
+  the keys are `&'static str` everywhere else.
+- The save is written on leaving the floor screen *and* on quitting, so an
+  hour of a night is not lost to a power cut.
+
+### The end-to-end walk (session 7, Phases 22 and 24)
+
+`casino/walk.rs` — one test, one casino, twenty-four numbered steps, from
+the doors opening to reopening it from disk. It is deliberately *one* long
+test rather than twenty-four short ones: the steps share a floor because
+that is the thing being tested. Not "does the roster work" but "does the
+roster the manager is running feed the leaderboard the screen would draw".
+Every system already has its own unit tests; what those cannot catch is a
+system that passes them and is wired to nothing.
+
+It runs on a `brisk()` config that makes a night happen in about nine
+seconds and makes the rolled-for things (happenings, tournaments) certain
+rather than likely, so it does not flake.
+
+One real finding from writing it: a table with nobody at it still deals —
+the high-limit room with no VIPs in it yet is exactly that — so a game can
+have rounds with no bets. Rounds without bets is a true state; a handle
+without bets is not, and that is what the step now asserts.
 
 ---
 

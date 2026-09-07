@@ -204,6 +204,49 @@ impl Roster {
         all
     }
 
+    /// Everyone, ready to be written down.
+    pub fn saved(&self) -> Vec<super::save::SavedPatron> {
+        self.people
+            .values()
+            .map(|p| super::save::SavedPatron {
+                id: p.id,
+                name: p.name.clone(),
+                archetype: p.archetype,
+                nerve: p.nerve,
+                appetite: p.appetite,
+                discipline: p.discipline,
+                read: p.read,
+                lifetime: p.lifetime.clone(),
+            })
+            .collect()
+    }
+
+    /// Rebuilds a roster from a saved one.
+    ///
+    /// Everybody comes back **outside the building**, waiting to walk in
+    /// again. Where they were sitting is not saved on purpose — see
+    /// `casino::save` — and a reopened casino should fill up the way any
+    /// other night does, from people who have been here before.
+    pub fn restore(saved: &[super::save::SavedPatron]) -> Roster {
+        let mut r = Roster::new();
+        for s in saved {
+            let mut p = Patron::of_kind(&mut Rng::from_seed(s.id.max(1)), s.id, s.archetype);
+            p.name = s.name.clone();
+            p.nerve = s.nerve;
+            p.appetite = s.appetite;
+            p.discipline = s.discipline;
+            p.read = s.read;
+            p.lifetime = s.lifetime.clone();
+            p.chips = 0;
+            p.bought = 0;
+            p.presence = Presence::Away { back_at: Duration::ZERO };
+            r.next_id = r.next_id.max(s.id + 1);
+            r.people.insert(s.id, p);
+        }
+        r.minted = r.people.len() as u64;
+        r
+    }
+
     /// How the population breaks down by tier, lowest tier first.
     pub fn by_tier(&self, cfg: &Config) -> Vec<usize> {
         let mut counts = vec![0usize; cfg.tiers.len()];
@@ -321,6 +364,66 @@ mod tests {
         // Somebody who is seated is not available to fill another seat.
         r.seat(known, 3);
         assert_eq!(r.waiting(&mut rng), None);
+    }
+
+    #[test]
+    fn a_roster_written_down_and_read_back_is_the_same_people() {
+        let mut rng = probe();
+        let mut r = Roster::new();
+        for i in 0..25 {
+            let id = r.mint(&mut rng);
+            let p = r.get_mut(id).unwrap();
+            p.begin_visit(1_000 + i as i64);
+            p.settle(200, 150);
+            p.end_visit(Duration::from_secs(60));
+        }
+        let back = Roster::restore(&r.saved());
+        assert_eq!(back.len(), r.len());
+        for original in r.iter() {
+            let after = back.get(original.id).expect("everybody should come back");
+            assert_eq!(after.name, original.name);
+            assert_eq!(after.archetype, original.archetype, "{} changed personality", original.name);
+            assert_eq!(
+                (after.nerve, after.appetite, after.discipline, after.read),
+                (original.nerve, original.appetite, original.discipline, original.read),
+                "{}'s traits were re-rolled",
+                original.name
+            );
+            assert_eq!(after.lifetime, original.lifetime, "{} lost their history", original.name);
+        }
+    }
+
+    #[test]
+    fn everybody_comes_back_outside_the_building_holding_nothing() {
+        // Where somebody was sitting is not saved; they walk back in and
+        // choose again. What they must not do is come back still holding
+        // chips they took to the cage, or seated at a table that is not
+        // there any more.
+        let mut rng = probe();
+        let mut r = Roster::new();
+        for _ in 0..10 {
+            let id = r.mint(&mut rng);
+            r.get_mut(id).unwrap().begin_visit(5_000);
+            r.seat(id, 42);
+        }
+        assert_eq!(r.chips_in_play(), 50_000);
+        let back = Roster::restore(&r.saved());
+        assert_eq!(back.chips_in_play(), 0, "somebody came back holding the house's chips");
+        assert_eq!(back.present(), 0, "somebody came back already in the building");
+        assert!(back.seated_at(42).is_empty(), "somebody came back sat at a table that no longer exists");
+        assert_eq!(back.due_back(Duration::ZERO).len(), 10, "everybody should be ready to walk in");
+    }
+
+    #[test]
+    fn ids_carry_on_climbing_after_a_reopening() {
+        let mut rng = probe();
+        let mut r = Roster::new();
+        let ids: Vec<u64> = (0..5).map(|_| r.mint(&mut rng)).collect();
+        let mut back = Roster::restore(&r.saved());
+        let fresh = back.mint(&mut rng);
+        assert!(fresh > *ids.iter().max().unwrap(), "a reopened casino reused somebody's id");
+        assert!(back.get(fresh).is_some());
+        assert_eq!(back.len(), 6);
     }
 
     #[test]

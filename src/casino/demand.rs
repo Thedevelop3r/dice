@@ -191,6 +191,13 @@ impl Demand {
         moved
     }
 
+    /// Puts back a saved standing, so a reopened casino remembers what the
+    /// room was into. Only the appeal survives; the occupancy figures are
+    /// a measurement of a night that is over.
+    pub fn set_appeal(&mut self, key: &'static str, appeal: i64) {
+        self.per_kind.entry(key).or_insert_with(Standing::new).appeal = appeal;
+    }
+
     /// Forgets a kind entirely — used when the last table of it closes and
     /// the floor stops having an opinion.
     pub fn forget(&mut self, key: &'static str) {

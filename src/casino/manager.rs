@@ -28,6 +28,7 @@ use super::instance::{Instance, Kind, Limit, RoundLog};
 use super::interest::{self, Interest};
 use super::patron::{Patron, Presence};
 use super::roster::{self, Roster};
+use super::save::{Save, SavedTable};
 use super::sim::Sim;
 use super::tournament::{Running, Stage, Tournament};
 use crate::rng::Rng;
@@ -955,6 +956,76 @@ impl Manager {
             .max_by_key(|(id, i)| (i.score, std::cmp::Reverse(*id)))
     }
 
+    /// The whole casino, ready to be written down.
+    ///
+    /// Taken under the lock in one go, so it is a coherent picture rather
+    /// than a set of figures from slightly different moments.
+    pub fn saved(&self) -> Save {
+        let Ok(f) = self.floor.lock() else { return Save { version: super::save::VERSION, ..Save::default() } };
+        Save {
+            version: super::save::VERSION,
+            // Truncated to whole milliseconds, because that is the
+            // precision the file has. A save that does not compare equal
+            // to what it was made from fails its own validation step —
+            // and it should, because it would mean something was lost.
+            elapsed: Duration::from_millis(f.clock.now().as_millis() as u64),
+            speed: f.cfg.speed,
+            bank: f.bank.saved(),
+            by_table: f.bank.by_table().iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            by_expense: f.bank.by_expense().iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            people: f.roster.saved(),
+            tables: f
+                .instances
+                .iter()
+                .map(|t| SavedTable { kind: t.kind, number: t.number(), limit: t.limit })
+                .collect(),
+            appeal: f.demand.ranked().iter().map(|(k, s)| (k.to_string(), s.appeal)).collect(),
+            opened: f.opened.iter().map(|(k, n)| (k.to_string(), *n)).collect(),
+            tourneys_held: f.tourneys_held,
+        }
+    }
+
+    /// Opens a casino that has run before.
+    ///
+    /// The books, the people and the floor plan all carry on. Nobody is
+    /// sitting anywhere yet: everybody starts outside and walks back in,
+    /// which is why a restored casino looks like the start of a night
+    /// rather than a freeze-frame of the last one.
+    pub fn resume(seed: u64, save: &Save, badge: Badge) -> Manager {
+        let m = Manager::start(seed, save.bank.money, save.bank.chips, badge);
+        {
+            let Ok(mut f) = m.floor.lock() else { return m };
+            f.bank = Bank::restore(&save.bank, &save.by_table, &save.by_expense);
+            f.roster = Roster::restore(&save.people);
+            f.cfg.speed = save.speed;
+            f.clock = Clock::resume(save.elapsed, save.speed);
+            f.tourneys_held = save.tourneys_held;
+            for (key, n) in save.opened.iter() {
+                if let Some(k) = Kind::from_key(key) {
+                    f.opened.insert(k.key(), *n);
+                }
+            }
+        }
+        // The tables are opened through the ordinary path, so a restored
+        // floor is built by the same code a fresh one is — there is no
+        // second way to bring a table into being.
+        for t in save.tables.iter() {
+            m.open_at(t.kind, 1, t.limit);
+        }
+        // The room's mood is put back after the tables exist, since a kind
+        // with no table open has no standing to restore.
+        if let Ok(mut f) = m.floor.lock() {
+            let now = f.clock.now();
+            for (key, appeal) in save.appeal.iter() {
+                if let Some(k) = Kind::from_key(key) {
+                    f.demand.set_appeal(k.key(), *appeal);
+                }
+            }
+            f.feed.push(now, Weight::Notable, Event::CasinoOpened { money: save.bank.money, chips: save.bank.chips });
+        }
+        m
+    }
+
     /// The ids currently on the floor, in the order they were opened —
     /// which is the order the UI cycles through.
     pub fn ids(&self) -> Vec<u32> {
@@ -1661,6 +1732,105 @@ mod tests {
                 "the house won {} from tournaments against a rake of {expected}",
                 tally.ggr()
             );
+        }
+    }
+
+    #[test]
+    fn a_casino_survives_being_closed_and_opened_again() {
+        // Phase 18, end to end: run a night, write it down, reopen it, and
+        // check the things that are supposed to carry on have carried on.
+        let mut first = Manager::start(80, 500_000, 20_000_000, Badge::new());
+        first.set_speed(10_000);
+        first.open(Kind::Slots, 2);
+        first.open_at(Kind::Baccarat, 1, Limit::High);
+        assert!(wait_for(|| first.snapshot().rounds > 200, Duration::from_secs(15)), "the floor never got going");
+
+        let before = first.snapshot();
+        let save = first.saved();
+        first.stop();
+
+        // Through the file, not just through memory: this is the path the
+        // program actually takes.
+        let at = std::env::temp_dir().join("dice_arena_reopen_test.save");
+        let _ = std::fs::remove_file(&at);
+        save.write(&at).expect("it should write");
+        let read_back = crate::casino::save::Save::load(&at).expect("it should load");
+        let second = Manager::resume(81, &read_back, Badge::new());
+        std::thread::sleep(Duration::from_millis(300));
+        let after = second.snapshot();
+
+        // A reopened casino is *live*, so these carry on from where they
+        // were rather than freezing there. The failure being guarded
+        // against is a reset to nothing, not a figure that has moved on.
+        assert!(after.handle >= before.handle, "the night's turnover was forgotten: {} against {}", after.handle, before.handle);
+        assert!(after.bets >= before.bets, "the bet count started again");
+        assert!(after.known >= before.known, "the regulars were forgotten");
+        assert!(before.handle > 0 && before.known > 0, "the test needs a casino that actually ran");
+        // The cage carries on from where it was, give or take the buy-ins
+        // of the people walking back in while this test looks at it.
+        assert!(
+            (after.money - before.money).abs() < before.money / 10,
+            "the cage did not carry on: {} against {}",
+            after.money,
+            before.money
+        );
+        assert_eq!(after.tables.len(), before.tables.len(), "the floor plan changed");
+        assert!(after.tables.iter().any(|t| t.limit == Limit::High), "the high-limit room did not reopen");
+        // Table numbering carries on rather than starting again at #1.
+        let names: Vec<String> = after.tables.iter().map(|t| t.name.clone()).collect();
+        assert!(names.iter().any(|n| n.contains("Slots #")), "no slots table reopened: {names:?}");
+        assert!(!names.iter().any(|n| n == "Slots #1"), "the numbering started again: {names:?}");
+
+        // And it is a live casino, not a photograph: it keeps playing.
+        assert!(wait_for(|| second.snapshot().rounds > after.rounds, Duration::from_secs(10)), "the reopened floor is dead");
+        let _ = std::fs::remove_file(&at);
+    }
+
+    #[test]
+    fn a_reopened_casino_fills_up_with_the_people_who_were_there_before() {
+        let mut first = Manager::start(82, 500_000, 20_000_000, Badge::new());
+        first.configure(Config { speed: 10_000, roster_size: 15, ..Config::default() });
+        first.open(Kind::Slots, 3);
+        assert!(wait_for(|| first.snapshot().known >= 10, Duration::from_secs(15)), "nobody ever came in");
+        let names_before: Vec<String> = {
+            let f = first.floor.lock().unwrap();
+            f.roster.iter().map(|p| p.name.clone()).collect()
+        };
+        let save = first.saved();
+        first.stop();
+
+        let second = Manager::resume(83, &save, Badge::new());
+        std::thread::sleep(Duration::from_millis(500));
+        let names_after: Vec<String> = {
+            let f = second.floor.lock().unwrap();
+            f.roster.iter().map(|p| p.name.clone()).collect()
+        };
+        // Every one of them is still known. The reopened floor goes on to
+        // let more people in, as any night does — what must not happen is
+        // somebody from before being replaced by a stranger.
+        for name in names_before.iter() {
+            assert!(names_after.contains(name), "{name} was not at the reopened casino");
+        }
+        // They come back and sit down of their own accord — nobody is
+        // restored into a seat.
+        assert!(wait_for(|| second.snapshot().crowd > 0, Duration::from_secs(10)), "nobody ever came back in");
+    }
+
+    #[test]
+    fn a_saved_casino_is_a_coherent_picture_and_not_a_smear() {
+        // The save is taken under one lock, so the books in it agree with
+        // themselves even though the floor never stops moving.
+        let m = Manager::start(84, 500_000, 20_000_000, Badge::new());
+        m.set_speed(10_000);
+        m.open(Kind::Slots, 4);
+        assert!(wait_for(|| m.snapshot().rounds > 100, Duration::from_secs(15)), "the floor never got going");
+        for _ in 0..20 {
+            let s = m.saved();
+            assert_eq!(s.bank.handle - s.bank.payouts, s.bank.collected - s.bank.paid, "the books disagree with themselves");
+            assert!(s.bank.handle >= s.bank.payouts.min(s.bank.handle));
+            assert_eq!(s.version, crate::casino::save::VERSION);
+            assert!(!s.people.is_empty());
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 

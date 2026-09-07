@@ -117,6 +117,11 @@ impl Kind {
     /// How many can sit here at once, and how long a round takes. A slot
     /// machine seats one and spins constantly; a bingo hall seats several
     /// and takes its time.
+    /// The inverse of `key`, for reading a saved floor back.
+    pub fn from_key(key: &str) -> Option<Kind> {
+        Kind::ALL.iter().copied().find(|k| k.key() == key)
+    }
+
     pub fn seats(self) -> (usize, usize) {
         match self {
             Kind::Slots | Kind::VidPoker | Kind::Scratch | Kind::Crash | Kind::Mines | Kind::Plinko => (1, 1),
@@ -246,6 +251,14 @@ impl Limit {
         }
     }
 
+    pub fn from_label(label: &str) -> Option<Limit> {
+        match label {
+            "house" => Some(Limit::House),
+            "high limit" => Some(Limit::High),
+            _ => None,
+        }
+    }
+
     /// The bet ceiling this table imposes, whoever is sitting at it.
     pub fn ceiling(self, cfg: &super::config::Config) -> i64 {
         match self {
@@ -305,6 +318,8 @@ pub struct Instance {
     pub seen: u32,
     /// How many seats the table currently wants filled.
     wanted: usize,
+    /// Which one of its kind this is.
+    number: u32,
     /// What this table lets people bet, and who it lets sit down.
     pub limit: Limit,
 }
@@ -335,6 +350,7 @@ impl Instance {
             opened: now,
             seen: 0,
             wanted: seats,
+            number,
             limit,
         };
         // Seats are filled by the floor, not by the table: who sits where
@@ -342,6 +358,13 @@ impl Instance {
         inst.wanted = seats;
         sim.emit(Weight::Notable, Event::TableOpened { table: id, name: inst.name.clone() });
         inst
+    }
+
+    /// Which one of its kind this is — `Roulette #3` is number three.
+    /// Kept so a reopened casino carries on numbering rather than starting
+    /// again at one.
+    pub fn number(&self) -> u32 {
+        self.number
     }
 
     /// How many seats this table would like filled. Re-rolled as people
@@ -551,6 +574,21 @@ mod tests {
         keys.dedup();
         assert_eq!(labels.len(), n, "two kinds share a label");
         assert_eq!(keys.len(), n, "two kinds share a stats key");
+    }
+
+    #[test]
+    fn every_kind_and_limit_can_be_read_back_from_what_it_writes() {
+        // Persistence depends on this exactly: a saved floor is a list of
+        // keys, and a key that cannot be parsed back is a table that
+        // quietly vanishes when the casino reopens.
+        for k in Kind::ALL {
+            assert_eq!(Kind::from_key(k.key()), Some(k), "{} does not survive a round trip", k.label());
+        }
+        assert_eq!(Kind::from_key("not-a-game"), None);
+        for l in [Limit::House, Limit::High] {
+            assert_eq!(Limit::from_label(l.label()), Some(l));
+        }
+        assert_eq!(Limit::from_label("velvet"), None);
     }
 
     #[test]

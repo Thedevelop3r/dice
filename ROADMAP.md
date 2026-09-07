@@ -190,6 +190,23 @@ nothing recomputed per frame that can be accumulated per event.
 
 ---
 
+## Where it got to
+
+Every phase of the roadmap is built. What was deliberately left out, and
+would be the next honest conversation rather than the next commit:
+
+- **`Config` is not persisted.** A reopened casino runs on this build's
+  defaults. It wants a settings screen more than it wants a save format.
+- **Nobody is restored into a seat**, and no tournament survives a restart.
+  Both are stated in `casino/save.rs` with the reasoning; both are
+  deliberate, not missing.
+- **Phase 8's demand does not feed back into the floor.** The room's taste
+  and its occupancy are measured and shown, but nothing opens or closes a
+  table on the strength of them. A house that responded to its own figures
+  would be a genuinely new behaviour, not a finishing touch.
+- **Rule 8 held throughout**: no floors, no upgrades, no expansion, no
+  unlockables. The casino is a fixed building that got busier inside.
+
 ## Progress
 
 | Step | Phase(s) | State |
@@ -205,6 +222,6 @@ nothing recomputed per frame that can be accumulated per event.
 | Feed, notifications, spectator, follow | 9, 10, 11, 12 | **done** — feed screen, Major notifications, `spectate`, `casino/interest.rs` |
 | Analytics, leaderboards | 13, 14, 15 | **done** — `casino/analytics.rs`, the night screen, the customers screen |
 | Random events, tournaments | 16, 17 | **done** — `casino/happening.rs`, `casino/tournament.rs` |
-| Persistence | 18, 19 | pending |
-| Tests, integration | 22, 24 | pending |
-| UI integration | 23 | pending |
+| Persistence | 18, 19 | **done** — `casino/save.rs`, wired into `main.rs` |
+| Tests, integration | 22, 24 | **done** — 380 tests, and `casino/walk.rs` walks all twenty-four steps |
+| UI integration | 23 | **done** — floor, feed, spectator, night, customers, books, tourneys |

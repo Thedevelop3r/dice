@@ -128,21 +128,58 @@ independently of whatever screen you happen to be looking at.
 - **Pick a floor** — a quiet night, a busy floor, one of everything, or all
   fifty-one tables at once. Open more at any time.
 - **The overview** lists every running table with its seats, round, status,
-  take and last result. Move with `J`/`K`, watch one with `W`, pause with
-  `P`, close with `X`, change speed with `S`.
+  take and last result, with what is going on in the building tonight above
+  it and a strip of recent goings-on below. Move with `J`/`K`, watch one
+  with `W`, pause with `P`, close with `X`, change speed with `S` (0.25x up
+  to 10x).
 - **Watching a table** shows who is sitting there, what each of them just
-  bet, their stack, and how they have run. `N`/`P` step to the next table —
-  the ones you leave keep playing.
+  bet, their stack, how they have run tonight and across every visit they
+  have ever made. `N`/`P` step to the next table — the ones you leave keep
+  playing.
+- **`V` — spectate.** The floor picks what you look at, holds on it for a
+  spell, and moves to whatever is most worth watching, telling you why.
+- **`E` — the feed.** Everything worth reading, with `B` to narrow it to
+  the big ones.
+- **`T` — the night.** How it has been going over the last minute, ten
+  minutes, hour, or all of it, with a bar per half-minute and a table of
+  which games are carrying the room.
+- **`C` — the customers.** Biggest spenders, who is up on the house, and
+  the regulars. Rarely the same people.
+- **`M` — the books.** Handle, payouts, the realised hold, the cage, what
+  the building costs to run, the bottom line, and every movement of money
+  or chips by kind.
+- **`R` — tournaments.** One starts up every so often: a field playing
+  itself down to a winner.
 - **The money and chips in the top-right** are the casino's own, live. They
   stay on screen everywhere in the app, including in the middle of a hand
   you are playing yourself.
 
-Patrons are not random noise with names on. Four traits — nerve, appetite,
-discipline and read — decide how much they stake, how far up a table's bet
-ladder they reach, and when they walk away. What no trait does is bend an
-outcome: every background round is settled by the same audited maths as the
-table you would play by hand. A patron's `luck` is therefore *measured*
-rather than rolled.
+Patrons are people the building knows. Each has an archetype — conservative,
+gambler, strategist, chaser, whale, beginner, hunch player — which sets the
+bands four traits are rolled within: nerve, appetite, discipline and read.
+Those decide how much they stake, how far up a table's bet ladder they
+reach, which table they choose, and when they walk away.
+
+They also **persist**. Somebody who gets up is not deleted; they go home,
+and later they come back, to a floor that remembers every visit they have
+made. The population is bounded, so past a point a new arrival is a familiar
+face rather than a stranger — which is why the regulars list exists and why
+a name on it means something.
+
+What no archetype and no trait does is bend an outcome. Every background
+round is settled by the same audited maths as the table you would play by
+hand, so a patron's `luck` is *measured* rather than rolled, and the "lucky
+player" archetype is a staking behaviour rather than a thumb on the scale.
+The same goes for what the room is in the mood for and for the things that
+happen to it over a night — a coach party, a quiet spell, a game everybody
+suddenly wants a seat at, a short-staffed shift. Every one of them moves a
+rate or a cost. Not one of them touches a payout.
+
+Money and chips are separate quantities, and the books say so: the handle
+and the gaming win are counted in chips, the bottom line in cash. Tables
+have limits, the top tier gets a higher one and a room of its own, the
+building charges its own running costs, and it all carries on from where it
+was the next time you open the doors.
 
 Money and chips are separate quantities. Chips move bet by bet at the
 tables; money moves only at the cage, where the house sells chips at 10 to
@@ -206,10 +243,20 @@ that touch nothing in the games that came before them.
   uses to time-slice tables that don't know they're being cycled.
 - `src/games/floor.rs` — which tables exist, and the screensaver that walks
   them.
-- `src/casino/` — the background simulation: `bank.rs` (the one set of
-  books), `patron.rs` (simulated players), `instance.rs` (one running
-  table), `manager.rs` (the simulation thread), `ui.rs` (screens that draw
-  snapshots and never run anything).
+- `src/casino/` — the background simulation, in fourteen pieces:
+  `config.rs` (every tunable, so no threshold is written down where it is
+  used), `clock.rs` (simulated time, so 0.25x means fewer rounds rather than
+  the same rounds drawn slower), `event.rs` (the bus; publishers push,
+  screens pull, and the per-round traffic is counted but never kept),
+  `bank.rs` (the one set of books, with a typed movement for every way money
+  or chips can move), `patron.rs` and `roster.rs` (the people, and the fact
+  that they outlive the tables they sit at), `instance.rs` (one running
+  table), `demand.rs` (what the room is in the mood for, and how full it has
+  been), `happening.rs` (what is going on tonight), `interest.rs` (how worth
+  watching a table is), `analytics.rs` (the night in bounded time buckets,
+  never recomputed), `tournament.rs`, `save.rs` (versioned, migrated,
+  written atomically), `manager.rs` (the simulation thread), and `ui.rs`
+  (screens that draw snapshots and never run anything).
 - `src/economy.rs` — `Wallet` (the player's chips, dollars and inventory)
   and `House`, the casino's mirror-image ledger, recorded explicitly at each
   game's settlement point rather than hooked generically into `Wallet`
@@ -241,12 +288,20 @@ that touch nothing in the games that came before them.
 cargo test
 ```
 
-217 tests, covering dice-notation parsing, roll uniformity, seeded
+380 tests, covering dice-notation parsing, roll uniformity, seeded
 reproducibility, every Yahtzee scoring category, Luck Bet hit/sweep
 resolution, Roulette's payout table, Blackjack's hand totals, Ultra Casino
 Dice's pot math, the house ledger's zero-sum invariant, and the render
 geometry (every face and card is a perfect rectangle at every size, and the
 big ones really are 3× the small ones).
+
+The simulation has its own share of those: that chips are only ever moved
+and never made, that a patron's record survives them getting up, that
+scoring how watchable a table is cannot touch the table, that a save which
+fails to write leaves the previous one exactly where it was, and — in
+`casino/walk.rs` — one long test that opens a casino, runs a night through
+it, and checks all twenty-four things end to end, from the doors opening to
+reopening it from disk afterwards.
 
 ### The house auditor
 

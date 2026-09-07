@@ -19,6 +19,9 @@
 //!   no path by which a reader's code runs on the simulation thread.
 //! - [`interest`] — how worth watching a table is. A lens on the floor,
 //!   never a hand on it.
+//! - [`save`] — the casino written down: versioned, migrated on the way
+//!   in, and replaced atomically so a crash cannot leave a floor that
+//!   cannot be reopened.
 //! - [`sim`] — the bundle of floor-owned services a table borrows for the
 //!   length of one call.
 //! - [`bank`] — the economy manager. One set of books, money and chips,
@@ -53,8 +56,15 @@ pub mod interest;
 pub mod manager;
 pub mod patron;
 pub mod roster;
+pub mod save;
 pub mod sim;
 pub mod tournament;
 pub mod ui;
+
+/// The whole thing walked end to end, in one go. Tests only — see the
+/// module's own docs for why it is one long test rather than twenty-four
+/// short ones.
+#[cfg(test)]
+mod walk;
 
 pub use manager::Manager;
